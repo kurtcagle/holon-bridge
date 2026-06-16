@@ -1,7 +1,7 @@
 {
   "name": "holon-bridge",
-  "version": "2.2.0",
-  "description": "LLM ↔ Jena bridge with NL query, SHACL-validated update, and capability discovery",
+  "version": "2.4.0",
+  "description": "LLM \u2194 Jena bridge with NL query, SHACL-validated update, and capability discovery",
   "type": "module",
   "main": "server.js",
   "scripts": {
