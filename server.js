@@ -1,5 +1,5 @@
 /**
- * server.js -- HolonBridge v2.6.0
+ * server.js -- HolonBridge v2.7.0
  *
  * HTTP bridge between an LLM client and a Jena 6.0 Fuseki triplestore.
  *
@@ -80,6 +80,7 @@ let SHACL_REQUIRED = process.env.SHACL_REQUIRED === 'true'
 
 /** IRI of the named-queries graph for the active dataset. */
 function namedQueriesGraphIri() { return `urn:${DATASET}:named-queries` }
+function namedRulesGraphIri()   { return `urn:${DATASET}:named-rules` }
 
 // --- Context directory helpers ------------------------------------------------
 
@@ -105,6 +106,7 @@ function getContextDir() {
 let schemaContext = ''
 let databookIds   = []
 let namedQueries  = []
+let namedRules    = []   // non-canonical — pending WG IV alignment
 let namedGraphs   = []
 let activeWatcher = null   // chokidar FSWatcher for the active context dir
 
@@ -226,6 +228,68 @@ ORDER BY ?id`
   }
 }
 
+/**
+ * Load named rules from RDF graph `urn:{DATASET}:named-rules`.
+ * Non-canonical implementation — pending WG IV alignment.
+ */
+async function loadNamedRulesFromGraph() {
+  const graphIri = namedRulesGraphIri()
+  const sparql = `
+PREFIX hb:      <https://w3id.org/holonbridge/>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX sh:      <http://www.w3.org/ns/shacl#>
+
+SELECT ?id ?label ?description ?sparql ?targetGraph ?sourceGraph
+       ?writeMode ?ruleStatus ?parameters ?order
+WHERE {
+  GRAPH <${graphIri}> {
+    ?rule a hb:NamedRule ;
+          dcterms:identifier ?id ;
+          hb:sparql          ?sparql .
+    OPTIONAL { ?rule dcterms:title       ?label }
+    OPTIONAL { ?rule dcterms:description ?description }
+    OPTIONAL { ?rule hb:targetGraph      ?targetGraph }
+    OPTIONAL { ?rule hb:sourceGraph      ?sourceGraph }
+    OPTIONAL { ?rule hb:writeMode        ?writeMode }
+    OPTIONAL { ?rule hb:ruleStatus       ?ruleStatus }
+    OPTIONAL { ?rule hb:parameters       ?parameters }
+    OPTIONAL { ?rule sh:order            ?order }
+  }
+}
+ORDER BY ?order ?id`
+  try {
+    const { bindings } = await runQuery(JENA_SPARQL, sparql, LOG_SPARQL)
+    const rules = bindings
+      .map(r => {
+        let params = []
+        if (r.parameters?.value) {
+          try { params = JSON.parse(r.parameters.value) } catch (_) {}
+        }
+        const writeMode   = (r.writeMode?.value   ?? '').split('#').pop() || 'Append'
+        const ruleStatus  = (r.ruleStatus?.value  ?? '').split('#').pop() || 'Active'
+        return {
+          id:          r.id?.value          ?? '',
+          label:       r.label?.value       ?? r.id?.value ?? '',
+          description: r.description?.value ?? '',
+          sparql:      r.sparql?.value      ?? '',
+          targetGraph: r.targetGraph?.value ?? null,
+          sourceGraph: r.sourceGraph?.value ?? null,
+          writeMode,
+          ruleStatus,
+          firesOnSeverity: ['Info', 'Warning', 'Violation'], // default all; extend later
+          params,
+          order:       r.order?.value ? parseInt(r.order.value, 10) : 100
+        }
+      })
+      .filter(r => r.id && r.sparql && r.targetGraph)
+    console.log(`[Bridge] Loaded ${rules.length} named rule${rules.length === 1 ? '' : 's'} from <${graphIri}>`)
+    return rules
+  } catch (err) {
+    console.warn(`[Bridge] No named rules from <${graphIri}>: ${err.message}`)
+    return []
+  }
+}
+
 async function loadContext() {
   const dir = getContextDir()
   const db  = await loadDataBookFromDir(dir)
@@ -247,6 +311,9 @@ async function loadContext() {
   const rdfQueries = await loadNamedQueriesFromGraph()
   const rdfIds     = new Set(rdfQueries.map(q => q.id))
   namedQueries     = [...rdfQueries, ...fsQueries.filter(q => !rdfIds.has(q.id))]
+
+  // Load named rules
+  namedRules = await loadNamedRulesFromGraph()
 
   databookIds  = db.ids()
   console.log(`[Bridge] Context loaded from ${dir} -- ${schemaContext.length} chars, ${namedQueries.length} named queries (${rdfQueries.length} RDF, ${fsQueries.length} filesystem)`)
@@ -553,6 +620,7 @@ app.post('/reload', async (_req, res) => {
       schemaChars: schemaContext.length,
       namedGraphs: namedGraphs.length,
       namedQueries: namedQueries.length,
+      namedRules: namedRules.length,
       databookBlocks: databookIds
     })
   } catch (err) {
@@ -669,6 +737,7 @@ app.post('/fuseki-url', async (req, res) => {
     shaclGraph:     SHACL_GRAPH,
     namedGraphs:    namedGraphs.length,
     namedQueries:   namedQueries.length,
+    namedRules:     namedRules.length,
   }
   if (warning) payload.warning = warning
   return res.json(payload)
@@ -713,7 +782,7 @@ app.get('/description', async (_req, res) => {
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
 
   res.json({
-    service: 'holon-bridge', version: '2.6.0',
+    service: 'holon-bridge', version: '2.7.0',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
@@ -728,6 +797,9 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/fuseki-url',     description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
       { method: 'POST', path: '/shacl-mode',     description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
       { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query. Body: { id, label?, description?, sparql, targetGraph?, params?: [{name, description?, default?}] } or { id, delete: true }. Use {{paramName}} placeholders in sparql; callers supply values via POST /query { queryId, params }.' },
+      { method: 'POST', path: '/named-rule',    description: '[NON-CANONICAL] Register, update, enable/disable, or delete a named rule. Body: { id, sparql, targetGraph, writeMode?, ruleStatus?, firesOnSeverity?, params?, order? } or { id, delete: true } or { id, status }.' },
+      { method: 'POST', path: '/rule',          description: '[NON-CANONICAL] Execute a named rule by ID. Runs CONSTRUCT and writes results to targetGraph per writeMode (Append/Replace/Sync). Body: { ruleId, params?, writeMode? }.' },
+      { method: 'POST', path: '/graph-op',      description: 'Execute a SPARQL graph management operation. Body: { operation: clear|drop|create|copy|move|add, source?, target, silent? }.' },
       { method: 'GET',  path: '/datasets',       description: 'List all datasets available on the Fuseki server.' },
       { method: 'GET',  path: '/graphs',         description: 'Live query: list all named graphs in the active dataset with triple counts.' },
       { method: 'GET',  path: '/graph',          description: 'Fetch RDF content of a single named graph via GSP. Query params: iri=<encoded IRI>, format=turtle|trig.' },
@@ -736,7 +808,9 @@ app.get('/description', async (_req, res) => {
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
     namedQueriesGraph: namedQueriesGraphIri(),
+    namedRulesGraph:   namedRulesGraphIri(),
     namedQueries, namedGraphs, databookBlocks: databookIds,
+    namedRules: namedRules.length,
     shacl: {
       graph: SHACL_GRAPH, tripleCount: shaclTriples,
       required: SHACL_REQUIRED,
@@ -762,11 +836,14 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.6.0',
+    status: 'ok', service: 'holon-bridge', version: '2.7.0',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
-    databookBlocks: databookIds, namedGraphs, maxRetries: MAX_RETRIES
+    databookBlocks: databookIds, namedGraphs,
+    namedQueries: namedQueries.length,
+    namedRules: namedRules.length,
+    maxRetries: MAX_RETRIES
   })
 })
 
@@ -918,8 +995,12 @@ app.post('/sparql-select', async (req, res) => {
 
   const query      = sparql.trim()
   const asDataBook = format === 'databook'
-  const upperQ     = query.replace(/^\s*(#[^\n]*\n\s*)*/i, '').toUpperCase()
-  const isConstruct = /^\s*(CONSTRUCT|DESCRIBE)/i.test(upperQ)
+  // Strip comments and PREFIX declarations before detecting query type
+  const strippedQ  = query
+    .replace(/^\s*(#[^\n]*\n\s*)*/i, '')           // strip leading comments
+    .replace(/PREFIX\s+\S*\s*<[^>]*>\s*/gi, '')    // strip PREFIX declarations
+    .trim()
+  const isConstruct = /^(CONSTRUCT|DESCRIBE)\b/i.test(strippedQ)
 
   console.log(`[Bridge] /sparql-select (${query.length} chars, ${isConstruct ? 'CONSTRUCT/DESCRIBE' : 'SELECT/ASK'})`)
   if (LOG_SPARQL) console.log(query)
@@ -1048,6 +1129,326 @@ app.get('/graph', async (req, res) => {
   }
 })
 
+// -- POST /named-rule ----------------------------------------------------------
+//
+// [NON-CANONICAL] Register, update, enable/disable, or delete a named rule.
+// Pending WG IV alignment before this API is considered stable.
+//
+// Register/update: { id, label?, description?, sparql, targetGraph,
+//                    sourceGraph?, writeMode?, ruleStatus?, firesOnSeverity?,
+//                    params?, order? }
+// Delete:          { id, delete: true }
+// Status change:   { id, status: "Active"|"Suspended"|"Deprecated" }
+
+app.post('/named-rule', async (req, res) => {
+  const { id, label, description, sparql, targetGraph, sourceGraph,
+          writeMode, ruleStatus, status, params, order,
+          delete: del } = req.body ?? {}
+
+  if (!id || typeof id !== 'string' || !id.trim())
+    return res.status(400).json({ error: '"id" is required.' })
+
+  const graphIri  = namedRulesGraphIri()
+  const ruleIri   = `${graphIri}:${id.trim()}`
+  const HB        = 'https://w3id.org/holonbridge/'
+  const DCTERMS   = 'http://purl.org/dc/terms/'
+  const SH        = 'http://www.w3.org/ns/shacl#'
+
+  // -- Delete ----------------------------------------------------------------
+  if (del) {
+    const deleteSparql = `
+PREFIX hb:      <${HB}>
+PREFIX dcterms: <${DCTERMS}>
+WITH <${graphIri}>
+DELETE { ?rule ?p ?o }
+WHERE  { ?rule dcterms:identifier """${id}""" ; ?p ?o }`
+    try {
+      await fetch(JENA_UPDATE, { method:'POST',
+        headers:{'Content-Type':'application/sparql-update'}, body: deleteSparql })
+      namedRules = namedRules.filter(r => r.id !== id)
+      console.log(`[Bridge] Named rule '${id}' deleted`)
+      return res.json({ deleted: true, id })
+    } catch (err) {
+      return res.status(500).json({ error: `Delete failed: ${err.message}` })
+    }
+  }
+
+  // -- Status change only ----------------------------------------------------
+  if (status && !sparql) {
+    const validStatuses = ['Active','Suspended','Deprecated']
+    if (!validStatuses.includes(status))
+      return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` })
+    const updateSparql = `
+PREFIX hb:      <${HB}>
+PREFIX dcterms: <${DCTERMS}>
+WITH <${graphIri}>
+DELETE { ?rule hb:ruleStatus ?old }
+INSERT { ?rule hb:ruleStatus hb:${status} }
+WHERE  { ?rule dcterms:identifier """${id}""" . OPTIONAL { ?rule hb:ruleStatus ?old } }`
+    try {
+      await fetch(JENA_UPDATE, { method:'POST',
+        headers:{'Content-Type':'application/sparql-update'}, body: updateSparql })
+      const r = namedRules.find(r => r.id === id)
+      if (r) r.ruleStatus = status
+      console.log(`[Bridge] Named rule '${id}' status → ${status}`)
+      return res.json({ updated: true, id, ruleStatus: status })
+    } catch (err) {
+      return res.status(500).json({ error: `Status update failed: ${err.message}` })
+    }
+  }
+
+  // -- Register / update -----------------------------------------------------
+  if (!sparql || typeof sparql !== 'string' || !sparql.trim())
+    return res.status(400).json({ error: '"sparql" is required for registration.' })
+  if (!targetGraph || typeof targetGraph !== 'string' || !targetGraph.trim())
+    return res.status(400).json({ error: '"targetGraph" is required for registration.' })
+
+  let paramsJson = null
+  if (params !== undefined) {
+    if (!Array.isArray(params))
+      return res.status(400).json({ error: '"params" must be an array.' })
+    paramsJson = JSON.stringify(params)
+  }
+
+  const escape   = s => s.replace(/\\/g,'\\\\').replace(/"""/g,'\\"\\"\\"')
+  const wm       = writeMode  ?? 'Append'
+  const rs       = ruleStatus ?? 'Active'
+  const ord      = order      ?? 100
+  const sevList  = (Array.isArray(req.body.firesOnSeverity) ? req.body.firesOnSeverity : ['Info','Warning','Violation'])
+    .map(s => `<${SH}${s}>`).join(' , ')
+
+  const optionals = [
+    label       ? `    <${DCTERMS}title>       """${escape(label)}""" ;`       : null,
+    description ? `    <${DCTERMS}description> """${escape(description)}""" ;` : null,
+    sourceGraph ? `    <${HB}sourceGraph>      <${sourceGraph}> ;`             : null,
+    paramsJson  ? `    <${HB}parameters>       """${escape(paramsJson)}""" ;`  : null,
+  ].filter(Boolean).join('\n')
+
+  const insertSparql = `
+PREFIX hb:      <${HB}>
+PREFIX dcterms: <${DCTERMS}>
+PREFIX sh:      <${SH}>
+PREFIX xsd:     <http://www.w3.org/2001/XMLSchema#>
+
+WITH <${graphIri}>
+DELETE { ?rule ?p ?o }
+WHERE  { ?rule dcterms:identifier """${id}""" ; ?p ?o } ;
+
+INSERT DATA {
+  GRAPH <${graphIri}> {
+    <${ruleIri}>
+      a hb:NamedRule ;
+      dcterms:identifier  """${escape(id)}""" ;
+      hb:sparql           """${escape(sparql.trim())}""" ;
+      hb:targetGraph      <${targetGraph.trim()}> ;
+      hb:writeMode        hb:${wm} ;
+      hb:ruleStatus       hb:${rs} ;
+      sh:order            ${ord} ;
+${optionals}
+      hb:firesOnSeverity  ${sevList} .
+  }
+}`
+
+  try {
+    const resp = await fetch(JENA_UPDATE, { method:'POST',
+      headers:{'Content-Type':'application/sparql-update'}, body: insertSparql })
+    if (!resp.ok) {
+      const txt = await resp.text()
+      return res.status(502).json({ error: `Fuseki update failed: ${txt.slice(0,200)}` })
+    }
+    // Reload rules into memory
+    namedRules = await loadNamedRulesFromGraph()
+    console.log(`[Bridge] Named rule '${id}' registered (writeMode: ${wm}, status: ${rs})`)
+    return res.json({ registered: true, id, targetGraph, writeMode: wm, ruleStatus: rs })
+  } catch (err) {
+    return res.status(500).json({ error: `Named rule registration failed: ${err.message}` })
+  }
+})
+
+// -- GET /named-rules ----------------------------------------------------------
+//
+// List all registered named rules with status and metadata.
+
+app.get('/named-rules', (_req, res) => {
+  res.json({
+    total:      namedRules.length,
+    active:     namedRules.filter(r => r.ruleStatus === 'Active').length,
+    suspended:  namedRules.filter(r => r.ruleStatus === 'Suspended').length,
+    rulesGraph: namedRulesGraphIri(),
+    rules:      namedRules.map(({ id, label, description, targetGraph, sourceGraph,
+                                  writeMode, ruleStatus, firesOnSeverity, params, order }) =>
+                  ({ id, label, description, targetGraph, sourceGraph,
+                     writeMode, ruleStatus, firesOnSeverity, params: params ?? [], order }))
+  })
+})
+
+// -- POST /rule ----------------------------------------------------------------
+//
+// [NON-CANONICAL] Execute a named rule by ID.
+// Runs the CONSTRUCT, writes results to targetGraph per writeMode.
+// Params substitute {{placeholders}} in the SPARQL. $this may be supplied
+// as a param to bind the focus node.
+//
+// Request:  { ruleId, params?: { key: value }, writeMode?: "Append"|"Replace"|"Sync" }
+// Response: { ruleId, targetGraph, writeMode, triplesWritten, sparql }
+
+app.post('/rule', async (req, res) => {
+  const { ruleId, params, writeMode: writeModeOverride } = req.body ?? {}
+
+  if (!ruleId || typeof ruleId !== 'string')
+    return res.status(400).json({ error: '"ruleId" is required.' })
+
+  const rule = namedRules.find(r => r.id === ruleId)
+  if (!rule)
+    return res.status(404).json({ error: `Named rule '${ruleId}' not found.` })
+
+  if (rule.ruleStatus === 'Suspended')
+    return res.status(409).json({ error: `Named rule '${ruleId}' is suspended.` })
+
+  if (rule.ruleStatus === 'Deprecated')
+    return res.status(409).json({ error: `Named rule '${ruleId}' is deprecated.` })
+
+  // Apply param substitution (including $this as a special binding)
+  let sparqlToRun = rule.sparql
+  if (params && typeof params === 'object') {
+    // Handle $this specially — substitute with <IRI> form if it looks like an IRI
+    const allParams = { ...params }
+    if (allParams['$this']) {
+      const thisVal = allParams['$this']
+      sparqlToRun = sparqlToRun.replace(/\$this\b/g,
+        thisVal.startsWith('http') || thisVal.startsWith('urn') ? `<${thisVal}>` : thisVal)
+      delete allParams['$this']
+    }
+    const sub = substituteParams(sparqlToRun, allParams)
+    if (sub.missing.length > 0)
+      return res.status(400).json({ error: 'Unresolved placeholders', missing: sub.missing })
+    sparqlToRun = sub.sparql
+  }
+
+  const writeMode   = writeModeOverride ?? rule.writeMode ?? 'Append'
+  const targetGraph = rule.targetGraph
+
+  console.log(`[Bridge] /rule '${ruleId}' writeMode=${writeMode} target=<${targetGraph}>`)
+  if (LOG_SPARQL) console.log(sparqlToRun)
+
+  try {
+    // 1. Execute CONSTRUCT → get Turtle
+    const controller = new AbortController()
+    const timer      = setTimeout(() => controller.abort(), 60_000)
+    let constructResp
+    try {
+      constructResp = await fetch(JENA_SPARQL, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
+        body:    sparqlToRun,
+        signal:  controller.signal
+      })
+    } finally { clearTimeout(timer) }
+
+    const turtle = await constructResp.text()
+    if (!constructResp.ok)
+      return res.status(502).json({ error: `CONSTRUCT failed (HTTP ${constructResp.status}): ${turtle.slice(0,200)}` })
+
+    // Count approximate triples (newlines in non-empty Turtle)
+    const tripleCount = turtle.trim() ? turtle.split('\n').filter(l => l.trim() && !l.trim().startsWith('#') && !l.trim().startsWith('@') && !l.trim().startsWith('PREFIX')).length : 0
+
+    // 2. Apply write mode to target graph via GSP
+    const gspTarget = `${JENA_GSP}?graph=${encodeURIComponent(targetGraph)}`
+
+    if (writeMode === 'Replace' || writeMode === 'Sync') {
+      // Clear / drop first
+      const clearOp = writeMode === 'Sync' ? 'DROP SILENT' : 'CLEAR'
+      await fetch(JENA_UPDATE, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/sparql-update' },
+        body:    `${clearOp} GRAPH <${targetGraph}>`
+      })
+    }
+
+    // Append (POST) or initial write after clear (POST)
+    if (turtle.trim()) {
+      const gspResp = await fetch(gspTarget, {
+        method:  'POST',
+        headers: { 'Content-Type': 'text/turtle' },
+        body:    turtle
+      })
+      if (!gspResp.ok) {
+        const gspErr = await gspResp.text()
+        return res.status(502).json({ error: `GSP write failed: ${gspErr.slice(0,200)}` })
+      }
+    }
+
+    return res.json({
+      ruleId,
+      targetGraph,
+      writeMode,
+      triplesWritten: tripleCount,
+      sparql: sparqlToRun,
+      note: 'Non-canonical implementation — pending WG IV alignment'
+    })
+  } catch (err) {
+    if (err.name === 'AbortError')
+      return res.status(504).json({ error: 'CONSTRUCT timed out (60s).' })
+    console.error(`[Bridge] /rule '${ruleId}' error:`, err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+// -- POST /graph-op ------------------------------------------------------------
+//
+// Execute a SPARQL graph management operation (CLEAR, DROP, CREATE, COPY, MOVE, ADD).
+// These underpin named rule write semantics and are also available to callers directly.
+//
+// Request:  { operation, source?, target, silent? }
+// Response: { operation, source?, target, ok }
+
+app.post('/graph-op', async (req, res) => {
+  const { operation, source, target, silent = true } = req.body ?? {}
+
+  const ops = ['clear','drop','create','copy','move','add']
+  if (!operation || !ops.includes(operation.toLowerCase()))
+    return res.status(400).json({ error: `"operation" must be one of: ${ops.join(', ')}` })
+
+  const op    = operation.toLowerCase()
+  const sil   = silent ? 'SILENT' : ''
+
+  // Validate required params per operation
+  if (['clear','drop','create'].includes(op) && !target)
+    return res.status(400).json({ error: `"target" is required for ${op}` })
+  if (['copy','move','add'].includes(op) && (!source || !target))
+    return res.status(400).json({ error: `"source" and "target" are required for ${op}` })
+
+  let sparqlOp
+  switch (op) {
+    case 'clear':  sparqlOp = `CLEAR  ${sil} GRAPH <${target}>`; break
+    case 'drop':   sparqlOp = `DROP   ${sil} GRAPH <${target}>`; break
+    case 'create': sparqlOp = `CREATE ${sil} GRAPH <${target}>`; break
+    case 'copy':   sparqlOp = `COPY   ${sil} <${source}> TO <${target}>`; break
+    case 'move':   sparqlOp = `MOVE   ${sil} <${source}> TO <${target}>`; break
+    case 'add':    sparqlOp = `ADD    ${sil} <${source}> TO <${target}>`; break
+  }
+
+  console.log(`[Bridge] /graph-op: ${sparqlOp}`)
+
+  try {
+    const resp = await fetch(JENA_UPDATE, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/sparql-update' },
+      body:    sparqlOp
+    })
+    if (!resp.ok) {
+      const txt = await resp.text()
+      return res.status(502).json({ error: `Fuseki graph-op failed: ${txt.slice(0,200)}` })
+    }
+    // Refresh named graphs list
+    namedGraphs = await discoverGraphs(JENA_SPARQL)
+    return res.json({ operation: op, source: source ?? null, target, ok: true, sparql: sparqlOp })
+  } catch (err) {
+    console.error('[Bridge] /graph-op error:', err)
+    return res.status(500).json({ error: err.message })
+  }
+})
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -1055,8 +1456,10 @@ app.use((_req, res) => {
     error: 'Not found.',
     available: [
       'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select',
-      'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode', 'POST /named-query',
-      'GET  /datasets', 'GET  /graphs', 'GET  /graph', 'GET  /named-queries',
+      'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode',
+      'POST /named-query', 'POST /named-rule', 'POST /rule', 'POST /graph-op',
+      'GET  /datasets', 'GET  /graphs', 'GET  /graph',
+      'GET  /named-queries', 'GET  /named-rules',
       'GET  /description', 'GET  /health'
     ]
   })
@@ -1068,7 +1471,7 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.6.0 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.7.0 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
