@@ -1,5 +1,5 @@
 /**
- * server.js -- HolonBridge v2.4.0
+ * server.js -- HolonBridge v2.5.0
  *
  * HTTP bridge between an LLM client and a Jena 6.0 Fuseki triplestore.
  *
@@ -646,24 +646,27 @@ app.get('/description', async (_req, res) => {
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
 
   res.json({
-    service: 'holon-bridge', version: '2.4.0',
+    service: 'holon-bridge', version: '2.5.0',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
     shaclTriples, model: MODEL, maxRetries: MAX_RETRIES,
     operations: [
-      { method: 'POST', path: '/query',         description: 'NL -> SPARQL -> interpreted answer. Or { queryId } to execute a stored named query directly.' },
-      { method: 'POST', path: '/update',        description: 'SHACL-gated Turtle push to a named graph.' },
-      { method: 'POST', path: '/sparql-update', description: 'Raw SPARQL UPDATE -- no validation gate.' },
-      { method: 'POST', path: '/reload',        description: 'Reload context directory + named queries (RDF + filesystem) + rediscover named graphs.' },
-      { method: 'POST', path: '/dataset',       description: 'Switch active dataset at runtime. Accepts optional "fusekiUrl" to change Fuseki host in the same call. Restarts context watcher. Body: { "dataset": "name", "fusekiUrl"?: "http://..." }.' },
-      { method: 'POST', path: '/fuseki-url',   description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
-      { method: 'POST', path: '/shacl-mode',    description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
-      { method: 'POST', path: '/named-query',   description: 'Register, update, or delete a named query in the RDF graph urn:{dataset}:named-queries. Body: { id, label?, description?, sparql, targetGraph? } or { id, delete: true }.' },
-      { method: 'GET',  path: '/datasets',      description: 'List all datasets available on the Fuseki server.' },
-      { method: 'GET',  path: '/named-queries', description: 'List all registered named queries with source (rdf|filesystem).' },
-      { method: 'GET',  path: '/description',   description: 'Capability manifest for LLM consumption (this endpoint).' },
-      { method: 'GET',  path: '/health',        description: 'Liveness check.' }
+      { method: 'POST', path: '/query',          description: 'NL -> SPARQL -> interpreted answer. Or { queryId } to execute a stored named query directly.' },
+      { method: 'POST', path: '/sparql-select',  description: 'Direct SPARQL SELECT/ASK/CONSTRUCT/DESCRIBE — bypasses NL pipeline entirely. Body: { "sparql": "..." }. Returns bindings for SELECT/ASK, Turtle for CONSTRUCT/DESCRIBE.' },
+      { method: 'POST', path: '/update',         description: 'SHACL-gated Turtle push to a named graph.' },
+      { method: 'POST', path: '/sparql-update',  description: 'Raw SPARQL UPDATE (INSERT/DELETE/etc) — no validation gate.' },
+      { method: 'POST', path: '/reload',         description: 'Reload context directory + named queries (RDF + filesystem) + rediscover named graphs.' },
+      { method: 'POST', path: '/dataset',        description: 'Switch active dataset at runtime. Accepts optional "fusekiUrl" to change Fuseki host in the same call. Restarts context watcher. Body: { "dataset": "name", "fusekiUrl"?: "http://..." }.' },
+      { method: 'POST', path: '/fuseki-url',     description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
+      { method: 'POST', path: '/shacl-mode',     description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
+      { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query in the RDF graph urn:{dataset}:named-queries. Body: { id, label?, description?, sparql, targetGraph? } or { id, delete: true }.' },
+      { method: 'GET',  path: '/datasets',       description: 'List all datasets available on the Fuseki server.' },
+      { method: 'GET',  path: '/graphs',         description: 'Live query: list all named graphs in the active dataset with triple counts.' },
+      { method: 'GET',  path: '/graph',          description: 'Fetch RDF content of a single named graph via GSP. Query params: iri=<encoded IRI>, format=turtle|trig.' },
+      { method: 'GET',  path: '/named-queries',  description: 'List all registered named queries with source (rdf|filesystem).' },
+      { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
+      { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
     namedQueriesGraph: namedQueriesGraphIri(),
     namedQueries, namedGraphs, databookBlocks: databookIds,
@@ -692,7 +695,7 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.4.0',
+    status: 'ok', service: 'holon-bridge', version: '2.5.0',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
@@ -819,15 +822,166 @@ app.get('/named-queries', (_req, res) => {
   })
 })
 
+// -- POST /sparql-select -------------------------------------------------------
+//
+// Execute a raw SPARQL SELECT, ASK, DESCRIBE, or CONSTRUCT query directly
+// against Fuseki, bypassing the NL pipeline and LLM entirely.
+// Designed for programmatic/agent callers that know exactly what they want.
+//
+// SELECT/ASK: { "sparql": "SELECT ...", "format"?: "json"|"databook" }
+//   -> { vars, bindings, formattedResults, count }
+//
+// CONSTRUCT/DESCRIBE: { "sparql": "CONSTRUCT ..." }
+//   -> text/turtle response body
+
+app.post('/sparql-select', async (req, res) => {
+  const { sparql, format } = req.body ?? {}
+
+  if (!sparql || typeof sparql !== 'string' || !sparql.trim())
+    return res.status(400).json({ error: 'Request body must include a non-empty "sparql" string.' })
+
+  const query      = sparql.trim()
+  const asDataBook = format === 'databook'
+  const upperQ     = query.replace(/^\s*(#[^\n]*\n\s*)*/i, '').toUpperCase()
+  const isConstruct = /^\s*(CONSTRUCT|DESCRIBE)/i.test(upperQ)
+
+  console.log(`[Bridge] /sparql-select (${query.length} chars, ${isConstruct ? 'CONSTRUCT/DESCRIBE' : 'SELECT/ASK'})`)
+  if (LOG_SPARQL) console.log(query)
+
+  try {
+    if (isConstruct) {
+      // CONSTRUCT / DESCRIBE -- return Turtle directly
+      const controller = new AbortController()
+      const timer      = setTimeout(() => controller.abort(), 30_000)
+      let response
+      try {
+        response = await fetch(JENA_SPARQL, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
+          body:    query,
+          signal:  controller.signal
+        })
+      } finally { clearTimeout(timer) }
+
+      const turtle = await response.text()
+      if (!response.ok)
+        return res.status(502).json({ error: `Fuseki returned HTTP ${response.status}: ${turtle.slice(0, 300)}` })
+      return res.type('text/turtle').send(turtle)
+    }
+
+    // SELECT / ASK
+    const { vars, bindings } = await runQuery(JENA_SPARQL, query, LOG_SPARQL)
+    const formattedResults   = formatBindings(vars, bindings)
+
+    if (asDataBook) {
+      const doc = buildResponseDataBook({
+        nlQuery: '(direct SPARQL query)', sparql: query, bindings, vars,
+        formattedResults,
+        answer:  `Direct query returned ${bindings.length} result(s).`,
+        retries: 0, namedGraphs, model: MODEL, endpoint: JENA_SPARQL, error: null
+      })
+      return res.type('text/markdown')
+        .set('Content-Disposition', 'inline; filename="sparql-select.databook.md"')
+        .send(doc)
+    }
+
+    return res.json({ vars, bindings, formattedResults, count: bindings.length })
+  } catch (err) {
+    if (err instanceof SparqlError)
+      return res.status(400).json({
+        error:   'SPARQL execution error',
+        message: err.jenaMessage ?? err.message,
+        sparql:  query
+      })
+    console.error('[Bridge] /sparql-select error:', err)
+    return res.status(500).json({ error: 'Internal bridge error', message: err.message })
+  }
+})
+
+// -- GET /graphs ---------------------------------------------------------------
+//
+// Live query: list all named graphs in the active dataset with triple counts.
+// Unlike the cached list in /health, this always reflects current Fuseki state.
+//
+// Response: { dataset, graphs: [{ iri, triples }], total }
+
+app.get('/graphs', async (_req, res) => {
+  const sparql = `
+SELECT ?g (COUNT(*) AS ?triples)
+WHERE { GRAPH ?g { ?s ?p ?o } }
+GROUP BY ?g
+ORDER BY ?g`
+
+  try {
+    const { bindings } = await runQuery(JENA_SPARQL, sparql, LOG_SPARQL)
+    const graphs = bindings.map(b => ({
+      iri:     b.g?.value      ?? '(unknown)',
+      triples: parseInt(b.triples?.value ?? '0', 10)
+    }))
+    return res.json({ dataset: DATASET, graphs, total: graphs.length })
+  } catch (err) {
+    console.error('[Bridge] /graphs error:', err)
+    return res.status(500).json({ error: `Could not query named graphs: ${err.message}` })
+  }
+})
+
+// -- GET /graph ----------------------------------------------------------------
+//
+// Fetch the full RDF content of a single named graph via GSP.
+// Returns Turtle by default; append ?format=trig for TriG.
+//
+// Query params:
+//   iri    (required) -- the graph IRI, URL-encoded
+//   format (optional) -- "turtle" (default) or "trig"
+//
+// Example: GET /graph?iri=https%3A%2F%2Fw3id.org%2Fggsc%2Fchloe%2Fpersons
+
+app.get('/graph', async (req, res) => {
+  const { iri, format = 'turtle' } = req.query
+
+  if (!iri || typeof iri !== 'string' || !iri.trim())
+    return res.status(400).json({ error: 'Query parameter "iri" is required.' })
+
+  const acceptType = format === 'trig' ? 'application/trig' : 'text/turtle'
+  const gspUrl     = `${JENA_GSP}?graph=${encodeURIComponent(iri.trim())}`
+
+  console.log(`[Bridge] GSP fetch: <${iri}>`)
+  try {
+    const controller = new AbortController()
+    const timer      = setTimeout(() => controller.abort(), 30_000)
+    let response
+    try {
+      response = await fetch(gspUrl, {
+        headers: { 'Accept': acceptType },
+        signal:  controller.signal
+      })
+    } finally { clearTimeout(timer) }
+
+    const body = await response.text()
+    if (response.status === 404)
+      return res.status(404).json({ error: `Named graph <${iri}> not found in dataset '${DATASET}'.` })
+    if (!response.ok)
+      return res.status(502).json({ error: `Fuseki GSP returned HTTP ${response.status}: ${body.slice(0, 300)}` })
+
+    return res.type(acceptType).send(body)
+  } catch (err) {
+    if (err.name === 'AbortError')
+      return res.status(504).json({ error: 'Fuseki GSP request timed out.' })
+    console.error('[Bridge] /graph error:', err)
+    return res.status(500).json({ error: `GSP fetch failed: ${err.message}` })
+  }
+})
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
   res.status(404).json({
     error: 'Not found.',
     available: [
-      'POST /query', 'POST /update', 'POST /sparql-update',
+      'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select',
       'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode', 'POST /named-query',
-      'GET  /datasets', 'GET  /named-queries', 'GET  /description', 'GET  /health'
+      'GET  /datasets', 'GET  /graphs', 'GET  /graph', 'GET  /named-queries',
+      'GET  /description', 'GET  /health'
     ]
   })
 })
@@ -838,7 +992,7 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.4.0 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.5.0 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
