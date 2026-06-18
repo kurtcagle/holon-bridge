@@ -1,5 +1,5 @@
 /**
- * server.js -- HolonBridge v2.5.0
+ * server.js -- HolonBridge v2.6.0
  *
  * HTTP bridge between an LLM client and a Jena 6.0 Fuseki triplestore.
  *
@@ -110,6 +110,48 @@ let activeWatcher = null   // chokidar FSWatcher for the active context dir
 
 // --- Helpers ------------------------------------------------------------------
 
+/**
+ * Substitute {{paramName}} placeholders in a SPARQL string with caller-supplied
+ * values. Substitution is raw string replacement — the query author is
+ * responsible for placing placeholders in the correct SPARQL syntactic context
+ * (inside quotes, angle brackets, etc.).
+ *
+ * Example named query SPARQL:
+ *   FILTER(CONTAINS(LCASE(?jobTitle), LCASE("{{role}}")))
+ *
+ * Called with params: { role: "ontologist" } ->
+ *   FILTER(CONTAINS(LCASE(?jobTitle), LCASE("ontologist")))
+ *
+ * IRI example:
+ *   ?person foaf:gender <{{genderIRI}}> .
+ * Called with params: { genderIRI: "http://xmlns.com/foaf/0.1/Female" }
+ *
+ * Returns { sparql, substituted, missing } where:
+ *   sparql      -- the result string (may still have unresolved placeholders)
+ *   substituted -- array of param names that were replaced
+ *   missing     -- array of {{placeholders}} still present after substitution
+ */
+function substituteParams(sparql, params) {
+  if (!params || typeof params !== 'object' || Object.keys(params).length === 0)
+    return { sparql, substituted: [], missing: [] }
+
+  let result = sparql
+  const substituted = []
+
+  for (const [key, value] of Object.entries(params)) {
+    const placeholder = new RegExp(`\\{\\{${key}\\}\\}`, 'g')
+    if (placeholder.test(result)) {
+      result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value))
+      substituted.push(key)
+    }
+  }
+
+  // Detect any remaining unresolved placeholders
+  const remaining = [...result.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[0])
+
+  return { sparql: result, substituted, missing: remaining }
+}
+
 function rebuildEndpoints(dataset, base) {
   DATASET     = dataset
   if (base) JENA_BASE = base.replace(/\/+$/, '')   // strip trailing slash
@@ -144,7 +186,7 @@ async function loadNamedQueriesFromGraph() {
 PREFIX hb:      <https://w3id.org/holonbridge/>
 PREFIX dcterms: <http://purl.org/dc/terms/>
 
-SELECT ?id ?label ?description ?sparql ?targetGraph
+SELECT ?id ?label ?description ?sparql ?targetGraph ?parameters
 WHERE {
   GRAPH <${graphIri}> {
     ?query a hb:NamedQuery ;
@@ -153,20 +195,28 @@ WHERE {
     OPTIONAL { ?query dcterms:title       ?label }
     OPTIONAL { ?query dcterms:description ?description }
     OPTIONAL { ?query hb:targetGraph      ?targetGraph }
+    OPTIONAL { ?query hb:parameters       ?parameters }
   }
 }
 ORDER BY ?id`
   try {
     const { bindings } = await runQuery(JENA_SPARQL, sparql, LOG_SPARQL)
     const queries = bindings
-      .map(r => ({
-        id:          r.id?.value          ?? '',
-        label:       r.label?.value       ?? r.id?.value ?? '',
-        description: r.description?.value ?? '',
-        sparql:      r.sparql?.value      ?? '',
-        targetGraph: r.targetGraph?.value ?? null,
-        source:      'rdf'
-      }))
+      .map(r => {
+        let params = []
+        if (r.parameters?.value) {
+          try { params = JSON.parse(r.parameters.value) } catch (_) {}
+        }
+        return {
+          id:          r.id?.value          ?? '',
+          label:       r.label?.value       ?? r.id?.value ?? '',
+          description: r.description?.value ?? '',
+          sparql:      r.sparql?.value      ?? '',
+          targetGraph: r.targetGraph?.value ?? null,
+          params,
+          source:      'rdf'
+        }
+      })
       .filter(q => q.id && q.sparql)
     console.log(`[Bridge] Loaded ${queries.length} named quer${queries.length === 1 ? 'y' : 'ies'} from <${graphIri}>`)
     return queries
@@ -348,22 +398,39 @@ app.use((req, res, next) => {
 // -- POST /query ---------------------------------------------------------------
 
 app.post('/query', async (req, res) => {
-  const { nl, queryId, format } = req.body ?? {}
+  const { nl, queryId, params, format } = req.body ?? {}
   const asDataBook = format === 'databook'
 
   // -- Named query: execute stored SPARQL directly, bypass NL pipeline -----------
   if (queryId) {
     const nq = namedQueries.find(q => q.id === queryId)
     if (!nq) return res.status(404).json({ error: `Named query '${queryId}' not found.` })
-    console.log(`[Bridge] Named query '${queryId}' (source: ${nq.source ?? 'unknown'})`)
+
+    // Apply parameter substitution if params supplied
+    let sparqlToRun = nq.sparql
+    let substitution = { substituted: [], missing: [] }
+    if (params && typeof params === 'object') {
+      substitution = substituteParams(nq.sparql, params)
+      sparqlToRun  = substitution.sparql
+      if (substitution.missing.length > 0) {
+        return res.status(400).json({
+          error:   `Named query '${queryId}' has unresolved placeholders after substitution.`,
+          missing: substitution.missing,
+          params:  nq.params ?? []
+        })
+      }
+    }
+
+    console.log(`[Bridge] Named query '${queryId}' (source: ${nq.source ?? 'unknown'}, params: ${JSON.stringify(params ?? {})})`)
     try {
-      const { vars, bindings }  = await runQuery(JENA_SPARQL, nq.sparql, LOG_SPARQL)
+      const { vars, bindings }  = await runQuery(JENA_SPARQL, sparqlToRun, LOG_SPARQL)
       const formattedResults    = formatBindings(vars, bindings)
       const answer              = `Named query '${nq.label ?? queryId}' returned ${bindings.length} result(s).`
-      const result              = { answer, sparql: nq.sparql, bindings, vars, formattedResults, retries: 0, queryId }
+      const result              = { answer, sparql: sparqlToRun, bindings, vars, formattedResults, retries: 0, queryId,
+                                    substitution: substitution.substituted.length > 0 ? substitution : undefined }
       if (asDataBook) {
         const doc = buildResponseDataBook({
-          nlQuery: nq.description ?? queryId, sparql: nq.sparql, bindings, vars,
+          nlQuery: nq.description ?? queryId, sparql: sparqlToRun, bindings, vars,
           formattedResults, answer, retries: 0, namedGraphs, model: MODEL,
           endpoint: JENA_SPARQL, error: null
         })
@@ -646,13 +713,13 @@ app.get('/description', async (_req, res) => {
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
 
   res.json({
-    service: 'holon-bridge', version: '2.5.0',
+    service: 'holon-bridge', version: '2.6.0',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
     shaclTriples, model: MODEL, maxRetries: MAX_RETRIES,
     operations: [
-      { method: 'POST', path: '/query',          description: 'NL -> SPARQL -> interpreted answer. Or { queryId } to execute a stored named query directly.' },
+      { method: 'POST', path: '/query',          description: 'NL -> SPARQL -> interpreted answer. Or { queryId } to execute a stored named query. Or { queryId, params: { key: value } } for parameterised named queries — substitutes {{key}} placeholders in the stored SPARQL before execution.' },
       { method: 'POST', path: '/sparql-select',  description: 'Direct SPARQL SELECT/ASK/CONSTRUCT/DESCRIBE — bypasses NL pipeline entirely. Body: { "sparql": "..." }. Returns bindings for SELECT/ASK, Turtle for CONSTRUCT/DESCRIBE.' },
       { method: 'POST', path: '/update',         description: 'SHACL-gated Turtle push to a named graph.' },
       { method: 'POST', path: '/sparql-update',  description: 'Raw SPARQL UPDATE (INSERT/DELETE/etc) — no validation gate.' },
@@ -660,7 +727,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/dataset',        description: 'Switch active dataset at runtime. Accepts optional "fusekiUrl" to change Fuseki host in the same call. Restarts context watcher. Body: { "dataset": "name", "fusekiUrl"?: "http://..." }.' },
       { method: 'POST', path: '/fuseki-url',     description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
       { method: 'POST', path: '/shacl-mode',     description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
-      { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query in the RDF graph urn:{dataset}:named-queries. Body: { id, label?, description?, sparql, targetGraph? } or { id, delete: true }.' },
+      { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query. Body: { id, label?, description?, sparql, targetGraph?, params?: [{name, description?, default?}] } or { id, delete: true }. Use {{paramName}} placeholders in sparql; callers supply values via POST /query { queryId, params }.' },
       { method: 'GET',  path: '/datasets',       description: 'List all datasets available on the Fuseki server.' },
       { method: 'GET',  path: '/graphs',         description: 'Live query: list all named graphs in the active dataset with triple counts.' },
       { method: 'GET',  path: '/graph',          description: 'Fetch RDF content of a single named graph via GSP. Query params: iri=<encoded IRI>, format=turtle|trig.' },
@@ -695,7 +762,7 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.5.0',
+    status: 'ok', service: 'holon-bridge', version: '2.6.0',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
@@ -765,6 +832,14 @@ app.post('/named-query', async (req, res) => {
   if (!sparql || typeof sparql !== 'string' || !sparql.trim())
     return res.status(400).json({ error: '"sparql" is required for registration.' })
 
+  // Validate params if supplied (must be array of { name, description?, default? })
+  let paramsJson = null
+  if (req.body.params !== undefined) {
+    if (!Array.isArray(req.body.params))
+      return res.status(400).json({ error: '"params" must be an array of { name, description?, default? } objects.' })
+    paramsJson = JSON.stringify(req.body.params)
+  }
+
   const escape = s => s.replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"')
   const HB      = 'https://w3id.org/holonbridge/'
   const DCTERMS = 'http://purl.org/dc/terms/'
@@ -773,6 +848,7 @@ app.post('/named-query', async (req, res) => {
     label       ? `    <${DCTERMS}title>       """${escape(label)}""" ;`       : null,
     description ? `    <${DCTERMS}description> """${escape(description)}""" ;` : null,
     targetGraph ? `    <${HB}targetGraph>      <${targetGraph}> ;`             : null,
+    paramsJson  ? `    <${HB}parameters>       """${escape(paramsJson)}""" ;`  : null,
   ].filter(Boolean).join('\n')
 
   const turtleData = `${queryNode} a <${HB}NamedQuery> ;
@@ -817,8 +893,8 @@ app.get('/named-queries', (_req, res) => {
     total:      namedQueries.length,
     rdf:        rdf.length,
     filesystem: fs.length,
-    queries:    namedQueries.map(({ id, label, description, targetGraph, source }) =>
-                  ({ id, label, description, targetGraph, source }))
+    queries:    namedQueries.map(({ id, label, description, targetGraph, params, source }) =>
+                  ({ id, label, description, targetGraph, params: params ?? [], source }))
   })
 })
 
@@ -992,7 +1068,7 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.5.0 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.6.0 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
