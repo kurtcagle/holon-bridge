@@ -39,6 +39,7 @@ import 'dotenv/config'
 import express          from 'express'
 import chokidar         from 'chokidar'
 import { join }         from 'path'
+import { randomUUID }   from 'node:crypto'
 
 import { loadDataBookFromDir }                                      from './lib/databook.js'
 import { runQuery, formatBindings, discoverGraphs,
@@ -80,7 +81,8 @@ let SHACL_REQUIRED = process.env.SHACL_REQUIRED === 'true'
 
 /** IRI of the named-queries graph for the active dataset. */
 function namedQueriesGraphIri() { return `urn:${DATASET}:named-queries` }
-function namedRulesGraphIri()   { return `urn:${DATASET}:named-rules` }
+function namedRulesGraphIri()     { return `urn:${DATASET}:named-rules` }
+function namedPipelinesGraphIri() { return `urn:${DATASET}:named-pipelines` }
 
 // --- Context directory helpers ------------------------------------------------
 
@@ -107,6 +109,8 @@ let schemaContext = ''
 let databookIds   = []
 let namedQueries  = []
 let namedRules    = []   // non-canonical — pending WG IV alignment
+let namedPipelines = []  // non-canonical — pending WG IV alignment
+const messageStore = new Map() // in-memory message status; volatile on restart
 let namedGraphs   = []
 let activeWatcher = null   // chokidar FSWatcher for the active context dir
 
@@ -290,6 +294,271 @@ ORDER BY ?order ?id`
   }
 }
 
+/**
+ * Load pipeline manifests from RDF graph `urn:{DATASET}:named-pipelines`.
+ * Non-canonical — pending WG IV alignment.
+ */
+async function loadNamedPipelinesFromGraph() {
+  const graphIri = namedPipelinesGraphIri()
+  const sparql = `
+PREFIX hb:      <https://w3id.org/holonbridge/>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+
+SELECT ?id ?label ?description ?signalType ?holdingGraph ?shapesGraph
+       ?promotionRule ?violationRule ?warningRule ?reportGraph ?contextGraph
+       ?retainOnViolation ?defaultWarningPolicy
+WHERE {
+  GRAPH <${graphIri}> {
+    ?pipeline a hb:Pipeline ;
+              dcterms:identifier ?id .
+    OPTIONAL { ?pipeline dcterms:title             ?label }
+    OPTIONAL { ?pipeline dcterms:description       ?description }
+    OPTIONAL { ?pipeline hb:signalType             ?signalType }
+    OPTIONAL { ?pipeline hb:holdingGraph           ?holdingGraph }
+    OPTIONAL { ?pipeline hb:shapesGraph            ?shapesGraph }
+    OPTIONAL { ?pipeline hb:promotionRule          ?promotionRule }
+    OPTIONAL { ?pipeline hb:violationRule          ?violationRule }
+    OPTIONAL { ?pipeline hb:warningRule            ?warningRule }
+    OPTIONAL { ?pipeline hb:reportGraph            ?reportGraph }
+    OPTIONAL { ?pipeline hb:contextGraph           ?contextGraph }
+    OPTIONAL { ?pipeline hb:retainOnViolation      ?retainOnViolation }
+    OPTIONAL { ?pipeline hb:defaultWarningPolicy   ?defaultWarningPolicy }
+  }
+}
+ORDER BY ?id`
+  try {
+    const { bindings } = await runQuery(JENA_SPARQL, sparql, LOG_SPARQL)
+    const pipelines = bindings
+      .map(r => ({
+        id:                   r.id?.value                ?? '',
+        label:                r.label?.value             ?? '',
+        description:          r.description?.value       ?? '',
+        signalType:           r.signalType?.value        ?? null,
+        holdingGraph:         r.holdingGraph?.value      ?? null,
+        shapesGraph:          r.shapesGraph?.value       ?? SHACL_GRAPH,
+        promotionRule:        r.promotionRule?.value     ?? null,
+        violationRule:        r.violationRule?.value     ?? null,
+        warningRule:          r.warningRule?.value       ?? null,
+        reportGraph:          r.reportGraph?.value       ?? `urn:${DATASET}:reports`,
+        contextGraph:         r.contextGraph?.value      ?? null,
+        retainOnViolation:    r.retainOnViolation?.value === 'true',
+        defaultWarningPolicy: (r.defaultWarningPolicy?.value ?? '').split('#').pop() || 'Block'
+      }))
+      .filter(p => p.id)
+    console.log(`[Bridge] Loaded ${pipelines.length} pipeline${pipelines.length === 1 ? '' : 's'} from <${graphIri}>`)
+    return pipelines
+  } catch (err) {
+    console.warn(`[Bridge] No pipelines from <${graphIri}>: ${err.message}`)
+    return []
+  }
+}
+
+/**
+ * Execute a named rule by rule object, with optional param substitution.
+ * Returns { turtle, tripleCount } on success or throws.
+ * Non-canonical — shared between /rule endpoint and runPipeline().
+ */
+async function executeNamedRule(rule, params = {}) {
+  let sparqlToRun = rule.sparql
+
+  // $this special binding
+  if (params['$this']) {
+    const v = params['$this']
+    sparqlToRun = sparqlToRun.replace(/\$this\b/g,
+      (v.startsWith('http') || v.startsWith('urn')) ? `<${v}>` : v)
+    delete params['$this']
+  }
+
+  // Timestamp and other auto-bindings
+  const now = new Date().toISOString()
+  const autoParams = { '$timestamp': now, '$dataset': DATASET, ...params }
+  const sub = substituteParams(sparqlToRun, autoParams)
+  if (sub.missing.length > 0)
+    throw new Error(`Unresolved placeholders in rule '${rule.id}': ${sub.missing.join(', ')}`)
+  sparqlToRun = sub.sparql
+
+  const writeMode   = rule.writeMode   ?? 'Append'
+  const targetGraph = rule.targetGraph
+
+  // Execute CONSTRUCT
+  const controller = new AbortController()
+  const timer      = setTimeout(() => controller.abort(), 60_000)
+  let constructResp
+  try {
+    constructResp = await fetch(JENA_SPARQL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
+      body:    sparqlToRun,
+      signal:  controller.signal
+    })
+  } finally { clearTimeout(timer) }
+
+  const turtle = await constructResp.text()
+  if (!constructResp.ok)
+    throw new Error(`CONSTRUCT failed (HTTP ${constructResp.status}): ${turtle.slice(0, 200)}`)
+
+  const tripleCount = turtle.trim()
+    ? turtle.split('\n').filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('@') && !l.startsWith('PREFIX')).length
+    : 0
+
+  // Write to target graph per writeMode
+  const gspTarget = `${JENA_GSP}?graph=${encodeURIComponent(targetGraph)}`
+  if (writeMode === 'Replace' || writeMode === 'Sync') {
+    await fetch(JENA_UPDATE, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/sparql-update' },
+      body:    `${writeMode === 'Sync' ? 'DROP SILENT' : 'CLEAR'} GRAPH <${targetGraph}>`
+    })
+  }
+  if (turtle.trim()) {
+    const gspResp = await fetch(gspTarget, {
+      method:  'POST',
+      headers: { 'Content-Type': 'text/turtle' },
+      body:    turtle
+    })
+    if (!gspResp.ok) {
+      const err = await gspResp.text()
+      throw new Error(`GSP write failed: ${err.slice(0, 200)}`)
+    }
+  }
+  return { turtle, tripleCount, writeMode, targetGraph }
+}
+
+/**
+ * Run the inbound signal pipeline for a given messageId.
+ * Reads envelope from messageStore, validates payload, routes by severity,
+ * fires appropriate named rule, updates message status.
+ * Non-canonical — pending WG IV alignment.
+ */
+async function runPipeline(messageId) {
+  const msg = messageStore.get(messageId)
+  if (!msg) throw new Error(`Message '${messageId}' not found in store.`)
+
+  const pipeline = namedPipelines.find(p => p.id === msg.pipelineId)
+    ?? namedPipelines.find(p => p.signalType === msg.signalType)
+  if (!pipeline) {
+    msg.status = 'hb:Rejected'
+    msg.note   = `No pipeline found for id '${msg.pipelineId}' or signalType '${msg.signalType}'.`
+    return
+  }
+
+  const payloadGraph  = msg.payloadGraph
+  const shapesGraph   = pipeline.shapesGraph ?? SHACL_GRAPH
+  const reportGraph   = pipeline.reportGraph ?? `urn:${DATASET}:reports`
+  const holdingGraph  = msg.holdingGraph
+
+  try {
+    // 1. Fetch payload graph as Turtle for validation
+    const gspUrl = `${JENA_GSP}?graph=${encodeURIComponent(payloadGraph)}`
+    const gspResp = await fetch(gspUrl, { headers: { 'Accept': 'text/turtle' } })
+    if (!gspResp.ok) throw new Error(`Could not fetch payload graph <${payloadGraph}>`)
+    const payloadTurtle = await gspResp.text()
+
+    // 2. SHACL validate
+    const validation = await validateWithShacl(JENA_BASE, DATASET, shapesGraph, payloadTurtle)
+    const conforms    = validation?.conforms ?? true
+
+    // 3. Determine max severity from report
+    let maxSeverity = 'Info'
+    if (!conforms && validation?.results?.length > 0) {
+      const severities = validation.results.map(r => r.severity ?? 'Violation')
+      maxSeverity = severities.includes('Violation') ? 'Violation'
+                  : severities.includes('Warning')   ? 'Warning'
+                  : 'Info'
+    }
+
+    // 4. Route by severity
+    const ruleParams = {
+      '$holdingGraph': holdingGraph,
+      '$payloadGraph': payloadGraph,
+      '$signalType':   msg.signalType,
+      '$user':         msg.submittedBy ?? '',
+      '$timestamp':    new Date().toISOString(),
+      'uuid':          randomUUID()
+    }
+
+    if (maxSeverity === 'Violation') {
+      msg.status = 'hb:Violated'
+      const vRule = namedRules.find(r => r.id === pipeline.violationRule)
+      if (vRule) {
+        await executeNamedRule(vRule, { ...ruleParams,
+          '$reportGraph': reportGraph,
+          '$validationNote': (validation?.results?.[0]?.message ?? 'Violation')
+        })
+      }
+      // Write ValidationReport stub to report graph
+      const reportTurtle = `
+PREFIX hb:  <https://w3id.org/holonbridge/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+<urn:${DATASET}:report:${messageId}>
+  a hb:ValidationReport ;
+  hb:messageId "${messageId}" ;
+  hb:conforms false ;
+  hb:severity hb:Violation ;
+  hb:timestamp "${ruleParams['$timestamp']}"^^xsd:dateTime .`
+      await fetch(`${JENA_GSP}?graph=${encodeURIComponent(reportGraph)}`, {
+        method: 'POST', headers: { 'Content-Type': 'text/turtle' }, body: reportTurtle
+      })
+      msg.reportIri = `urn:${DATASET}:report:${messageId}`
+      if (!pipeline.retainOnViolation)
+        await fetch(JENA_UPDATE, { method: 'POST',
+          headers: { 'Content-Type': 'application/sparql-update' },
+          body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
+        })
+
+    } else if (maxSeverity === 'Warning') {
+      msg.status = 'hb:Warned'
+      const warningPolicy = pipeline.defaultWarningPolicy ?? 'Block'
+      const wRule = namedRules.find(r => r.id === pipeline.warningRule)
+
+      if (warningPolicy === 'Block') {
+        // Treat as violation
+        if (wRule) await executeNamedRule(wRule, { ...ruleParams, '$reportGraph': reportGraph })
+        msg.status = 'hb:Rejected'
+        msg.note   = 'Warning treated as violation per pipeline defaultWarningPolicy: Block'
+        if (!pipeline.retainOnViolation)
+          await fetch(JENA_UPDATE, { method: 'POST',
+            headers: { 'Content-Type': 'application/sparql-update' },
+            body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
+          })
+      } else {
+        // AnnotateAndPromote — promote with warning annotation
+        if (wRule) await executeNamedRule(wRule, ruleParams)
+        const eventIri = `urn:${DATASET}:event:${ruleParams.uuid}`
+        msg.status  = 'hb:Promoted'
+        msg.eventIri = eventIri
+        msg.note    = 'Promoted with warning annotation (AnnotateAndPromote policy)'
+        await fetch(JENA_UPDATE, { method: 'POST',
+          headers: { 'Content-Type': 'application/sparql-update' },
+          body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
+        })
+      }
+
+    } else {
+      // Valid path — fire promotion rule
+      msg.status = 'hb:Valid'
+      const pRule = namedRules.find(r => r.id === pipeline.promotionRule)
+      if (pRule) await executeNamedRule(pRule, ruleParams)
+      const eventIri = `urn:${DATASET}:event:${ruleParams.uuid}`
+      msg.status    = 'hb:Promoted'
+      msg.eventIri  = eventIri
+      await fetch(JENA_UPDATE, { method: 'POST',
+        headers: { 'Content-Type': 'application/sparql-update' },
+        body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
+      })
+    }
+
+    msg.resolvedAt = new Date().toISOString()
+    console.log(`[Bridge] Pipeline '${msg.pipelineId}' → message '${messageId}' → ${msg.status}`)
+
+  } catch (err) {
+    msg.status     = 'hb:Rejected'
+    msg.note       = err.message
+    msg.resolvedAt = new Date().toISOString()
+    console.error(`[Bridge] Pipeline error for '${messageId}':`, err.message)
+  }
+}
+
 async function loadContext() {
   const dir = getContextDir()
   const db  = await loadDataBookFromDir(dir)
@@ -314,6 +583,9 @@ async function loadContext() {
 
   // Load named rules
   namedRules = await loadNamedRulesFromGraph()
+
+  // Load named pipelines
+  namedPipelines = await loadNamedPipelinesFromGraph()
 
   databookIds  = db.ids()
   console.log(`[Bridge] Context loaded from ${dir} -- ${schemaContext.length} chars, ${namedQueries.length} named queries (${rdfQueries.length} RDF, ${fsQueries.length} filesystem)`)
@@ -782,7 +1054,7 @@ app.get('/description', async (_req, res) => {
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
 
   res.json({
-    service: 'holon-bridge', version: '2.7.0',
+    service: 'holon-bridge', version: '2.8.0',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
@@ -797,7 +1069,11 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/fuseki-url',     description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
       { method: 'POST', path: '/shacl-mode',     description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
       { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query. Body: { id, label?, description?, sparql, targetGraph?, params?: [{name, description?, default?}] } or { id, delete: true }. Use {{paramName}} placeholders in sparql; callers supply values via POST /query { queryId, params }.' },
-      { method: 'POST', path: '/named-rule',    description: '[NON-CANONICAL] Register, update, enable/disable, or delete a named rule. Body: { id, sparql, targetGraph, writeMode?, ruleStatus?, firesOnSeverity?, params?, order? } or { id, delete: true } or { id, status }.' },
+      { method: 'POST', path: '/pipeline',      description: '[NON-CANONICAL] Register, update, or delete a pipeline manifest. Body: { id, signalType, holdingGraph, promotionRule, contextGraph, ... } or { id, delete: true }.' },
+      { method: 'POST', path: '/ingest',        description: '[NON-CANONICAL] Submit a signal through a named pipeline. Pattern A: JSON body. Pattern B: text/turtle hb:Message. Returns 202 with messageId. Add sync:true for synchronous execution.' },
+      { method: 'POST', path: '/pipeline-run',  description: '[NON-CANONICAL] Trigger pipeline on pre-populated holding graph (Pattern C). Body: { messageId }. Returns 202.' },
+      { method: 'GET',  path: '/pipelines',     description: '[NON-CANONICAL] List all registered pipeline manifests.' },
+      { method: 'GET',  path: '/message/:id',   description: '[NON-CANONICAL] Poll message status. Returns status, eventIri, reportIri, resolvedAt.' },
       { method: 'POST', path: '/rule',          description: '[NON-CANONICAL] Execute a named rule by ID. Runs CONSTRUCT and writes results to targetGraph per writeMode (Append/Replace/Sync). Body: { ruleId, params?, writeMode? }.' },
       { method: 'POST', path: '/graph-op',      description: 'Execute a SPARQL graph management operation. Body: { operation: clear|drop|create|copy|move|add, source?, target, silent? }.' },
       { method: 'GET',  path: '/datasets',       description: 'List all datasets available on the Fuseki server.' },
@@ -809,8 +1085,10 @@ app.get('/description', async (_req, res) => {
     ],
     namedQueriesGraph: namedQueriesGraphIri(),
     namedRulesGraph:   namedRulesGraphIri(),
+    namedPipelinesGraph: namedPipelinesGraphIri(),
     namedQueries, namedGraphs, databookBlocks: databookIds,
     namedRules: namedRules.length,
+    namedPipelines: namedPipelines.length,
     shacl: {
       graph: SHACL_GRAPH, tripleCount: shaclTriples,
       required: SHACL_REQUIRED,
@@ -836,13 +1114,14 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.7.0',
+    status: 'ok', service: 'holon-bridge', version: '2.8.0',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
     databookBlocks: databookIds, namedGraphs,
     namedQueries: namedQueries.length,
     namedRules: namedRules.length,
+    namedPipelines: namedPipelines.length,
     maxRetries: MAX_RETRIES
   })
 })
@@ -1284,13 +1563,10 @@ app.get('/named-rules', (_req, res) => {
 
 // -- POST /rule ----------------------------------------------------------------
 //
-// [NON-CANONICAL] Execute a named rule by ID.
-// Runs the CONSTRUCT, writes results to targetGraph per writeMode.
-// Params substitute {{placeholders}} in the SPARQL. $this may be supplied
-// as a param to bind the focus node.
+// [NON-CANONICAL] Execute a named rule by ID via the executeNamedRule helper.
 //
 // Request:  { ruleId, params?: { key: value }, writeMode?: "Append"|"Replace"|"Sync" }
-// Response: { ruleId, targetGraph, writeMode, triplesWritten, sparql }
+// Response: { ruleId, targetGraph, writeMode, triplesWritten }
 
 app.post('/rule', async (req, res) => {
   const { ruleId, params, writeMode: writeModeOverride } = req.body ?? {}
@@ -1301,90 +1577,23 @@ app.post('/rule', async (req, res) => {
   const rule = namedRules.find(r => r.id === ruleId)
   if (!rule)
     return res.status(404).json({ error: `Named rule '${ruleId}' not found.` })
-
   if (rule.ruleStatus === 'Suspended')
     return res.status(409).json({ error: `Named rule '${ruleId}' is suspended.` })
-
   if (rule.ruleStatus === 'Deprecated')
     return res.status(409).json({ error: `Named rule '${ruleId}' is deprecated.` })
 
-  // Apply param substitution (including $this as a special binding)
-  let sparqlToRun = rule.sparql
-  if (params && typeof params === 'object') {
-    // Handle $this specially — substitute with <IRI> form if it looks like an IRI
-    const allParams = { ...params }
-    if (allParams['$this']) {
-      const thisVal = allParams['$this']
-      sparqlToRun = sparqlToRun.replace(/\$this\b/g,
-        thisVal.startsWith('http') || thisVal.startsWith('urn') ? `<${thisVal}>` : thisVal)
-      delete allParams['$this']
-    }
-    const sub = substituteParams(sparqlToRun, allParams)
-    if (sub.missing.length > 0)
-      return res.status(400).json({ error: 'Unresolved placeholders', missing: sub.missing })
-    sparqlToRun = sub.sparql
-  }
+  // Apply writeMode override
+  const ruleToRun = writeModeOverride ? { ...rule, writeMode: writeModeOverride } : rule
 
-  const writeMode   = writeModeOverride ?? rule.writeMode ?? 'Append'
-  const targetGraph = rule.targetGraph
-
-  console.log(`[Bridge] /rule '${ruleId}' writeMode=${writeMode} target=<${targetGraph}>`)
-  if (LOG_SPARQL) console.log(sparqlToRun)
-
+  console.log(`[Bridge] /rule '${ruleId}' writeMode=${ruleToRun.writeMode} target=<${rule.targetGraph}>`)
   try {
-    // 1. Execute CONSTRUCT → get Turtle
-    const controller = new AbortController()
-    const timer      = setTimeout(() => controller.abort(), 60_000)
-    let constructResp
-    try {
-      constructResp = await fetch(JENA_SPARQL, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
-        body:    sparqlToRun,
-        signal:  controller.signal
-      })
-    } finally { clearTimeout(timer) }
-
-    const turtle = await constructResp.text()
-    if (!constructResp.ok)
-      return res.status(502).json({ error: `CONSTRUCT failed (HTTP ${constructResp.status}): ${turtle.slice(0,200)}` })
-
-    // Count approximate triples (newlines in non-empty Turtle)
-    const tripleCount = turtle.trim() ? turtle.split('\n').filter(l => l.trim() && !l.trim().startsWith('#') && !l.trim().startsWith('@') && !l.trim().startsWith('PREFIX')).length : 0
-
-    // 2. Apply write mode to target graph via GSP
-    const gspTarget = `${JENA_GSP}?graph=${encodeURIComponent(targetGraph)}`
-
-    if (writeMode === 'Replace' || writeMode === 'Sync') {
-      // Clear / drop first
-      const clearOp = writeMode === 'Sync' ? 'DROP SILENT' : 'CLEAR'
-      await fetch(JENA_UPDATE, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/sparql-update' },
-        body:    `${clearOp} GRAPH <${targetGraph}>`
-      })
-    }
-
-    // Append (POST) or initial write after clear (POST)
-    if (turtle.trim()) {
-      const gspResp = await fetch(gspTarget, {
-        method:  'POST',
-        headers: { 'Content-Type': 'text/turtle' },
-        body:    turtle
-      })
-      if (!gspResp.ok) {
-        const gspErr = await gspResp.text()
-        return res.status(502).json({ error: `GSP write failed: ${gspErr.slice(0,200)}` })
-      }
-    }
-
+    const result = await executeNamedRule(ruleToRun, params ? { ...params } : {})
     return res.json({
       ruleId,
-      targetGraph,
-      writeMode,
-      triplesWritten: tripleCount,
-      sparql: sparqlToRun,
-      note: 'Non-canonical implementation — pending WG IV alignment'
+      targetGraph:    rule.targetGraph,
+      writeMode:      result.writeMode,
+      triplesWritten: result.tripleCount,
+      note:           'Non-canonical implementation — pending WG IV alignment'
     })
   } catch (err) {
     if (err.name === 'AbortError')
@@ -1449,6 +1658,266 @@ app.post('/graph-op', async (req, res) => {
   }
 })
 
+// -- POST /pipeline ------------------------------------------------------------
+//
+// [NON-CANONICAL] Register, update, or delete a pipeline manifest.
+//
+// Register: { id, label?, description?, signalType, holdingGraph, shapesGraph?,
+//             promotionRule, violationRule?, warningRule?, reportGraph?,
+//             contextGraph, retainOnViolation?, defaultWarningPolicy? }
+// Delete:   { id, delete: true }
+
+app.post('/pipeline', async (req, res) => {
+  const { id, label, description, signalType, holdingGraph, shapesGraph,
+          promotionRule, violationRule, warningRule, reportGraph, contextGraph,
+          retainOnViolation, defaultWarningPolicy, delete: del } = req.body ?? {}
+
+  if (!id || typeof id !== 'string' || !id.trim())
+    return res.status(400).json({ error: '"id" is required.' })
+
+  const graphIri    = namedPipelinesGraphIri()
+  const pipelineIri = `${graphIri}:${id.trim()}`
+  const HB          = 'https://w3id.org/holonbridge/'
+  const DCTERMS     = 'http://purl.org/dc/terms/'
+  const escape      = s => s.replace(/\\/g,'\\\\').replace(/"""/g,'\\"\\"\\"')
+
+  if (del) {
+    const deleteSparql = `
+PREFIX dcterms: <${DCTERMS}>
+WITH <${graphIri}>
+DELETE { ?p ?pr ?o } WHERE { ?p dcterms:identifier """${id}""" ; ?pr ?o }`
+    try {
+      await fetch(JENA_UPDATE, { method:'POST',
+        headers:{'Content-Type':'application/sparql-update'}, body: deleteSparql })
+      namedPipelines = namedPipelines.filter(p => p.id !== id)
+      return res.json({ deleted: true, id })
+    } catch (err) {
+      return res.status(500).json({ error: err.message })
+    }
+  }
+
+  if (!signalType || !holdingGraph || !promotionRule || !contextGraph)
+    return res.status(400).json({ error: '"signalType", "holdingGraph", "promotionRule", and "contextGraph" are required.' })
+
+  const optionals = [
+    label               ? `    <${DCTERMS}title>              """${escape(label)}""" ;`        : null,
+    description         ? `    <${DCTERMS}description>        """${escape(description)}""" ;`  : null,
+    shapesGraph         ? `    <${HB}shapesGraph>             <${shapesGraph}> ;`              : null,
+    violationRule       ? `    <${HB}violationRule>           """${escape(violationRule)}""" ;`: null,
+    warningRule         ? `    <${HB}warningRule>             """${escape(warningRule)}""" ;`  : null,
+    reportGraph         ? `    <${HB}reportGraph>             <${reportGraph}> ;`              : null,
+    retainOnViolation !== undefined
+                        ? `    <${HB}retainOnViolation>       "${!!retainOnViolation}"^^<http://www.w3.org/2001/XMLSchema#boolean> ;` : null,
+    defaultWarningPolicy? `    <${HB}defaultWarningPolicy>   <${HB}${defaultWarningPolicy}> ;`: null,
+  ].filter(Boolean).join('\n')
+
+  const insertSparql = `
+PREFIX hb:      <${HB}>
+PREFIX dcterms: <${DCTERMS}>
+
+WITH <${graphIri}>
+DELETE { ?p ?pr ?o } WHERE { ?p dcterms:identifier """${id}""" ; ?pr ?o } ;
+
+INSERT DATA {
+  GRAPH <${graphIri}> {
+    <${pipelineIri}>
+      a hb:Pipeline ;
+      dcterms:identifier    """${escape(id)}""" ;
+      hb:signalType         <${signalType}> ;
+      hb:holdingGraph       <${holdingGraph}> ;
+      hb:promotionRule      """${escape(promotionRule)}""" ;
+      hb:contextGraph       <${contextGraph}> ;
+${optionals}
+      hb:defaultWarningPolicy hb:${defaultWarningPolicy ?? 'Block'} .
+  }
+}`
+
+  try {
+    const resp = await fetch(JENA_UPDATE, { method:'POST',
+      headers:{'Content-Type':'application/sparql-update'}, body: insertSparql })
+    if (!resp.ok) return res.status(502).json({ error: `Fuseki update failed` })
+    namedPipelines = await loadNamedPipelinesFromGraph()
+    console.log(`[Bridge] Pipeline '${id}' registered`)
+    return res.json({ registered: true, id, signalType, contextGraph })
+  } catch (err) {
+    return res.status(500).json({ error: err.message })
+  }
+})
+
+// -- GET /pipelines ------------------------------------------------------------
+
+app.get('/pipelines', (_req, res) => {
+  res.json({
+    total:         namedPipelines.length,
+    pipelinesGraph: namedPipelinesGraphIri(),
+    pipelines:     namedPipelines.map(({ id, label, signalType, contextGraph,
+                                         promotionRule, violationRule, warningRule,
+                                         defaultWarningPolicy }) =>
+                     ({ id, label, signalType, contextGraph,
+                        promotionRule, violationRule, warningRule, defaultWarningPolicy }))
+  })
+})
+
+// -- POST /ingest --------------------------------------------------------------
+//
+// [NON-CANONICAL] Submit a signal through a named pipeline.
+// Pattern A: JSON body with payload string (bridge auto-wraps)
+// Pattern B: text/turtle body with pre-wrapped hb:Message
+// Returns 202 Accepted with messageId and statusUrl.
+// Add "sync": true for synchronous execution (dev/test only).
+
+app.post('/ingest', async (req, res) => {
+  const contentType = req.headers['content-type'] ?? ''
+  const isTurtle    = contentType.includes('text/turtle')
+
+  let messageId, pipelineId, signalType, submittedBy, sourceSystem,
+      correlationId, payloadTurtle, sync = false
+
+  if (isTurtle) {
+    // Pattern B — pre-wrapped hb:Message in Turtle
+    const rawTurtle = req.body?.toString?.() ?? ''
+    // Extract messageId from Turtle heuristically (look for hb:messageId)
+    const midMatch  = rawTurtle.match(/hb:messageId\s+"([^"]+)"/)
+    const pidMatch  = rawTurtle.match(/hb:pipelineId\s+"([^"]+)"/)
+    const stMatch   = rawTurtle.match(/hb:signalType\s+<([^>]+)>/)
+    messageId   = midMatch?.[1] ?? randomUUID()
+    pipelineId  = pidMatch?.[1] ?? ''
+    signalType  = stMatch?.[1]  ?? ''
+    payloadTurtle = rawTurtle
+  } else {
+    // Pattern A — JSON body, bridge auto-wraps
+    const body = req.body ?? {}
+    messageId    = randomUUID()
+    pipelineId   = body.pipelineId   ?? ''
+    signalType   = body.signalType   ?? ''
+    submittedBy  = body.submittedBy  ?? null
+    sourceSystem = body.sourceSystem ?? null
+    correlationId = body.correlationId ?? null
+    payloadTurtle = body.payload     ?? ''
+    sync         = body.sync === true
+  }
+
+  if (!pipelineId && !signalType)
+    return res.status(400).json({ error: '"pipelineId" or "signalType" is required.' })
+  if (!payloadTurtle.trim())
+    return res.status(400).json({ error: '"payload" is required.' })
+
+  const pipeline = namedPipelines.find(p => p.id === pipelineId)
+               ?? namedPipelines.find(p => p.signalType === signalType)
+  if (!pipeline)
+    return res.status(404).json({ error: `No pipeline found for id '${pipelineId}' or signalType '${signalType}'.` })
+
+  const holdingGraph  = pipeline.holdingGraph ?? `urn:${DATASET}:holding:${messageId}`
+  const payloadGraph  = `${holdingGraph}:payload`
+  const now           = new Date().toISOString()
+
+  // Build envelope Turtle
+  const envelopeTurtle = `
+PREFIX hb:  <https://w3id.org/holonbridge/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+<urn:${DATASET}:message:${messageId}>
+  a hb:Message ;
+  hb:messageId     "${messageId}" ;
+  hb:signalType    <${signalType || pipeline.signalType}> ;
+  hb:pipelineId    "${pipelineId || pipeline.id}" ;
+  hb:submittedAt   "${now}"^^xsd:dateTime ;
+  hb:payloadGraph  <${payloadGraph}> ;
+  hb:status        hb:Pending${submittedBy  ? ` ;\n  hb:submittedBy   <${submittedBy}>` : ''}${sourceSystem  ? ` ;\n  hb:sourceSystem  "${sourceSystem}"` : ''}${correlationId ? ` ;\n  hb:correlationId "${correlationId}"` : ''} .`
+
+  // Store initial status
+  messageStore.set(messageId, {
+    messageId, pipelineId: pipeline.id, signalType: signalType || pipeline.signalType,
+    submittedAt: now, submittedBy, holdingGraph, payloadGraph,
+    status: 'hb:Pending', eventIri: null, reportIri: null, note: null, resolvedAt: null
+  })
+
+  // Push envelope to holding graph and payload to payload graph
+  try {
+    await fetch(`${JENA_GSP}?graph=${encodeURIComponent(holdingGraph)}`, {
+      method: 'POST', headers: { 'Content-Type': 'text/turtle' }, body: envelopeTurtle
+    })
+    await fetch(`${JENA_GSP}?graph=${encodeURIComponent(payloadGraph)}`, {
+      method: 'POST', headers: { 'Content-Type': 'text/turtle' }, body: payloadTurtle
+    })
+  } catch (err) {
+    messageStore.delete(messageId)
+    return res.status(502).json({ error: `Failed to push to holding graph: ${err.message}` })
+  }
+
+  console.log(`[Bridge] /ingest accepted messageId='${messageId}' pipeline='${pipeline.id}'`)
+
+  if (sync) {
+    await runPipeline(messageId)
+    const msg = messageStore.get(messageId)
+    return res.json({ messageId, pipelineId: pipeline.id, ...msg })
+  }
+
+  // Async — fire and forget
+  setImmediate(() => runPipeline(messageId))
+
+  return res.status(202).json({
+    accepted:   true,
+    messageId,
+    pipelineId: pipeline.id,
+    statusUrl:  `/message/${messageId}`
+  })
+})
+
+// -- POST /pipeline-run --------------------------------------------------------
+//
+// [NON-CANONICAL] Trigger pipeline execution on a pre-populated holding graph.
+// Pattern C: payload already pushed; call this to begin validation + routing.
+
+app.post('/pipeline-run', async (req, res) => {
+  const { messageId } = req.body ?? {}
+
+  if (!messageId || typeof messageId !== 'string')
+    return res.status(400).json({ error: '"messageId" is required.' })
+
+  const msg = messageStore.get(messageId)
+  if (!msg)
+    return res.status(404).json({ error: `Message '${messageId}' not found. Use POST /ingest first.` })
+
+  if (msg.status !== 'hb:Pending')
+    return res.status(409).json({ error: `Message '${messageId}' is not Pending (status: ${msg.status}).` })
+
+  console.log(`[Bridge] /pipeline-run triggered for '${messageId}'`)
+  setImmediate(() => runPipeline(messageId))
+
+  return res.status(202).json({
+    triggered:  true,
+    messageId,
+    pipelineId: msg.pipelineId,
+    statusUrl:  `/message/${messageId}`
+  })
+})
+
+// -- GET /message/:id ----------------------------------------------------------
+//
+// Poll the status of an in-flight or resolved message.
+
+app.get('/message/:id', (req, res) => {
+  const messageId = req.params.id
+  const msg = messageStore.get(messageId)
+
+  if (!msg)
+    return res.status(404).json({
+      error: `Message '${messageId}' not found. Status store is in-memory and resets on bridge restart.`
+    })
+
+  return res.json({
+    messageId:   msg.messageId,
+    pipelineId:  msg.pipelineId,
+    signalType:  msg.signalType,
+    status:      msg.status,
+    submittedAt: msg.submittedAt,
+    resolvedAt:  msg.resolvedAt ?? null,
+    eventIri:    msg.eventIri  ?? null,
+    reportIri:   msg.reportIri ?? null,
+    note:        msg.note      ?? null
+  })
+})
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -1458,9 +1927,10 @@ app.use((_req, res) => {
       'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select',
       'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode',
       'POST /named-query', 'POST /named-rule', 'POST /rule', 'POST /graph-op',
+      'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
       'GET  /datasets', 'GET  /graphs', 'GET  /graph',
-      'GET  /named-queries', 'GET  /named-rules',
-      'GET  /description', 'GET  /health'
+      'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
+      'GET  /message/:id', 'GET  /description', 'GET  /health'
     ]
   })
 })
