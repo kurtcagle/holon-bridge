@@ -711,8 +711,10 @@ async function runUpdate(turtle, graphIri, mode) {
     }
 
     if (!validation.conforms) {
-      console.warn(`[Update] SHACL validation failed -- ${validation.violations.length} violation(s)`)
+      const violations = validation.violations ?? []
+      console.warn(`[Update] SHACL validation failed -- ${violations.length} violation(s)`)
       return { updated: false, error: 'SHACL validation failed -- no data written',
+               conforms: false, results: violations, violations,
                validation, graph: graphIri, mode }
     }
   }
@@ -720,10 +722,10 @@ async function runUpdate(turtle, graphIri, mode) {
   try {
     const result = await pushToGraph(JENA_GSP, graphIri, turtle, mode)
     console.log(`[Update] Push succeeded -- HTTP ${result.status}, graph=${graphIri ?? 'default'}, mode=${mode}`)
-    return { updated: true, graph: graphIri, mode, validation, jenaStatus: result.status }
+    return { updated: true, conforms: true, results: [], graph: graphIri, mode, validation, jenaStatus: result.status }
   } catch (err) {
     return { updated: false, error: `Jena GSP push failed: ${err.jenaMessage ?? err.message}`,
-             validation, graph: graphIri, mode }
+             conforms: true, results: [], validation, graph: graphIri, mode }
   }
 }
 
