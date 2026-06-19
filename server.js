@@ -41,6 +41,12 @@ import chokidar         from 'chokidar'
 import { join }         from 'path'
 import { randomUUID }   from 'node:crypto'
 
+// Patch console to prefix every log line with an ISO timestamp
+;['log', 'warn', 'error'].forEach(method => {
+  const orig = console[method].bind(console)
+  console[method] = (...args) => orig(`[${new Date().toISOString()}]`, ...args)
+})
+
 import { loadDataBookFromDir }                                      from './lib/databook.js'
 import { runQuery, formatBindings, discoverGraphs,
          checkShaclGraph, pushToGraph, SparqlError }               from './lib/sparql.js'
