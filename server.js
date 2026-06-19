@@ -715,6 +715,7 @@ async function runUpdate(turtle, graphIri, mode) {
       console.warn(`[Update] SHACL validation failed -- ${violations.length} violation(s)`)
       return { updated: false, error: 'SHACL validation failed -- no data written',
                conforms: false, results: violations, violations,
+               rawReport: validation.rawReport ?? null,
                validation, graph: graphIri, mode }
     }
   }
