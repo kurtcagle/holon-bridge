@@ -430,7 +430,7 @@ async function executeNamedRule(rule, params = {}) {
  * fires appropriate named rule, updates message status.
  * Non-canonical — pending WG IV alignment.
  */
-async function runPipeline(messageId) {
+async function runIngestPipeline(messageId) {
   const msg = messageStore.get(messageId)
   if (!msg) throw new Error(`Message '${messageId}' not found in store.`)
 
@@ -1847,13 +1847,13 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
   console.log(`[Bridge] /ingest accepted messageId='${messageId}' pipeline='${pipeline.id}'`)
 
   if (sync) {
-    await runPipeline(messageId)
+    await runIngestPipeline(messageId)
     const msg = messageStore.get(messageId)
     return res.json({ messageId, pipelineId: pipeline.id, ...msg })
   }
 
   // Async — fire and forget
-  setImmediate(() => runPipeline(messageId))
+  setImmediate(() => runIngestPipeline(messageId))
 
   return res.status(202).json({
     accepted:   true,
@@ -1882,7 +1882,7 @@ app.post('/pipeline-run', async (req, res) => {
     return res.status(409).json({ error: `Message '${messageId}' is not Pending (status: ${msg.status}).` })
 
   console.log(`[Bridge] /pipeline-run triggered for '${messageId}'`)
-  setImmediate(() => runPipeline(messageId))
+  setImmediate(() => runIngestPipeline(messageId))
 
   return res.status(202).json({
     triggered:  true,
