@@ -29,7 +29,7 @@ async function fetchGitHubFile(owner, repo, path, token) {
   const res = await fetch(url, {
     headers: {
       // .trim() defends against CRLF line endings in .env on Windows
-      // which would append \r to the token value and cause a 401
+      // which would append \r to the token and cause a 401
       'Authorization':        `token ${token.trim()}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
@@ -82,10 +82,9 @@ export function extractTurtleBlocks(markdown) {
  * Fetch all registry DataBooks from GitHub and return their Turtle content.
  *
  * Returns:
- *   { ontology, contentTypes, bridges, endpoints }  — all strings of Turtle
+ *   { ontology, contentTypes, bridges, endpoints }  -- all strings of Turtle
  */
 export async function fetchRegistryDataBooks({ owner, repo, token }) {
-  // Trim token once here so all internal calls are clean
   const tok = token.trim()
   console.log(`[registry] Fetching DataBooks from ${owner}/${repo}...`)
 
