@@ -53,6 +53,9 @@ import { runQuery, formatBindings, discoverGraphs,
 import { buildQuery, retryQuery, interpretResults }                 from './lib/llm.js'
 import { buildResponseDataBook }                                    from './lib/format.js'
 import { validateWithShacl }                                        from './lib/shacl.js'
+import { initSession, loadRegistryCache,
+         resolveEndpoints, probeReachability,
+         GRAPHS as REGISTRY_GRAPHS }                                from './registry/session-init.js'
 
 // --- CLI arg parser -----------------------------------------------------------
 
@@ -1927,6 +1930,46 @@ app.get('/message/:id', (req, res) => {
   })
 })
 
+// -- GET /registry -------------------------------------------------------------
+//
+// List all registered HolonBridge instances with live reachability status.
+// Probes each bridge's /health endpoint on every call — never cached.
+
+app.get('/registry', async (_req, res) => {
+  try {
+    const health  = await probeReachability()
+    const entries = [...health.entries()].map(([iri, v]) => ({
+      iri,
+      label:     v.label,
+      url:       v.url,
+      reachable: v.reachable,
+      latencyMs: v.latencyMs ?? null,
+      error:     v.error     ?? null,
+    }))
+    res.json({ bridges: entries, graphs: REGISTRY_GRAPHS })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -- POST /registry/refresh ----------------------------------------------------
+//
+// Force a full registry cache refresh from GitHub, bypassing the TTL check.
+
+app.post('/registry/refresh', async (_req, res) => {
+  try {
+    const cache     = await loadRegistryCache({ cacheMaxAgeMs: 0 })
+    const endpoints = await resolveEndpoints()
+    res.json({
+      refreshed:          true,
+      graphsUpdated:      cache.graphsUpdated,
+      endpointsRefreshed: endpoints.refreshed,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -1939,7 +1982,8 @@ app.use((_req, res) => {
       'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
       'GET  /datasets', 'GET  /graphs', 'GET  /graph',
       'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
-      'GET  /message/:id', 'GET  /description', 'GET  /health'
+      'GET  /message/:id', 'GET  /description', 'GET  /health',
+        'GET  /registry', 'POST /registry/refresh'
     ]
   })
 })
@@ -1950,13 +1994,21 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.7.0 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.8.0 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
       console.log(`[Bridge] GSP:            ${JENA_GSP}`)
       console.log(`[Bridge] SHACL graph:    ${SHACL_GRAPH}`)
       console.log(`[Bridge] Model:          ${MODEL}  Max retries: ${MAX_RETRIES}`)
+    })
+
+    // Registry bootstrap — async, does not block server startup
+    initSession().then(({ health }) => {
+      const up = [...health.values()].filter(v => v.reachable).length
+      console.log(`[registry] ${up}/${health.size} bridge(s) reachable`)
+    }).catch(err => {
+      console.warn('[registry] Session init error (non-fatal):', err.message)
     })
   })
   .catch(err => {
