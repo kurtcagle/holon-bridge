@@ -28,7 +28,9 @@ async function fetchGitHubFile(owner, repo, path, token) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`
   const res = await fetch(url, {
     headers: {
-      'Authorization':        `token ${token}`,
+      // .trim() defends against CRLF line endings in .env on Windows
+      // which would append \r to the token value and cause a 401
+      'Authorization':        `token ${token.trim()}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
     },
@@ -42,13 +44,13 @@ async function fetchGitHubFile(owner, repo, path, token) {
 
 /**
  * List .databook.md files in a GitHub directory.
- * Returns [] gracefully if the directory doesn't exist yet.
+ * Returns [] gracefully if the directory does not exist yet.
  */
 async function listGitHubDir(owner, repo, dir, token) {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/${dir}`
   const res = await fetch(url, {
     headers: {
-      'Authorization':        `token ${token}`,
+      'Authorization':        `token ${token.trim()}`,
       'Accept':               'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
     },
@@ -83,19 +85,21 @@ export function extractTurtleBlocks(markdown) {
  *   { ontology, contentTypes, bridges, endpoints }  — all strings of Turtle
  */
 export async function fetchRegistryDataBooks({ owner, repo, token }) {
+  // Trim token once here so all internal calls are clean
+  const tok = token.trim()
   console.log(`[registry] Fetching DataBooks from ${owner}/${repo}...`)
 
   const [ontologyMd, contentTypesMd, endpointsMd] = await Promise.all([
-    fetchGitHubFile(owner, repo, REGISTRY_PATHS[0], token),
-    fetchGitHubFile(owner, repo, REGISTRY_PATHS[1], token),
-    fetchGitHubFile(owner, repo, REGISTRY_PATHS[2], token),
+    fetchGitHubFile(owner, repo, REGISTRY_PATHS[0], tok),
+    fetchGitHubFile(owner, repo, REGISTRY_PATHS[1], tok),
+    fetchGitHubFile(owner, repo, REGISTRY_PATHS[2], tok),
   ])
 
-  const bridgeFiles = await listGitHubDir(owner, repo, BRIDGES_DIR, token)
+  const bridgeFiles = await listGitHubDir(owner, repo, BRIDGES_DIR, tok)
   console.log(`[registry] Found ${bridgeFiles.length} bridge DataBook(s)`)
 
   const bridgeMds = await Promise.all(
-    bridgeFiles.map(f => fetchGitHubFile(owner, repo, f.path, token))
+    bridgeFiles.map(f => fetchGitHubFile(owner, repo, f.path, tok))
   )
 
   return {
