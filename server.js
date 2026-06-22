@@ -746,6 +746,38 @@ app.use((req, res, next) => {
   next()
 })
 
+// -- Auth middleware -----------------------------------------------------------
+//
+// All routes below this point require a valid Bearer token.
+// Set BEARER_TOKEN in .env (generate with: openssl rand -hex 32).
+//
+// If BEARER_TOKEN is absent the bridge logs a warning and runs unauthenticated
+// (acceptable on a loopback-only / dev machine, never in production).
+//
+// Exemptions: GET /health is always public (monitoring probes need no token).
+
+const BEARER_TOKEN = process.env.BEARER_TOKEN?.trim()
+
+if (!BEARER_TOKEN) {
+  console.warn('[Bridge] WARNING: BEARER_TOKEN not set — all endpoints are unauthenticated. ' +
+               'Set BEARER_TOKEN in .env and restart.')
+}
+
+function requireAuth(req, res, next) {
+  // /health is always public — allow monitoring probes without a token
+  if (req.path === '/health') return next()
+
+  if (!BEARER_TOKEN) return next()   // dev mode: no token configured
+
+  const header = req.headers['authorization'] ?? ''
+  const token  = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+  if (token !== BEARER_TOKEN)
+    return res.status(401).json({ error: 'Unauthorized — bad or missing Bearer token' })
+  next()
+}
+
+app.use(requireAuth)
+
 // -- POST /query ---------------------------------------------------------------
 
 app.post('/query', async (req, res) => {
