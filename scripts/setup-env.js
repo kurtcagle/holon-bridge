@@ -4,46 +4,40 @@
  *
  * Interactive setup for HolonBridge environment configuration.
  *
- * Separates CONFIGURATION (safe in .env) from SECRETS (must be OS env vars).
+ * Separates CONFIGURATION (safe in .env) from SECRETS (OS env vars).
  *
- * What it does:
- *   1. Reads current values from process.env and existing .env
- *   2. Walks you through each variable interactively
- *   3. Writes non-sensitive config to .env (in the project root)
- *   4. Outputs OS commands to set secrets in the system environment
- *      — Linux/macOS: export commands for ~/.profile or systemd unit
- *      — Windows:     PowerShell SetEnvironmentVariable commands
+ * On Windows (elevated shell): directly writes secrets to Machine-scope
+ * environment variables via the Windows registry, then prints confirmation.
  *
- * What it does NOT do:
- *   — Write secrets to any file on disk
- *   — Commit anything to version control
- *   — Overwrite existing .env without confirmation
+ * On Windows (non-elevated): outputs PowerShell commands to run manually.
+ *
+ * On Linux/macOS: outputs export commands for ~/.profile or systemd unit.
  *
  * Usage:
  *   node scripts/setup-env.js
- *   node scripts/setup-env.js --non-interactive   (use existing/defaults, output only)
+ *   node scripts/setup-env.js --non-interactive   (use existing/defaults)
+ *   node scripts/setup-env.js --scope User        (Windows User scope, no admin)
+ *   node scripts/setup-env.js --scope Machine     (Windows Machine scope, admin required)
  */
 
-import { createInterface }  from 'node:readline'
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { join, dirname }    from 'node:path'
-import { fileURLToPath }    from 'node:url'
-import { platform }         from 'node:os'
+import { createInterface }                         from 'node:readline'
+import { readFileSync, writeFileSync, existsSync }  from 'node:fs'
+import { join, dirname }                            from 'node:path'
+import { fileURLToPath }                            from 'node:url'
+import { platform }                                 from 'node:os'
+import { execSync }                                 from 'node:child_process'
 
-const __dirname     = dirname(fileURLToPath(import.meta.url))
-const ROOT          = join(__dirname, '..')
-const ENV_FILE      = join(ROOT, '.env')
+const __dirname       = dirname(fileURLToPath(import.meta.url))
+const ROOT            = join(__dirname, '..')
+const ENV_FILE        = join(ROOT, '.env')
 const NON_INTERACTIVE = process.argv.includes('--non-interactive')
-const IS_WINDOWS    = platform() === 'win32'
+const IS_WINDOWS      = platform() === 'win32'
+
+// Determine Windows scope — default Machine, override with --scope User
+const scopeIdx = process.argv.indexOf('--scope')
+const WIN_SCOPE = scopeIdx !== -1 ? process.argv[scopeIdx + 1] : 'Machine'
 
 // ── Variable definitions ─────────────────────────────────────────────────────
-//
-// Each entry:
-//   key          env var name
-//   label        human-readable name
-//   secret       true = must be OS env var, never written to .env
-//   default      fallback if not set
-//   description  shown during interactive setup
 
 const VARIABLES = [
   // ── Secrets (OS environment only) ─────────────────────────────────────────
@@ -58,7 +52,7 @@ const VARIABLES = [
     key:         'ANTHROPIC_API_KEY',
     label:       'Anthropic API Key',
     secret:      true,
-    description: 'Required for NL query (nl_query endpoint) and named query generation. ' +
+    description: 'Required for NL query and named query generation. ' +
                  'Obtain from https://console.anthropic.com',
   },
   {
@@ -73,31 +67,29 @@ const VARIABLES = [
     label:       'MCP Remote Token',
     secret:      true,
     description: 'Bearer token for holonbridge-mcp-remote SSE endpoint. ' +
-                 'Separate from BEARER_TOKEN. Generate with openssl rand -hex 32',
+                 'Separate from BEARER_TOKEN. Generate with: openssl rand -hex 32',
   },
   {
     key:         'HB_BEARER_TOKEN',
     label:       'HolonBridge Bearer Token (mcp-remote → bridge)',
     secret:      true,
-    description: 'The BEARER_TOKEN value that holonbridge-mcp-remote uses when calling ' +
-                 'the HolonBridge REST API. Must match BEARER_TOKEN above.',
+    description: 'The BEARER_TOKEN value holonbridge-mcp-remote uses when calling the bridge. ' +
+                 'Must match BEARER_TOKEN above.',
   },
-  // ── v3.0 key paths (set now, used later) ──────────────────────────────────
   {
     key:         'HOLONBRIDGE_PRIVATE_KEY_PATH',
     label:       'Private Key Path (v3.0)',
     secret:      true,
-    description: 'Path to ES256 private key PEM file for JWT peer auth (v3.0). ' +
-                 'Generate with: node scripts/generate-keys.js  Leave blank to skip for now.',
     optional:    true,
+    description: 'Path to ES256 private key PEM file for JWT peer auth (v3.0). ' +
+                 'Run: node scripts/generate-keys.js  Leave blank to skip.',
   },
   {
     key:         'HOLONBRIDGE_KEY_ID',
     label:       'Key ID (v3.0)',
     secret:      true,
-    description: 'Key identifier for the bridge keypair, e.g. kurtcagle-primary-2026-06. ' +
-                 'Leave blank to skip for now.',
     optional:    true,
+    description: 'Key identifier, e.g. kurtcagle-primary-2026-06. Leave blank to skip.',
   },
 
   // ── Configuration (safe in .env) ──────────────────────────────────────────
@@ -113,7 +105,7 @@ const VARIABLES = [
     label:       'Jena Fuseki Base URL',
     secret:      false,
     default:     'http://localhost:3030',
-    description: 'Base URL of the local Jena Fuseki instance. Never expose this publicly.',
+    description: 'Base URL of the local Jena Fuseki instance.',
   },
   {
     key:         'JENA_DATASET',
@@ -134,21 +126,21 @@ const VARIABLES = [
     label:       'Max Query Retries',
     secret:      false,
     default:     '2',
-    description: 'Number of times to retry a failed NL→SPARQL query before giving up.',
+    description: 'Number of times to retry a failed NL→SPARQL query.',
   },
   {
     key:         'LOG_SPARQL',
     label:       'Log SPARQL Queries',
     secret:      false,
     default:     'false',
-    description: 'Set true to log all SPARQL queries to console (verbose, dev only).',
+    description: 'Set true to log all SPARQL queries to console (dev only).',
   },
   {
     key:         'LOG_PROMPTS',
     label:       'Log LLM Prompts',
     secret:      false,
     default:     'false',
-    description: 'Set true to log all LLM prompts to console (verbose, dev only).',
+    description: 'Set true to log all LLM prompts to console (dev only).',
   },
   {
     key:         'SHACL_REQUIRED',
@@ -207,15 +199,45 @@ function loadDotenv() {
 }
 
 function writeDotenv(values) {
-  const lines = ['# HolonBridge configuration (non-sensitive)',
-                 '# Generated by scripts/setup-env.js',
-                 `# Updated: ${new Date().toISOString()}`,
-                 '# DO NOT add secrets to this file.',
-                 '']
-  for (const [k, v] of Object.entries(values)) {
-    lines.push(`${k}=${v}`)
-  }
+  const lines = [
+    '# HolonBridge configuration (non-sensitive)',
+    '# Generated by scripts/setup-env.js',
+    `# Updated: ${new Date().toISOString()}`,
+    '# DO NOT add secrets to this file.',
+    '',
+  ]
+  for (const [k, v] of Object.entries(values)) lines.push(`${k}=${v}`)
   writeFileSync(ENV_FILE, lines.join('\n') + '\n', 'utf8')
+}
+
+/**
+ * Attempt to set a Windows environment variable directly via PowerShell.
+ * Returns true on success, false if it fails (e.g. non-elevated for Machine scope).
+ */
+function setWindowsEnvVar(key, value, scope) {
+  try {
+    const escaped = value.replace(/'/g, "''")  // escape single quotes for PowerShell
+    execSync(
+      `powershell -NoProfile -Command "[System.Environment]::SetEnvironmentVariable('${key}', '${escaped}', '${scope}')"`,
+      { stdio: 'pipe' }
+    )
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+/**
+ * Check whether the current process is elevated (Windows admin).
+ */
+function isElevated() {
+  if (!IS_WINDOWS) return false
+  try {
+    execSync('net session', { stdio: 'pipe' })
+    return true
+  } catch (_) {
+    return false
+  }
 }
 
 // ── Interactive prompt ────────────────────────────────────────────────────────
@@ -231,12 +253,13 @@ async function promptVar(rl, v, current) {
   console.log(`  ${v.description}`)
   console.log(`  Current: ${display}`)
   if (v.optional) console.log('  (optional — press Enter to skip)')
-
   const input = await prompt(rl, '  New value (Enter to keep): ')
   return input.trim() || current || v.default || ''
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
+
+const elevated = isElevated()
 
 console.log()
 console.log('╔══════════════════════════════════════════════════════╗')
@@ -244,12 +267,22 @@ console.log('║      HolonBridge v2.9.0 — Environment Setup         ║')
 console.log('╚══════════════════════════════════════════════════════╝')
 console.log()
 console.log('CONFIGURATION  → written to .env (safe, non-sensitive)')
-console.log('SECRETS        → output as OS commands (never written to disk)')
+if (IS_WINDOWS) {
+  console.log(`SECRETS        → written to Windows ${WIN_SCOPE} environment`)
+  if (WIN_SCOPE === 'Machine' && !elevated) {
+    console.log()
+    console.log('⚠  WARNING: Machine scope requires Administrator rights.')
+    console.log('   Direct write will be attempted but may fail.')
+    console.log('   Re-run from an elevated PowerShell, or use --scope User.')
+  }
+} else {
+  console.log('SECRETS        → output as export commands for your shell profile')
+}
 console.log()
 
-const dotenvValues  = loadDotenv()
-const configValues  = {}   // will be written to .env
-const secretValues  = {}   // will be output as OS commands
+const dotenvValues = loadDotenv()
+const configValues = {}
+const secretValues = {}
 
 const rl = NON_INTERACTIVE ? null : createInterface({
   input:  process.stdin,
@@ -286,68 +319,70 @@ console.log('Writing non-sensitive configuration to .env...')
 writeDotenv(configValues)
 console.log(`✅ .env written (${Object.keys(configValues).length} values)`)
 
-// ── Output secret commands ────────────────────────────────────────────────────
+// ── Set / output secrets ──────────────────────────────────────────────────────
 
 console.log()
+
 if (Object.keys(secretValues).length === 0) {
   console.log('No secrets to set.')
+} else if (IS_WINDOWS) {
+  // Attempt direct write via PowerShell
+  console.log(`Setting ${Object.keys(secretValues).length} secret(s) in Windows ${WIN_SCOPE} environment...`)
+  console.log()
+
+  const failed = []
+  for (const [k, v] of Object.entries(secretValues)) {
+    const ok = setWindowsEnvVar(k, v, WIN_SCOPE)
+    if (ok) {
+      console.log(`  ✅ ${k}`)
+    } else {
+      console.log(`  ❌ ${k}  (failed — may need elevated shell)`)
+      failed.push([k, v])
+    }
+  }
+
+  if (failed.length > 0) {
+    console.log()
+    console.log('══════════════════════════════════════════════════════')
+    console.log('FAILED VARIABLES — run these manually as Administrator:')
+    console.log('══════════════════════════════════════════════════════')
+    console.log()
+    for (const [k, v] of failed) {
+      console.log(`[System.Environment]::SetEnvironmentVariable('${k}', '${v}', '${WIN_SCOPE}')`)
+    }
+    console.log()
+  } else {
+    console.log()
+    console.log('All secrets set successfully.')
+    console.log('Open a new terminal for the changes to take effect.')
+  }
+
 } else {
+  // Linux/macOS — output export commands
   console.log('══════════════════════════════════════════════════════')
-  console.log('RUN THESE COMMANDS TO SET SECRETS IN YOUR ENVIRONMENT')
+  console.log('ADD THESE TO ~/.profile, ~/.zshrc, OR systemd unit:')
   console.log('══════════════════════════════════════════════════════')
   console.log()
-
-  if (IS_WINDOWS) {
-    console.log('# PowerShell — run as Administrator for Machine scope')
-    console.log('# Or remove [Machine] for User scope (no admin required)')
-    console.log()
-    for (const [k, v] of Object.entries(secretValues)) {
-      console.log(`[System.Environment]::SetEnvironmentVariable('${k}', '${v}', 'Machine')`)
-    }
-    console.log()
-    console.log('# After setting, restart HolonBridge for changes to take effect.')
-    console.log()
-    console.log('# For Windows service, also set in service environment:')
-    console.log('# sc.exe config HolonBridge start= auto')
-    for (const k of Object.keys(secretValues)) {
-      console.log(`# sc.exe config HolonBridge obj= LocalSystem password= ""`)
-    }
-  } else {
-    console.log('# Bash/Zsh — add to ~/.profile or ~/.zshrc for persistence')
-    console.log('# Or add to systemd service unit [Service] section')
-    console.log()
-    for (const [k, v] of Object.entries(secretValues)) {
-      console.log(`export ${k}='${v}'`)
-    }
-    console.log()
-    console.log('# For systemd service, add to unit file:')
-    console.log('# [Service]')
-    for (const k of Object.keys(secretValues)) {
-      console.log(`# Environment="${k}=<value>"`)
-    }
+  for (const [k, v] of Object.entries(secretValues)) {
+    console.log(`export ${k}='${v}'`)
   }
+  console.log()
+  console.log('Then run: source ~/.profile  (or open a new terminal)')
+}
 
-  console.log()
-  console.log('══════════════════════════════════════════════════════')
-  console.log()
-  console.log('⚠  SECURITY NOTES:')
-  console.log('   — Do not paste the above output into any file that')
-  console.log('     gets committed to version control.')
-  console.log('   — After running, clear your terminal history:')
-  if (IS_WINDOWS) {
-    console.log('     Clear-History  (PowerShell)')
-  } else {
-    console.log('     history -c  (bash)  or  fc -p  (zsh)')
-  }
-  console.log('   — Consider using a password manager to store these')
-  console.log('     values rather than leaving them in shell history.')
+console.log()
+console.log('⚠  Security: clear terminal history after running.')
+if (IS_WINDOWS) {
+  console.log('   PowerShell: Clear-History')
+} else {
+  console.log('   Bash: history -c   Zsh: fc -p')
 }
 
 console.log()
 console.log('Setup complete.')
 console.log()
 console.log('Next steps:')
-console.log('  1. Run the secret commands above in your terminal')
+console.log('  1. Open a new terminal (for env vars to take effect)')
 console.log('  2. Restart HolonBridge:  npm start')
 console.log('  3. Generate keypair for v3.0:  node scripts/generate-keys.js')
 console.log()
