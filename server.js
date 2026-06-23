@@ -36,6 +36,24 @@
  */
 
 import 'dotenv/config'
+
+// -- Startup secret validation ------------------------------------------------
+// Secrets must be set as OS environment variables, not in .env
+// Non-sensitive config (ports, URLs, flags) may still use .env via dotenv
+// Fail fast with a clear message rather than running in an insecure state
+
+const REQUIRED_SECRETS = ['BEARER_TOKEN', 'ANTHROPIC_API_KEY']
+const MISSING_SECRETS  = REQUIRED_SECRETS.filter(k => !process.env[k]?.trim())
+
+if (MISSING_SECRETS.length > 0) {
+  for (const k of MISSING_SECRETS) {
+    console.error(`[Bridge] FATAL: Required secret '${k}' is not set in the environment.`)
+  }
+  console.error('[Bridge] Secrets must be set as OS environment variables, not in .env')
+  console.error('[Bridge] Run: node scripts/setup-env.js  to configure interactively')
+  process.exit(1)
+}
+
 import express          from 'express'
 import chokidar         from 'chokidar'
 import { join }         from 'path'
@@ -1098,7 +1116,7 @@ app.get('/description', async (_req, res) => {
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
 
   res.json({
-    service: 'holon-bridge', version: '2.8.0',
+    service: 'holon-bridge', version: '2.8.1',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
@@ -1158,7 +1176,7 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.8.0',
+    status: 'ok', service: 'holon-bridge', version: '2.8.1',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
@@ -2026,7 +2044,7 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.8.0 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.8.1 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
