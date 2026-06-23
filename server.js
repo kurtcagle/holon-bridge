@@ -1,5 +1,5 @@
 /**
- * server.js -- HolonBridge v2.7.0
+ * server.js -- HolonBridge v2.9.0
  *
  * HTTP bridge between an LLM client and a Jena 6.0 Fuseki triplestore.
  *
@@ -1116,7 +1116,7 @@ app.get('/description', async (_req, res) => {
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
 
   res.json({
-    service: 'holon-bridge', version: '2.8.1',
+    service: 'holon-bridge', version: '2.9.0',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
@@ -1176,7 +1176,7 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.8.1',
+    status: 'ok', service: 'holon-bridge', version: '2.9.0',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
@@ -2044,7 +2044,7 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.8.1 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.9.0 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
