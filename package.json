@@ -1,7 +1,7 @@
 {
   "name": "holon-bridge",
-  "version": "2.8.1",
-  "description": "LLM ↔ Jena bridge with NL query, SHACL-validated update, Bearer token auth, and capability discovery",
+  "version": "2.9.0",
+  "description": "LLM ↔ Jena bridge with NL query, SHACL-validated update, Bearer token auth, scoped env config, and capability discovery",
   "type": "module",
   "main": "server.js",
   "scripts": {
