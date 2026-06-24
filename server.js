@@ -71,6 +71,7 @@ import { runQuery, formatBindings, discoverGraphs,
 import { buildQuery, retryQuery, interpretResults }                 from './lib/llm.js'
 import { buildResponseDataBook }                                    from './lib/format.js'
 import { validateWithShacl }                                        from './lib/shacl.js'
+import { validateHandler }                                          from './lib/validate.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
          GRAPHS as REGISTRY_GRAPHS }                                from './registry/session-init.js'
@@ -2160,6 +2161,14 @@ app.post('/github-delete', requireAuth, async (req, res) => {
   }
 });
 
+// -- POST /validate -----------------------------------------------------------
+// Validate a named data graph against a named shapes graph in the dataset.
+// Body: { dataGraph: "<IRI>", shapesGraph?: "<IRI>" }
+
+app.post('/validate', async (req, res) => {
+  await validateHandler(req, res, { JENA_BASE, DATASET, SHACL_GRAPH })
+})
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -2173,6 +2182,7 @@ app.use((_req, res) => {
       'GET  /datasets', 'GET  /graphs', 'GET  /graph',
       'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
       'GET  /message/:id', 'GET  /description', 'GET  /health',
+        'POST /validate',
         'GET  /registry', 'POST /registry/refresh'
     ]
   })
