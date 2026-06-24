@@ -2020,6 +2020,146 @@ app.post('/registry/refresh', async (_req, res) => {
   }
 })
 
+
+// ── POST /github-push ─────────────────────────────────────────────────────
+// Push a file to GitHub via the Contents API.
+// Body: { owner, repo, path, content, message, branch? }
+// Uses GITHUB_PAT from environment.
+app.post('/github-push', requireAuth, async (req, res) => {
+  const { owner, repo, path, content, message, branch = 'main' } = req.body;
+
+  if (!owner || !repo || !path || !content || !message) {
+    return res.status(400).json({
+      error: 'Body must include owner, repo, path, content, and message.'
+    });
+  }
+
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) {
+    return res.status(500).json({ error: 'GITHUB_PAT not set in environment.' });
+  }
+
+  const apiBase = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+  const headers = {
+    'Authorization': `Bearer ${pat}`,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+    'User-Agent': 'HolonBridge/2.9.0'
+  };
+
+  try {
+    // Fetch current SHA if file exists (required for updates)
+    let sha;
+    try {
+      const getRes = await fetch(`${apiBase}?ref=${branch}`, { headers });
+      if (getRes.ok) {
+        const existing = await getRes.json();
+        sha = existing.sha;
+      }
+    } catch (_) { /* new file — no SHA needed */ }
+
+    // Encode content as base64
+    const encoded = Buffer.from(content, 'utf8').toString('base64');
+
+    const body = { message, content: encoded, branch };
+    if (sha) body.sha = sha;
+
+    const putRes = await fetch(apiBase, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(body)
+    });
+
+    const result = await putRes.json();
+
+    if (!putRes.ok) {
+      return res.status(putRes.status).json({
+        error: 'GitHub API error',
+        details: result.message || result
+      });
+    }
+
+    res.json({
+      pushed: true,
+      path,
+      sha: result.content?.sha,
+      url: result.content?.html_url,
+      commit: result.commit?.sha
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /github-delete ───────────────────────────────────────────────────
+// Delete a file from GitHub via the Contents API.
+// Body: { owner, repo, path, message, branch? }
+// SHA is fetched automatically. Uses GITHUB_PAT from environment.
+app.post('/github-delete', requireAuth, async (req, res) => {
+  const { owner, repo, path, message, branch = 'main' } = req.body;
+
+  if (!owner || !repo || !path || !message) {
+    return res.status(400).json({
+      error: 'Body must include owner, repo, path, and message.'
+    });
+  }
+
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) {
+    return res.status(500).json({ error: 'GITHUB_PAT not set in environment.' });
+  }
+
+  const apiBase = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
+  const headers = {
+    'Authorization': `Bearer ${pat}`,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+    'User-Agent': 'HolonBridge/2.9.0'
+  };
+
+  try {
+    // Fetch current SHA — required for deletion
+    const getRes = await fetch(`${apiBase}?ref=${branch}`, { headers });
+    if (!getRes.ok) {
+      const err = await getRes.json();
+      return res.status(getRes.status).json({
+        error: 'File not found or GitHub API error',
+        details: err.message || err
+      });
+    }
+    const existing = await getRes.json();
+    const sha = existing.sha;
+
+    // Delete the file
+    const delRes = await fetch(apiBase, {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({ message, sha, branch })
+    });
+
+    const result = await delRes.json();
+
+    if (!delRes.ok) {
+      return res.status(delRes.status).json({
+        error: 'GitHub API error',
+        details: result.message || result
+      });
+    }
+
+    res.json({
+      deleted: true,
+      path,
+      commit: result.commit?.sha
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -2037,6 +2177,8 @@ app.use((_req, res) => {
     ]
   })
 })
+
+
 
 // --- Start --------------------------------------------------------------------
 
