@@ -75,6 +75,7 @@ import { validateHandler }                                          from './lib/
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
          GRAPHS as REGISTRY_GRAPHS }                                from './registry/session-init.js'
+import registerOAuth                                                from './oauth.js'
 
 // --- CLI arg parser -----------------------------------------------------------
 
@@ -756,6 +757,7 @@ async function runUpdate(turtle, graphIri, mode) {
 
 const app = express()
 app.use(express.json({ limit: '10mb' }))
+app.use(express.urlencoded({ extended: true }))   // required for OAuth form posts
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin',  '*')
@@ -764,6 +766,19 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
 })
+
+// -- OAuth2 shim (must be before requireAuth) ----------------------------------
+//
+// Provides /oauth/token and /.well-known/oauth-authorization-server so that
+// claude.ai connectors (which expect OAuth Client ID + Secret) can exchange
+// credentials for the BEARER_TOKEN used by requireAuth below.
+//
+// Required .env additions:
+//   OAUTH_CLIENT_ID=holonbridge-claude
+//   OAUTH_CLIENT_SECRET=<strong secret, different from BEARER_TOKEN>
+//   PUBLIC_BASE_URL=https://kurtcagle-mcp.ngrok.io
+
+registerOAuth(app)
 
 // -- Auth middleware -----------------------------------------------------------
 //
@@ -796,6 +811,52 @@ function requireAuth(req, res, next) {
 }
 
 app.use(requireAuth)
+
+// ── MCP remote transport compatibility middleware ─────────────────────────────
+//
+// The holonbridge-mcp-remote SSE layer uses different path/key conventions than
+// the canonical HolonBridge REST routes. This middleware normalises both before
+// requests reach route handlers. No route definitions need changing.
+//
+// Mappings applied:
+//   POST /sparql/query   { query: "..." }    → POST /sparql-select  { sparql: "..." }
+//   POST /nl_query       { question: "..." } → POST /query          { nl: "..." }
+//   GET  /sparql/graphs                      → GET  /graphs
+//
+// Placement: after requireAuth (auth is already enforced by app.use above),
+// after express.json() (req.body is available), before all route definitions.
+
+app.use((req, res, next) => {
+  // POST /sparql/query → /sparql-select
+  // Normalise body key: MCP sends { query } but /sparql-select expects { sparql }
+  if (req.method === 'POST' && req.path === '/sparql/query') {
+    if (req.body && !req.body.sparql && req.body.query) {
+      req.body.sparql = req.body.query
+    }
+    req.url = '/sparql-select'
+    return next()
+  }
+
+  // POST /nl_query → /query
+  // Normalise body key: MCP sends { question } but /query expects { nl }
+  if (req.method === 'POST' && req.path === '/nl_query') {
+    if (req.body && !req.body.nl && req.body.question) {
+      req.body.nl = req.body.question
+    }
+    req.url = '/query'
+    return next()
+  }
+
+  // GET /sparql/graphs → /graphs
+  if (req.method === 'GET' && req.path === '/sparql/graphs') {
+    req.url = '/graphs'
+    return next()
+  }
+
+  next()
+})
+
+// ── end MCP compatibility middleware ──────────────────────────────────────────
 
 // -- POST /query ---------------------------------------------------------------
 
@@ -1127,7 +1188,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/sparql-select',    description: 'Direct SPARQL SELECT or ASK — bypasses NL pipeline. Body: { "sparql": "..." }. Returns JSON bindings. Also accepts CONSTRUCT/DESCRIBE for backwards compatibility; prefer /sparql-construct for graph-producing queries.' },
       { method: 'POST', path: '/sparql-construct', description: 'Direct SPARQL CONSTRUCT or DESCRIBE — returns RDF. Body: { "query": "CONSTRUCT { ... } WHERE { ... }", "format"?: "turtle"|"trig" }. Accept header overrides format param. Default: text/turtle. Timeout: 30s.' },
       { method: 'POST', path: '/describe',         description: 'Deep graph description of a resource. Follows IRIs and blank nodes to depth 1–5 (default 5, hard cap). rdf:List chains traversed via property path. Reifier nodes collected in parallel. Optional one-level inbound traversal with string-label subordinate. Body: { iri, depth?, graph?, inbound?, reifiers?, format? }. graph=null means dataset-wide (uses DESCRIBE); graph=<IRI> is bounded (uses CONSTRUCT).' },
-      { method: 'POST', path: '/update',           description: 'SHACL-gated Turtle push to a named graph.' },
+      { method: 'POST', path: '/update',         description: 'SHACL-gated Turtle push to a named graph.' },
       { method: 'POST', path: '/sparql-update',  description: 'Raw SPARQL UPDATE (INSERT/DELETE/etc) — no validation gate.' },
       { method: 'POST', path: '/reload',         description: 'Reload context directory + named queries (RDF + filesystem) + rediscover named graphs.' },
       { method: 'POST', path: '/dataset',        description: 'Switch active dataset at runtime. Accepts optional "fusekiUrl" to change Fuseki host in the same call. Restarts context watcher. Body: { "dataset": "name", "fusekiUrl"?: "http://..." }.' },
@@ -1499,28 +1560,6 @@ app.post('/sparql-construct', async (req, res) => {
 //   }
 //
 // Accept header overrides the "format" body param when both are present.
-//
-// Design notes
-// ------------
-// * Graph-bounded mode restricts both triple collection and frontier expansion
-//   to the named graph.  CONSTRUCT is used so the boundary is enforced.
-//   Blank nodes are followed via (a) 1-level generic follow for SHACL-style
-//   anonymous nodes, and (b) full rdf:List chain via (rdf:rest)* property path.
-//
-// * Dataset-wide mode uses SPARQL DESCRIBE which handles blank node transitivity
-//   natively (Concise Bounded Description).  Frontier expansion uses a SELECT
-//   that also sees through blank nodes so rdf:List items reach the next hop.
-//
-// * Reifiers are collected in a parallel CONSTRUCT at each BFS level.
-//   In Jena 6 / RDF-Star, <<?s ?p ?o>> syntax is available.
-//
-// * Inbound: one CONSTRUCT captures both the inbound triples and the string
-//   literals of their subjects in the same pass (cheaper than two queries).
-//
-// * Visited set prevents cycles and redundant re-traversal.
-//
-// * Depth is hard-capped at 5.  Beyond that, semantic relevance is typically
-//   minimal and query cost grows combinatorially.
 
 app.post('/describe', async (req, res) => {
   const {
@@ -1547,7 +1586,6 @@ app.post('/describe', async (req, res) => {
 
   console.log(`[Bridge] /describe <${seedIri}> depth=${maxDepth} graph=${graphIri ?? 'unbounded'} inbound=${inbound} reifiers=${reifiers}`)
 
-  // Helper: POST a SPARQL query to Fuseki, return Turtle text
   async function fc(sparql) {
     const controller = new AbortController()
     const timer      = setTimeout(() => controller.abort(), 30_000)
@@ -1575,33 +1613,24 @@ app.post('/describe', async (req, res) => {
       const inList   = frontier.map(i => `<${i}>`).join(' ')
       const inFilter = frontier.map(i => `<${i}>`).join(', ')
 
-      // ── Triple collection ─────────────────────────────────────────────────
-
       if (graphIri) {
-        // Graph-bounded: explicit CONSTRUCT + blank node follow + rdf:List path
         parts.push(await fc(`
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 CONSTRUCT { ?s ?p ?o }
 WHERE {
   GRAPH <${graphIri}> {
-    # Direct properties of frontier IRIs
     { ?s ?p ?o . FILTER(?s IN (${inFilter})) }
     UNION
-    # 1-level blank node follow (covers SHACL anonymous nodes etc.)
     { ?anc ?ap ?bn . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?bn))
       BIND(?bn AS ?s) ?s ?p ?o . }
     UNION
-    # Full rdf:List chain traversal (arbitrary length)
     { ?anc ?lp ?head . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?head))
       ?head (rdf:rest)* ?node . BIND(?node AS ?s) ?s ?p ?o . }
   }
 }`))
       } else {
-        // Dataset-wide: DESCRIBE handles blank node transitivity natively
         parts.push(await fc(`DESCRIBE ${inList}`))
       }
-
-      // ── Reifier collection ────────────────────────────────────────────────
 
       if (reifiers) {
         const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
@@ -1619,31 +1648,24 @@ WHERE {
         if (rt.trim()) parts.push(rt)
       }
 
-      // ── Next frontier: IRI objects reachable through blank nodes ──────────
-
       if (hop < maxDepth - 1) {
         const visitedFilter = [...visited].map(i => `<${i}>`).join(', ')
         const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
         const gcl = graphIri ? `}` : ''
-
         const { bindings } = await runQuery(JENA_SPARQL, `
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT DISTINCT ?o WHERE {
   ${gc}
-    # Direct IRI objects of frontier
     { ?s ?p ?o . FILTER(?s IN (${inFilter})) FILTER(isIRI(?o)) }
     UNION
-    # IRI objects via 1-level blank node
     { ?anc ?ap ?bn . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?bn))
       ?bn ?bp ?o . FILTER(isIRI(?o)) }
     UNION
-    # IRI objects via rdf:List chain (rdf:first items)
     { ?anc ?lp ?head . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?head))
       ?head (rdf:rest)* ?node . ?node rdf:first ?o . FILTER(isIRI(?o)) }
   ${gcl}
   FILTER(?o NOT IN (${visitedFilter}))
 }`, LOG_SPARQL)
-
         const newIRIs = bindings.map(b => b.o?.value).filter(Boolean)
         for (const i of newIRIs) visited.add(i)
         frontier = newIRIs
@@ -1652,8 +1674,6 @@ SELECT DISTINCT ?o WHERE {
         frontier = []
       }
     }
-
-    // ── Inbound: 1-level + string labels of inbound subjects ─────────────────
 
     if (inbound) {
       const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
@@ -1676,8 +1696,6 @@ WHERE {
 }`).catch(() => '')
       if (it.trim()) parts.push(it)
     }
-
-    // ── Merge and return ──────────────────────────────────────────────────────
 
     const merged = parts.filter(p => p?.trim()).join('\n\n')
     console.log(`[Bridge] /describe complete -- ${parts.length} part(s), ${merged.length} chars`)
