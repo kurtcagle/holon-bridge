@@ -1126,6 +1126,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/query',          description: 'NL -> SPARQL -> interpreted answer. Or { queryId } to execute a stored named query. Or { queryId, params: { key: value } } for parameterised named queries — substitutes {{key}} placeholders in the stored SPARQL before execution.' },
       { method: 'POST', path: '/sparql-select',    description: 'Direct SPARQL SELECT or ASK — bypasses NL pipeline. Body: { "sparql": "..." }. Returns JSON bindings. Also accepts CONSTRUCT/DESCRIBE for backwards compatibility; prefer /sparql-construct for graph-producing queries.' },
       { method: 'POST', path: '/sparql-construct', description: 'Direct SPARQL CONSTRUCT or DESCRIBE — returns RDF. Body: { "query": "CONSTRUCT { ... } WHERE { ... }", "format"?: "turtle"|"trig" }. Accept header overrides format param. Default: text/turtle. Timeout: 30s.' },
+      { method: 'POST', path: '/describe',         description: 'Deep graph description of a resource. Follows IRIs and blank nodes to depth 1–5 (default 5, hard cap). rdf:List chains traversed via property path. Reifier nodes collected in parallel. Optional one-level inbound traversal with string-label subordinate. Body: { iri, depth?, graph?, inbound?, reifiers?, format? }. graph=null means dataset-wide (uses DESCRIBE); graph=<IRI> is bounded (uses CONSTRUCT).' },
       { method: 'POST', path: '/update',           description: 'SHACL-gated Turtle push to a named graph.' },
       { method: 'POST', path: '/sparql-update',  description: 'Raw SPARQL UPDATE (INSERT/DELETE/etc) — no validation gate.' },
       { method: 'POST', path: '/reload',         description: 'Reload context directory + named queries (RDF + filesystem) + rediscover named graphs.' },
@@ -1473,6 +1474,219 @@ app.post('/sparql-construct', async (req, res) => {
     if (err.name === 'AbortError')
       return res.status(504).json({ error: 'CONSTRUCT query timed out (30s).' })
     console.error('[Bridge] /sparql-construct error:', err)
+    return res.status(500).json({ error: 'Internal bridge error', message: err.message })
+  }
+})
+
+// -- POST /describe ------------------------------------------------------------
+//
+// Deep graph description of a resource.  Follows IRIs and blank nodes to an
+// arbitrary depth (max 5 hops), collecting triples at each hop via CONSTRUCT
+// (graph-bounded) or DESCRIBE (dataset-wide).  rdf:List chains are traversed
+// via property path regardless of depth.  Reifier nodes are collected in a
+// parallel query at each hop.  Optional one-level inbound traversal captures
+// subjects that point at the seed, plus their string-valued properties (labels,
+// comments, etc.) to aid identification.
+//
+// Request body:
+//   {
+//     "iri":      "<seed IRI>"           -- required
+//     "depth":    1–5                    -- default 5 (capped at 5)
+//     "graph":    "<named graph IRI>"    -- default null (= dataset-wide)
+//     "inbound":  true|false             -- default false
+//     "reifiers": true|false             -- default true
+//     "format":   "turtle"|"trig"        -- default "turtle"
+//   }
+//
+// Accept header overrides the "format" body param when both are present.
+//
+// Design notes
+// ------------
+// * Graph-bounded mode restricts both triple collection and frontier expansion
+//   to the named graph.  CONSTRUCT is used so the boundary is enforced.
+//   Blank nodes are followed via (a) 1-level generic follow for SHACL-style
+//   anonymous nodes, and (b) full rdf:List chain via (rdf:rest)* property path.
+//
+// * Dataset-wide mode uses SPARQL DESCRIBE which handles blank node transitivity
+//   natively (Concise Bounded Description).  Frontier expansion uses a SELECT
+//   that also sees through blank nodes so rdf:List items reach the next hop.
+//
+// * Reifiers are collected in a parallel CONSTRUCT at each BFS level.
+//   In Jena 6 / RDF-Star, <<?s ?p ?o>> syntax is available.
+//
+// * Inbound: one CONSTRUCT captures both the inbound triples and the string
+//   literals of their subjects in the same pass (cheaper than two queries).
+//
+// * Visited set prevents cycles and redundant re-traversal.
+//
+// * Depth is hard-capped at 5.  Beyond that, semantic relevance is typically
+//   minimal and query cost grows combinatorially.
+
+app.post('/describe', async (req, res) => {
+  const {
+    iri,
+    depth    = 5,
+    graph    = null,
+    inbound  = false,
+    reifiers = true,
+    format   = 'turtle'
+  } = req.body ?? {}
+
+  if (!iri || typeof iri !== 'string' || !iri.trim())
+    return res.status(400).json({
+      error: '"iri" is required — provide the seed IRI to describe.',
+      example: { iri: 'urn:chloe:meeting:2026-06-26-causalspark-marion', depth: 3, graph: null }
+    })
+
+  const seedIri      = iri.trim()
+  const maxDepth     = Math.min(Math.max(parseInt(depth, 10) || 5, 1), 5)
+  const graphIri     = (graph && typeof graph === 'string' && graph.trim()) ? graph.trim() : null
+  const acceptHeader = req.headers['accept'] ?? ''
+  const responseType = (acceptHeader.includes('application/trig') || format === 'trig')
+    ? 'application/trig' : 'text/turtle'
+
+  console.log(`[Bridge] /describe <${seedIri}> depth=${maxDepth} graph=${graphIri ?? 'unbounded'} inbound=${inbound} reifiers=${reifiers}`)
+
+  // Helper: POST a SPARQL query to Fuseki, return Turtle text
+  async function fc(sparql) {
+    const controller = new AbortController()
+    const timer      = setTimeout(() => controller.abort(), 30_000)
+    let response
+    try {
+      response = await fetch(JENA_SPARQL, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
+        body:    sparql,
+        signal:  controller.signal
+      })
+    } finally { clearTimeout(timer) }
+    const body = await response.text()
+    if (!response.ok)
+      throw new Error(`Fuseki returned HTTP ${response.status}: ${body.slice(0, 200)}`)
+    return body
+  }
+
+  try {
+    const visited  = new Set([seedIri])
+    let   frontier = [seedIri]
+    const parts    = []
+
+    for (let hop = 0; hop < maxDepth && frontier.length > 0; hop++) {
+      const inList   = frontier.map(i => `<${i}>`).join(' ')
+      const inFilter = frontier.map(i => `<${i}>`).join(', ')
+
+      // ── Triple collection ─────────────────────────────────────────────────
+
+      if (graphIri) {
+        // Graph-bounded: explicit CONSTRUCT + blank node follow + rdf:List path
+        parts.push(await fc(`
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+CONSTRUCT { ?s ?p ?o }
+WHERE {
+  GRAPH <${graphIri}> {
+    # Direct properties of frontier IRIs
+    { ?s ?p ?o . FILTER(?s IN (${inFilter})) }
+    UNION
+    # 1-level blank node follow (covers SHACL anonymous nodes etc.)
+    { ?anc ?ap ?bn . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?bn))
+      BIND(?bn AS ?s) ?s ?p ?o . }
+    UNION
+    # Full rdf:List chain traversal (arbitrary length)
+    { ?anc ?lp ?head . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?head))
+      ?head (rdf:rest)* ?node . BIND(?node AS ?s) ?s ?p ?o . }
+  }
+}`))
+      } else {
+        // Dataset-wide: DESCRIBE handles blank node transitivity natively
+        parts.push(await fc(`DESCRIBE ${inList}`))
+      }
+
+      // ── Reifier collection ────────────────────────────────────────────────
+
+      if (reifiers) {
+        const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
+        const gcl = graphIri ? `}` : ''
+        const rt  = await fc(`
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+CONSTRUCT { ?reifier ?rp ?ro }
+WHERE {
+  ${gc}
+    ?reifier rdf:reifies << ?s ?p ?o >> .
+    FILTER(?s IN (${inFilter}))
+    ?reifier ?rp ?ro .
+  ${gcl}
+}`).catch(() => '')
+        if (rt.trim()) parts.push(rt)
+      }
+
+      // ── Next frontier: IRI objects reachable through blank nodes ──────────
+
+      if (hop < maxDepth - 1) {
+        const visitedFilter = [...visited].map(i => `<${i}>`).join(', ')
+        const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
+        const gcl = graphIri ? `}` : ''
+
+        const { bindings } = await runQuery(JENA_SPARQL, `
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?o WHERE {
+  ${gc}
+    # Direct IRI objects of frontier
+    { ?s ?p ?o . FILTER(?s IN (${inFilter})) FILTER(isIRI(?o)) }
+    UNION
+    # IRI objects via 1-level blank node
+    { ?anc ?ap ?bn . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?bn))
+      ?bn ?bp ?o . FILTER(isIRI(?o)) }
+    UNION
+    # IRI objects via rdf:List chain (rdf:first items)
+    { ?anc ?lp ?head . FILTER(?anc IN (${inFilter})) FILTER(isBlankNode(?head))
+      ?head (rdf:rest)* ?node . ?node rdf:first ?o . FILTER(isIRI(?o)) }
+  ${gcl}
+  FILTER(?o NOT IN (${visitedFilter}))
+}`, LOG_SPARQL)
+
+        const newIRIs = bindings.map(b => b.o?.value).filter(Boolean)
+        for (const i of newIRIs) visited.add(i)
+        frontier = newIRIs
+        console.log(`[Bridge] /describe hop ${hop + 1}/${maxDepth} -- frontier: ${frontier.length} new IRI(s)`)
+      } else {
+        frontier = []
+      }
+    }
+
+    // ── Inbound: 1-level + string labels of inbound subjects ─────────────────
+
+    if (inbound) {
+      const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
+      const gcl = graphIri ? `}` : ''
+      const it  = await fc(`
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+CONSTRUCT { ?s ?p <${seedIri}> . ?s ?sp ?label . }
+WHERE {
+  ${gc}
+    ?s ?p <${seedIri}> .
+    OPTIONAL {
+      ?s ?sp ?label .
+      FILTER(isLiteral(?label) &&
+        (datatype(?label) = xsd:string   ||
+         datatype(?label) = rdf:langString ||
+         lang(?label) != ""))
+    }
+  ${gcl}
+}`).catch(() => '')
+      if (it.trim()) parts.push(it)
+    }
+
+    // ── Merge and return ──────────────────────────────────────────────────────
+
+    const merged = parts.filter(p => p?.trim()).join('\n\n')
+    console.log(`[Bridge] /describe complete -- ${parts.length} part(s), ${merged.length} chars`)
+    return res.type(responseType).send(merged)
+
+  } catch (err) {
+    if (err.name === 'AbortError')
+      return res.status(504).json({ error: '/describe timed out (30s per hop).' })
+    console.error('[Bridge] /describe error:', err)
     return res.status(500).json({ error: 'Internal bridge error', message: err.message })
   }
 })
@@ -2255,7 +2469,7 @@ app.use((_req, res) => {
   res.status(404).json({
     error: 'Not found.',
     available: [
-      'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select', 'POST /sparql-construct',
+      'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select', 'POST /sparql-construct', 'POST /describe',
       'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode',
       'POST /named-query', 'POST /named-rule', 'POST /rule', 'POST /graph-op',
       'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
