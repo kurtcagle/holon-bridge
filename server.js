@@ -1124,8 +1124,9 @@ app.get('/description', async (_req, res) => {
     shaclTriples, model: MODEL, maxRetries: MAX_RETRIES,
     operations: [
       { method: 'POST', path: '/query',          description: 'NL -> SPARQL -> interpreted answer. Or { queryId } to execute a stored named query. Or { queryId, params: { key: value } } for parameterised named queries — substitutes {{key}} placeholders in the stored SPARQL before execution.' },
-      { method: 'POST', path: '/sparql-select',  description: 'Direct SPARQL SELECT/ASK/CONSTRUCT/DESCRIBE — bypasses NL pipeline entirely. Body: { "sparql": "..." }. Returns bindings for SELECT/ASK, Turtle for CONSTRUCT/DESCRIBE.' },
-      { method: 'POST', path: '/update',         description: 'SHACL-gated Turtle push to a named graph.' },
+      { method: 'POST', path: '/sparql-select',    description: 'Direct SPARQL SELECT or ASK — bypasses NL pipeline. Body: { "sparql": "..." }. Returns JSON bindings. Also accepts CONSTRUCT/DESCRIBE for backwards compatibility; prefer /sparql-construct for graph-producing queries.' },
+      { method: 'POST', path: '/sparql-construct', description: 'Direct SPARQL CONSTRUCT or DESCRIBE — returns RDF. Body: { "query": "CONSTRUCT { ... } WHERE { ... }", "format"?: "turtle"|"trig" }. Accept header overrides format param. Default: text/turtle. Timeout: 30s.' },
+      { method: 'POST', path: '/update',           description: 'SHACL-gated Turtle push to a named graph.' },
       { method: 'POST', path: '/sparql-update',  description: 'Raw SPARQL UPDATE (INSERT/DELETE/etc) — no validation gate.' },
       { method: 'POST', path: '/reload',         description: 'Reload context directory + named queries (RDF + filesystem) + rediscover named graphs.' },
       { method: 'POST', path: '/dataset',        description: 'Switch active dataset at runtime. Accepts optional "fusekiUrl" to change Fuseki host in the same call. Restarts context watcher. Body: { "dataset": "name", "fusekiUrl"?: "http://..." }.' },
@@ -1393,6 +1394,85 @@ app.post('/sparql-select', async (req, res) => {
         sparql:  query
       })
     console.error('[Bridge] /sparql-select error:', err)
+    return res.status(500).json({ error: 'Internal bridge error', message: err.message })
+  }
+})
+
+// -- POST /sparql-construct ----------------------------------------------------
+//
+// Execute a SPARQL CONSTRUCT or DESCRIBE query directly against Fuseki and
+// return the result as RDF.  Unlike /sparql-select (which detects and handles
+// CONSTRUCT internally while primarily serving SELECT/ASK), this endpoint is
+// dedicated to graph-producing queries and supports explicit format negotiation.
+//
+// Request body: { "query": "CONSTRUCT { ... } WHERE { ... }", "format"?: "turtle"|"trig" }
+// Accept header overrides the body "format" param when both are present.
+//
+// Response: text/turtle (default) or application/trig
+// Errors:   400 if query is missing or not a CONSTRUCT/DESCRIBE
+//           502 if Fuseki returns an error
+//           504 if the query times out (30s)
+
+app.post('/sparql-construct', async (req, res) => {
+  const { query, format } = req.body ?? {}
+
+  if (!query || typeof query !== 'string' || !query.trim())
+    return res.status(400).json({ error: 'Request body must include a non-empty "query" string.' })
+
+  // Determine output format: Accept header takes priority over body param
+  const acceptHeader = req.headers['accept'] ?? ''
+  let responseType
+  if (acceptHeader.includes('application/trig')) {
+    responseType = 'application/trig'
+  } else if (format === 'trig') {
+    responseType = 'application/trig'
+  } else {
+    responseType = 'text/turtle'   // default
+  }
+
+  // Validate query type — reject SELECT/ASK/UPDATE to give a helpful error
+  const stripped = query.trim()
+    .replace(/^\s*(#[^\n]*\n\s*)*/i, '')           // strip leading comments
+    .replace(/PREFIX\s+\S*\s*<[^>]*>\s*/gi, '')    // strip PREFIX declarations
+    .trim()
+
+  if (!/^(CONSTRUCT|DESCRIBE)\b/i.test(stripped)) {
+    return res.status(400).json({
+      error: 'POST /sparql-construct accepts CONSTRUCT and DESCRIBE queries only. ' +
+             'Use POST /sparql-select for SELECT and ASK, or POST /sparql-update for INSERT/DELETE.'
+    })
+  }
+
+  console.log(`[Bridge] /sparql-construct (${query.length} chars, format=${responseType})`)
+  if (LOG_SPARQL) console.log(query)
+
+  try {
+    const controller = new AbortController()
+    const timer      = setTimeout(() => controller.abort(), 30_000)
+    let response
+    try {
+      response = await fetch(JENA_SPARQL, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/sparql-query', 'Accept': responseType },
+        body:    query.trim(),
+        signal:  controller.signal
+      })
+    } finally { clearTimeout(timer) }
+
+    const body = await response.text()
+
+    if (!response.ok)
+      return res.status(502).json({
+        error: `Fuseki CONSTRUCT returned HTTP ${response.status}: ${body.slice(0, 300)}`
+      })
+
+    console.log(`[Bridge] /sparql-construct OK -- ${body.length} chars, ${responseType}`)
+    return res.type(responseType).send(body)
+
+  } catch (err) {
+    if (err.name === 'AbortError')
+      return res.status(504).json({ error: 'CONSTRUCT query timed out (30s).' })
+    console.error('[Bridge] /sparql-construct error:', err)
     return res.status(500).json({ error: 'Internal bridge error', message: err.message })
   }
 })
@@ -2175,7 +2255,7 @@ app.use((_req, res) => {
   res.status(404).json({
     error: 'Not found.',
     available: [
-      'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select',
+      'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select', 'POST /sparql-construct',
       'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode',
       'POST /named-query', 'POST /named-rule', 'POST /rule', 'POST /graph-op',
       'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
