@@ -64,47 +64,55 @@ const hbHeaders = (extra = {}) => ({
   ...extra,
 });
 
-/** POST application/sparql-query to HolonBridge. */
-async function hbQuery(sparql, type = 'select') {
-  const endpoint = type === 'construct' ? '/sparql/construct' : '/sparql/query';
-  const res = await fetch(`${HOLONBRIDGE_URL}${endpoint}`, {
+/** POST a SPARQL CONSTRUCT or DESCRIBE query to /sparql-construct. Returns Turtle. */
+async function hbConstruct(query, format = 'turtle') {
+  const accept = format === 'trig' ? 'application/trig' : 'text/turtle'
+  const res = await fetch(`${HOLONBRIDGE_URL}/sparql-construct`, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: accept }),
+    body: JSON.stringify({ query, format }),
+  })
+  if (!res.ok) throw new Error(`HolonBridge /sparql-construct: HTTP ${res.status} — ${await res.text()}`)
+  return res.text()
+}
+
+/** POST application/sparql-query to HolonBridge (SELECT/ASK only). */
+async function hbQuery(sparql) {
+  const res = await fetch(`${HOLONBRIDGE_URL}/sparql/query`, {
     method: 'POST',
     headers: hbHeaders({
       'Content-Type': 'application/sparql-query',
-      Accept: type === 'construct'
-        ? 'text/turtle'
-        : 'application/sparql-results+json',
+      Accept: 'application/sparql-results+json',
     }),
     body: sparql,
-  });
-  if (!res.ok) throw new Error(`HolonBridge ${endpoint}: HTTP ${res.status}`);
-  return type === 'construct' ? res.text() : res.json();
+  })
+  if (!res.ok) throw new Error(`HolonBridge /sparql/query: HTTP ${res.status}`)
+  return res.json()
 }
 
-/** POST application/sparql-update to HolonBridge. */
+/** POST a SPARQL UPDATE to /sparql-update with JSON body. */
 async function hbUpdate(sparql) {
-  const res = await fetch(`${HOLONBRIDGE_URL}/sparql/update`, {
+  const res = await fetch(`${HOLONBRIDGE_URL}/sparql-update`, {
     method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/sparql-update' }),
-    body: sparql,
+    headers: hbHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ update: sparql }),
   });
-  if (!res.ok) throw new Error(`HolonBridge /sparql/update: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`HolonBridge /sparql-update: HTTP ${res.status} — ${await res.text()}`);
   return res.text();
 }
 
-/** PUT text/turtle to a named graph (GSP). */
+/** POST Turtle to /update (SHACL-gated named graph push). */
 async function hbPushTurtle(turtle, graphIri, shapesGraph) {
-  const url = new URL(`${HOLONBRIDGE_URL}/graph`);
-  url.searchParams.set('graph', graphIri);
-  if (shapesGraph) url.searchParams.set('shapes', shapesGraph);
-
-  const res = await fetch(url.toString(), {
-    method: 'PUT',
-    headers: hbHeaders({ 'Content-Type': 'text/turtle' }),
-    body: turtle,
+  const res = await fetch(`${HOLONBRIDGE_URL}/update`, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ turtle, graph: graphIri, mode: 'append' }),
   });
-  if (!res.ok) throw new Error(`HolonBridge /graph PUT: HTTP ${res.status} — ${await res.text()}`);
-  return `Pushed to <${graphIri}> — HTTP ${res.status}`;
+  if (!res.ok) throw new Error(`HolonBridge /update: HTTP ${res.status} — ${await res.text()}`);
+  const data = await res.json();
+  return data.updated
+    ? `Pushed to <${graphIri}> — OK`
+    : `Push rejected: ${data.error ?? JSON.stringify(data)}`
 }
 
 /** GET a holon as a DataBook from HolonBridge. */
@@ -131,16 +139,44 @@ async function hbValidate(turtle, shapesGraph) {
   return res.text();   // sh:ValidationReport as Turtle
 }
 
-/** GET /nl_query from HolonBridge. */
+/** POST to /query with natural language question. */
 async function hbNlQuery(question, graph) {
-  const url = new URL(`${HOLONBRIDGE_URL}/nl_query`);
-  url.searchParams.set('q', question);
-  if (graph) url.searchParams.set('graph', graph);
-  const res = await fetch(url.toString(), {
-    headers: hbHeaders({ Accept: 'application/json' }),
+  const res = await fetch(`${HOLONBRIDGE_URL}/query`, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ nl: question, ...(graph ? { graph } : {}) }),
   });
-  if (!res.ok) throw new Error(`HolonBridge /nl_query: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`HolonBridge /query: HTTP ${res.status}`);
   return res.json();
+}
+
+/** POST to /describe — deep BFS graph description of a resource. Returns Turtle or TriG. */
+async function hbDescribe(iri, {
+  depth    = 5,
+  graph    = null,
+  inbound  = false,
+  reifiers = true,
+  format   = 'turtle',
+} = {}) {
+  const accept = format === 'trig' ? 'application/trig' : 'text/turtle'
+  const res = await fetch(`${HOLONBRIDGE_URL}/describe`, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: accept }),
+    body: JSON.stringify({ iri, depth, graph, inbound, reifiers, format }),
+  })
+  if (!res.ok) throw new Error(`HolonBridge /describe: HTTP ${res.status} — ${await res.text()}`)
+  return res.text()
+}
+
+/** POST to /dataset — switch the active Fuseki dataset at runtime. */
+async function hbDataset(dataset) {
+  const res = await fetch(`${HOLONBRIDGE_URL}/dataset`, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ dataset }),
+  })
+  if (!res.ok) throw new Error(`HolonBridge /dataset: HTTP ${res.status} — ${await res.text()}`)
+  return res.json()
 }
 
 /** Shared list_graphs SPARQL. */
@@ -179,7 +215,7 @@ let activeProfile = 'default';
 
 const server = new McpServer({
   name: 'holonbridge-mcp-remote',
-  version: '1.0.0',
+  version: '1.1.0',
 });
 
 // ── P1: Endpoint management ───────────────────────────────────────────────────
@@ -231,13 +267,13 @@ server.tool(
 
 server.tool(
   'sparql_construct',
-  'Execute a SPARQL CONSTRUCT query. Returns Turtle.',
+  'Execute a SPARQL CONSTRUCT or DESCRIBE query. Returns Turtle (default) or TriG.',
   {
-    query: z.string().describe('SPARQL CONSTRUCT query string'),
-    graph: z.string().optional().describe('Restrict to this named graph IRI'),
+    query:  z.string().describe('SPARQL CONSTRUCT or DESCRIBE query string'),
+    format: z.enum(['turtle', 'trig']).optional().describe('Output format (default: turtle)'),
   },
-  async ({ query }) => {
-    const turtle = await hbQuery(query, 'construct');
+  async ({ query, format = 'turtle' }) => {
+    const turtle = await hbConstruct(query, format);
     return { content: [{ type: 'text', text: turtle }] };
   }
 );
@@ -252,7 +288,41 @@ server.tool(
   }
 );
 
+server.tool(
+  'describe',
+  'Deep graph description of a resource. BFS traversal follows IRIs and blank nodes to a given depth (max 5). rdf:List chains traversed in full. Reifier nodes collected in parallel. Returns Turtle or TriG.',
+  {
+    iri:      z.string().describe('Seed IRI to describe'),
+    depth:    z.number().int().min(1).max(5).optional()
+                .describe('Traversal depth 1–5 (default 5)'),
+    graph:    z.string().optional()
+                .describe('Restrict to this named graph IRI; omit for dataset-wide traversal'),
+    inbound:  z.boolean().optional()
+                .describe('Include one-level inbound references plus their string labels (default false)'),
+    reifiers: z.boolean().optional()
+                .describe('Collect RDF-Star reifier nodes at each hop (default true)'),
+    format:   z.enum(['turtle', 'trig']).optional()
+                .describe('Output format (default: turtle)'),
+  },
+  async ({ iri, depth, graph, inbound, reifiers, format }) => {
+    const result = await hbDescribe(iri, { depth, graph, inbound, reifiers, format });
+    return { content: [{ type: 'text', text: result }] };
+  }
+);
+
 // ── P1: Graph management ──────────────────────────────────────────────────────
+
+server.tool(
+  'switch_dataset',
+  'Switch the active Fuseki dataset at runtime (e.g. "chloe", "storme", "ds", "ggsc").',
+  {
+    dataset: z.string().describe('Dataset name to activate'),
+  },
+  async ({ dataset }) => {
+    const data = await hbDataset(dataset);
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  }
+);
 
 server.tool(
   'push_turtle',
