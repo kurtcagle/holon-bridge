@@ -233,7 +233,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.2.0',
+    version: '1.3.0',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -381,11 +381,29 @@ function createMcpServer() {
     }
   );
 
-  // ── Dataset switching ─────────────────────────────────────────────────────────
+  // ── Dataset management ───────────────────────────────────────────────────────
+
+  srv.tool(
+    'list_datasets',
+    'List all Fuseki datasets available on this HolonBridge instance (GET /datasets).',
+    {},
+    async () => {
+      const res = await fetch(`${HOLONBRIDGE_URL}/datasets`, {
+        headers: hbHeaders({ Accept: 'application/json' }),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(`HolonBridge /datasets: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
 
   srv.tool(
     'switch_dataset',
-    'Switch the active Fuseki dataset on HolonBridge (POST /dataset).',
+    'Switch the active Fuseki dataset on HolonBridge (POST /dataset). ' +
+    'Session-scoped; does not persist across HolonBridge restarts.',
     { dataset: z.string().describe('Fuseki dataset name (e.g. "chloe", "ds", "storme")') },
     async ({ dataset }) => {
       const res = await fetch(`${HOLONBRIDGE_URL}/dataset`, {
@@ -464,7 +482,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.2.0',
+    version: '1.3.0',
     holonbridge: HOLONBRIDGE_URL,
     fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
@@ -474,7 +492,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.2.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.3.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
   console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
