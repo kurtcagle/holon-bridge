@@ -233,7 +233,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.3.0',
+    version: '1.4.0',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -439,6 +439,41 @@ app.options('*', cors());
 // via SSEServerTransport.handlePostMessage; parsing the body here would consume
 // the stream before the transport can read it, causing 400 errors.
 
+// ── OAuth discovery stubs ─────────────────────────────────────────────────────
+//
+// The MCP client (Claude ≥ some recent version) probes these well-known
+// endpoints before connecting.  We don't implement OAuth — auth is a simple
+// Bearer token on every request.  These stubs tell the client exactly that
+// and prevent 401s from blocking the SSE handshake.
+
+app.get('/.well-known/oauth-protected-resource', (_req, res) => {
+  res.json({
+    resource: process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io',
+    bearer_methods_supported: ['header'],
+  });
+});
+
+app.get('/.well-known/oauth-protected-resource/sse', (_req, res) => {
+  res.json({
+    resource: process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io',
+    bearer_methods_supported: ['header'],
+  });
+});
+
+// No OAuth server — return 404 so the client falls back to Bearer.
+app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+  res.status(404).json({ error: 'No OAuth authorization server — use Bearer token.' });
+});
+
+// No authorization endpoint — same story.
+app.get('/authorize', (_req, res) => {
+  res.status(404).json({ error: 'No OAuth authorization endpoint — use Bearer token.' });
+});
+
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
+// ── Bearer auth middleware (applied to all remaining routes) ──────────────────
+
 app.use((req, res, next) => {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ') || auth.slice(7) !== MCP_REMOTE_TOKEN) {
@@ -482,7 +517,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.3.0',
+    version: '1.4.0',
     holonbridge: HOLONBRIDGE_URL,
     fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
@@ -492,7 +527,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.3.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.4.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
   console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
