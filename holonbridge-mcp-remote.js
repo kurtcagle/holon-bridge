@@ -21,10 +21,20 @@
  *
  * Environment (.env in the same directory as this file):
  *   HOLONBRIDGE_URL=http://localhost:3031
- *   HB_BEARER_TOKEN=<HolonBridge bearer token>
- *   MCP_REMOTE_TOKEN=<separate secret>
+ *   HB_BEARER_TOKEN=<token for outbound HolonBridge REST calls>
+ *   MCP_REMOTE_TOKEN=<token Claude sends as Bearer on /sse — must match the
+ *                     credential entered in the Claude integration settings AND
+ *                     the client_secret Claude sends to POST /token during the
+ *                     OAuth flow; set all three to the same value for now>
  *   MCP_PORT=3032
- *   FUSEKI_GSP=http://localhost:3030/ds/data   # for push_turtle (direct GSP)
+ *   MCP_PUBLIC_URL=https://kurtcagle-mcp.ngrok.io  # your public ngrok/tunnel URL
+ *   FUSEKI_GSP=http://localhost:3030/ds/data        # for push_turtle (direct GSP)
+ *
+ * Token relationship (TODO: split properly when per-user scoping is added):
+ *   HB_BEARER_TOKEN      — protects HolonBridge from the MCP remote
+ *   MCP_REMOTE_TOKEN     — protects the MCP remote from external clients
+ *   OAuth client_secret  — Claude sends this during /token exchange; must equal
+ *                          MCP_REMOTE_TOKEN for the Bearer check on /sse to pass
  *
  * Changelog
  * ─────────
@@ -234,7 +244,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.7.0',
+    version: '1.7.1',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -589,7 +599,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.7.0',
+    version: '1.7.1',
     holonbridge: HOLONBRIDGE_URL,
     fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
@@ -599,7 +609,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.7.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.7.1 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
   console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
