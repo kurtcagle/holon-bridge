@@ -233,7 +233,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.4.0',
+    version: '1.5.0',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -439,35 +439,71 @@ app.options('*', cors());
 // via SSEServerTransport.handlePostMessage; parsing the body here would consume
 // the stream before the transport can read it, causing 400 errors.
 
-// ── OAuth discovery stubs ─────────────────────────────────────────────────────
+// ── Minimal OAuth 2.0 implementation ─────────────────────────────────────────
 //
-// The MCP client (Claude ≥ some recent version) probes these well-known
-// endpoints before connecting.  We don't implement OAuth — auth is a simple
-// Bearer token on every request.  These stubs tell the client exactly that
-// and prevent 401s from blocking the SSE handshake.
+// Claude's MCP client (2025+) implements the MCP Authorization spec and
+// requires a compliant OAuth 2.0 Protected Resource + Authorization Server
+// before it will connect.  We implement the minimum viable OAuth surface:
+//
+//   - Protected Resource metadata → points at ourselves as the auth server
+//   - Authorization Server metadata → advertises client_credentials grant
+//   - POST /token → issues MCP_REMOTE_TOKEN as a static access token
+//   - GET /authorize → satisfies any auth code probes with a redirect
+//
+// This is NOT real OAuth — it's a static token dispenser that speaks OAuth's
+// vocabulary.  MCP_REMOTE_TOKEN acts as both client_secret and access_token.
+// No user login, no PKCE, no token expiry.
+
+const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io';
 
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
   res.json({
-    resource: process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io',
-    bearer_methods_supported: ['header'],
+    resource:                  MCP_PUBLIC_URL,
+    authorization_servers:     [MCP_PUBLIC_URL],
+    bearer_methods_supported:  ['header'],
   });
 });
 
 app.get('/.well-known/oauth-protected-resource/sse', (_req, res) => {
   res.json({
-    resource: process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io',
-    bearer_methods_supported: ['header'],
+    resource:                  MCP_PUBLIC_URL,
+    authorization_servers:     [MCP_PUBLIC_URL],
+    bearer_methods_supported:  ['header'],
   });
 });
 
-// No OAuth server — return 404 so the client falls back to Bearer.
 app.get('/.well-known/oauth-authorization-server', (_req, res) => {
-  res.status(404).json({ error: 'No OAuth authorization server — use Bearer token.' });
+  res.json({
+    issuer:                                MCP_PUBLIC_URL,
+    token_endpoint:                        `${MCP_PUBLIC_URL}/token`,
+    authorization_endpoint:                `${MCP_PUBLIC_URL}/authorize`,
+    grant_types_supported:                 ['client_credentials'],
+    token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic'],
+    response_types_supported:              ['token'],
+  });
 });
 
-// No authorization endpoint — same story.
-app.get('/authorize', (_req, res) => {
-  res.status(404).json({ error: 'No OAuth authorization endpoint — use Bearer token.' });
+// Static token endpoint — issues MCP_REMOTE_TOKEN unconditionally.
+// Real auth is enforced downstream by the Bearer middleware.
+app.post('/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
+  res.json({
+    access_token: MCP_REMOTE_TOKEN,
+    token_type:   'Bearer',
+    expires_in:   86400,
+  });
+});
+
+// Authorization endpoint — for auth-code probes, redirect back with token.
+app.get('/authorize', (req, res) => {
+  const { redirect_uri, state } = req.query;
+  if (redirect_uri) {
+    const url = new URL(redirect_uri);
+    url.searchParams.set('access_token', MCP_REMOTE_TOKEN);
+    url.searchParams.set('token_type', 'Bearer');
+    if (state) url.searchParams.set('state', state);
+    return res.redirect(url.toString());
+  }
+  res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer' });
 });
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
@@ -517,7 +553,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.4.0',
+    version: '1.5.0',
     holonbridge: HOLONBRIDGE_URL,
     fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
@@ -527,7 +563,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.4.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.5.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
   console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
