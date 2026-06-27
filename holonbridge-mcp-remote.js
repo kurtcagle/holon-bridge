@@ -41,6 +41,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import { randomUUID } from 'crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
@@ -233,7 +234,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.5.0',
+    version: '1.6.0',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -439,71 +440,88 @@ app.options('*', cors());
 // via SSEServerTransport.handlePostMessage; parsing the body here would consume
 // the stream before the transport can read it, causing 400 errors.
 
-// ── Minimal OAuth 2.0 implementation ─────────────────────────────────────────
+// ── Minimal OAuth 2.0 + PKCE implementation ──────────────────────────────────
 //
-// Claude's MCP client (2025+) implements the MCP Authorization spec and
-// requires a compliant OAuth 2.0 Protected Resource + Authorization Server
-// before it will connect.  We implement the minimum viable OAuth surface:
+// Claude's MCP client (2025+) implements the MCP Authorization spec using
+// authorization_code + PKCE flow.  We implement the minimum viable surface:
 //
-//   - Protected Resource metadata → points at ourselves as the auth server
-//   - Authorization Server metadata → advertises client_credentials grant
-//   - POST /token → issues MCP_REMOTE_TOKEN as a static access token
-//   - GET /authorize → satisfies any auth code probes with a redirect
+//   1. GET  /.well-known/oauth-protected-resource  → points at our auth server
+//   2. GET  /.well-known/oauth-authorization-server → advertises our endpoints
+//   3. GET  /authorize?redirect_uri&state&code_challenge → redirects with code
+//   4. POST /token { grant_type=authorization_code, code } → returns access token
 //
 // This is NOT real OAuth — it's a static token dispenser that speaks OAuth's
-// vocabulary.  MCP_REMOTE_TOKEN acts as both client_secret and access_token.
-// No user login, no PKCE, no token expiry.
+// vocabulary.  MCP_REMOTE_TOKEN is the issued access_token; the PKCE verifier
+// is accepted but not cryptographically checked.  All real auth enforcement
+// happens in the Bearer middleware below.
 
 const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io';
 
+// One-time auth codes: code → { redirect_uri, state }.  Short-lived in memory.
+const authCodes = new Map();
+
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
   res.json({
-    resource:                  MCP_PUBLIC_URL,
-    authorization_servers:     [MCP_PUBLIC_URL],
-    bearer_methods_supported:  ['header'],
+    resource:                 MCP_PUBLIC_URL,
+    authorization_servers:    [MCP_PUBLIC_URL],
+    bearer_methods_supported: ['header'],
   });
 });
 
 app.get('/.well-known/oauth-protected-resource/sse', (_req, res) => {
   res.json({
-    resource:                  MCP_PUBLIC_URL,
-    authorization_servers:     [MCP_PUBLIC_URL],
-    bearer_methods_supported:  ['header'],
+    resource:                 MCP_PUBLIC_URL,
+    authorization_servers:    [MCP_PUBLIC_URL],
+    bearer_methods_supported: ['header'],
   });
 });
 
 app.get('/.well-known/oauth-authorization-server', (_req, res) => {
   res.json({
     issuer:                                MCP_PUBLIC_URL,
-    token_endpoint:                        `${MCP_PUBLIC_URL}/token`,
     authorization_endpoint:                `${MCP_PUBLIC_URL}/authorize`,
-    grant_types_supported:                 ['client_credentials'],
-    token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic'],
-    response_types_supported:              ['token'],
+    token_endpoint:                        `${MCP_PUBLIC_URL}/token`,
+    grant_types_supported:                 ['authorization_code', 'client_credentials'],
+    response_types_supported:              ['code'],
+    code_challenge_methods_supported:      ['S256', 'plain'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
   });
 });
 
-// Static token endpoint — issues MCP_REMOTE_TOKEN unconditionally.
-// Real auth is enforced downstream by the Bearer middleware.
-app.post('/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
-  res.json({
-    access_token: MCP_REMOTE_TOKEN,
-    token_type:   'Bearer',
-    expires_in:   86400,
-  });
-});
-
-// Authorization endpoint — for auth-code probes, redirect back with token.
+// Authorization endpoint — issues a one-time code and redirects back.
 app.get('/authorize', (req, res) => {
   const { redirect_uri, state } = req.query;
-  if (redirect_uri) {
-    const url = new URL(redirect_uri);
-    url.searchParams.set('access_token', MCP_REMOTE_TOKEN);
-    url.searchParams.set('token_type', 'Bearer');
-    if (state) url.searchParams.set('state', state);
-    return res.redirect(url.toString());
+  if (!redirect_uri) {
+    return res.status(400).json({ error: 'redirect_uri is required' });
   }
-  res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer' });
+  const code = randomUUID();
+  authCodes.set(code, { redirect_uri, state });
+  // Clean up after 5 minutes
+  setTimeout(() => authCodes.delete(code), 5 * 60 * 1000);
+
+  const url = new URL(redirect_uri);
+  url.searchParams.set('code', code);
+  if (state) url.searchParams.set('state', state);
+  return res.redirect(url.toString());
+});
+
+// Token endpoint — exchanges auth code (or client_credentials) for MCP_REMOTE_TOKEN.
+app.post('/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
+  const { grant_type, code } = req.body ?? {};
+
+  if (grant_type === 'authorization_code') {
+    if (!code || !authCodes.has(code)) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown or expired code.' });
+    }
+    authCodes.delete(code);  // one-time use
+    return res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer', expires_in: 86400 });
+  }
+
+  if (grant_type === 'client_credentials') {
+    return res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer', expires_in: 86400 });
+  }
+
+  return res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
@@ -553,7 +571,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.5.0',
+    version: '1.6.0',
     holonbridge: HOLONBRIDGE_URL,
     fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
@@ -563,7 +581,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.5.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.6.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
   console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
