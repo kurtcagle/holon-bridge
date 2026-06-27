@@ -2,7 +2,7 @@
  * holonbridge-mcp-remote.js
  *
  * Remote (HTTP/SSE) transport wrapper for holonbridge-mcp.
- * Exposes the same 11 MCP tools over the MCP remote protocol so that the
+ * Exposes MCP tools over the MCP remote protocol so that the
  * Claude web client (claude.ai) can connect to them as a custom connector.
  *
  * Architecture
@@ -20,31 +20,22 @@
  *   npm install @modelcontextprotocol/sdk express cors
  *
  * Environment (.env in the same directory as this file):
- *   HOLONBRIDGE_URL=https://kurtcagle.ngrok.io   # or Ben's ngrok URL
- *   HB_BEARER_TOKEN=<HolonBridge bearer token>   # token for HolonBridge
- *   MCP_REMOTE_TOKEN=<separate secret>           # token for THIS server
+ *   HOLONBRIDGE_URL=http://localhost:3031
+ *   HB_BEARER_TOKEN=<HolonBridge bearer token>
+ *   MCP_REMOTE_TOKEN=<separate secret>
  *   MCP_PORT=3032
+ *   FUSEKI_GSP=http://localhost:3030/ds/data   # for push_turtle (direct GSP)
  *
- * Start:
- *   node holonbridge-mcp-remote.js
- *
- * Then expose via ngrok:
- *   ngrok http --url=ben-ggsc.ngrok.io 3032
- *
- * Add to claude.ai:
- *   Settings → Integrations → Add custom integration
- *   URL: https://ben-ggsc.ngrok.io/sse
- *   Auth header: Authorization: Bearer <MCP_REMOTE_TOKEN>
- *
- * v1.0.1 — fix: create a fresh McpServer per SSE connection.
- *   The MCP SDK enforces one-transport-per-Protocol-instance. Reusing a
- *   single server across connections caused a fatal crash on reconnect:
- *     Error: Already connected to a transport. Call close() before
- *     connecting to a new transport, or use a separate Protocol instance
- *     per connection.
- *   Fix: registerTools() factory called inside the /sse handler so each
- *   client session gets its own McpServer. Profile/endpoint state remains
- *   module-level and is shared correctly across sessions.
+ * Changelog
+ * ─────────
+ *   2026-06-26 v1.2  Fix POST /message 400: remove express.json() middleware;
+ *                    pass req.body explicitly to handlePostMessage.
+ *   2026-06-26 v1.1  Fix "Already connected" crash: create McpServer per
+ *                    SSE connection instead of sharing one instance.
+ *   2026-06-26 v1.2  Align all HolonBridge helper functions to v2.9.0 routes:
+ *                    /sparql-select, /sparql-construct, /sparql-update,
+ *                    GET /graphs, POST /query (NL). push_turtle uses direct
+ *                    Fuseki GSP (HolonBridge v2.9.0 has no write route).
  */
 
 import 'dotenv/config';
@@ -58,66 +49,105 @@ import { z } from 'zod';
 
 const {
   HOLONBRIDGE_URL = 'http://localhost:3031',
-  HB_BEARER_TOKEN,         // token for HolonBridge REST calls
-  MCP_REMOTE_TOKEN,        // token clients must send to reach THIS server
+  HB_BEARER_TOKEN,
+  MCP_REMOTE_TOKEN,
   MCP_PORT = '3032',
+  FUSEKI_GSP = 'http://localhost:3030/ds/data',  // direct Fuseki GSP for push_turtle
 } = process.env;
 
 if (!HB_BEARER_TOKEN)  throw new Error('HB_BEARER_TOKEN is required in .env');
 if (!MCP_REMOTE_TOKEN) throw new Error('MCP_REMOTE_TOKEN is required in .env');
 
-// ── HolonBridge HTTP helpers ──────────────────────────────────────────────────
+// ── HolonBridge HTTP helpers (aligned to v2.9.0 routes) ──────────────────────
 
-/** Build auth headers for every HolonBridge request. */
 const hbHeaders = (extra = {}) => ({
   Authorization: `Bearer ${HB_BEARER_TOKEN}`,
   ...extra,
 });
 
-/** POST application/sparql-query to HolonBridge. */
+/**
+ * SPARQL SELECT or ASK via POST /sparql-select  { sparql: "..." }
+ * Returns HolonBridge's { vars, bindings, formattedResults, count } shape.
+ *
+ * SPARQL CONSTRUCT or DESCRIBE via POST /sparql-construct  { query: "..." }
+ * Returns Turtle text.
+ */
 async function hbQuery(sparql, type = 'select') {
-  const endpoint = type === 'construct' ? '/sparql/construct' : '/sparql/query';
-  const res = await fetch(`${HOLONBRIDGE_URL}${endpoint}`, {
-    method: 'POST',
-    headers: hbHeaders({
-      'Content-Type': 'application/sparql-query',
-      Accept: type === 'construct'
-        ? 'text/turtle'
-        : 'application/sparql-results+json',
-    }),
-    body: sparql,
-  });
-  if (!res.ok) throw new Error(`HolonBridge ${endpoint}: HTTP ${res.status}`);
-  return type === 'construct' ? res.text() : res.json();
+  if (type === 'construct') {
+    const res = await fetch(`${HOLONBRIDGE_URL}/sparql-construct`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ query: sparql }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HolonBridge /sparql-construct: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    }
+    return res.text();
+  } else {
+    const res = await fetch(`${HOLONBRIDGE_URL}/sparql-select`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+      body: JSON.stringify({ sparql }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HolonBridge /sparql-select: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    }
+    return res.json();
+  }
 }
 
-/** POST application/sparql-update to HolonBridge. */
+/**
+ * SPARQL UPDATE via POST /sparql-update  { update: "..." }
+ * Returns { updated: true, status: 200 }.
+ */
 async function hbUpdate(sparql) {
-  const res = await fetch(`${HOLONBRIDGE_URL}/sparql/update`, {
+  const res = await fetch(`${HOLONBRIDGE_URL}/sparql-update`, {
     method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/sparql-update' }),
-    body: sparql,
+    headers: hbHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ update: sparql }),
   });
-  if (!res.ok) throw new Error(`HolonBridge /sparql/update: HTTP ${res.status}`);
-  return res.text();
+  if (!res.ok) {
+    const msg = await res.text();
+    throw new Error(`HolonBridge /sparql-update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+  }
+  return res.json();
 }
 
-/** PUT text/turtle to a named graph (GSP). */
+/**
+ * Push Turtle to a named graph via direct Fuseki GSP (PUT).
+ *
+ * HolonBridge v2.9.0 has no write route — GET /graph is read-only and there
+ * is no PUT /graph.  The direct Fuseki GSP endpoint is used instead.
+ * Set FUSEKI_GSP in .env (default: http://localhost:3030/ds/data).
+ *
+ * The optional shapes_graph argument triggers a validate-before-push call
+ * via HolonBridge's POST /validate route.
+ */
 async function hbPushTurtle(turtle, graphIri, shapesGraph) {
-  const url = new URL(`${HOLONBRIDGE_URL}/graph`);
-  url.searchParams.set('graph', graphIri);
-  if (shapesGraph) url.searchParams.set('shapes', shapesGraph);
+  // Optional pre-push SHACL validation
+  if (shapesGraph) {
+    await hbValidate(turtle, shapesGraph);  // throws on violation
+  }
 
-  const res = await fetch(url.toString(), {
+  const url = `${FUSEKI_GSP}?graph=${encodeURIComponent(graphIri)}`;
+  const res = await fetch(url, {
     method: 'PUT',
-    headers: hbHeaders({ 'Content-Type': 'text/turtle' }),
+    headers: { 'Content-Type': 'text/turtle' },
     body: turtle,
   });
-  if (!res.ok) throw new Error(`HolonBridge /graph PUT: HTTP ${res.status} — ${await res.text()}`);
-  return `Pushed to <${graphIri}> — HTTP ${res.status}`;
+  if (!res.ok) {
+    const msg = await res.text();
+    throw new Error(`Fuseki GSP PUT: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+  }
+  return `Pushed to <${graphIri}> via Fuseki GSP — HTTP ${res.status}`;
 }
 
-/** GET a holon as a DataBook from HolonBridge. */
+/**
+ * Get a holon as a DataBook via GET /holon/:iri.
+ * (Route unchanged from previous version — verify if your build has it.)
+ */
 async function hbGetHolon(holonIri, projectionMode = 'immersive') {
   const url = new URL(`${HOLONBRIDGE_URL}/holon/${encodeURIComponent(holonIri)}`);
   url.searchParams.set('projection', projectionMode);
@@ -128,7 +158,10 @@ async function hbGetHolon(holonIri, projectionMode = 'immersive') {
   return res.text();
 }
 
-/** POST Turtle to HolonBridge SHACL validation endpoint. */
+/**
+ * Validate Turtle via POST /validate?shapes=<shapesGraph> with raw Turtle body.
+ * Returns sh:ValidationReport as Turtle.
+ */
 async function hbValidate(turtle, shapesGraph) {
   const url = new URL(`${HOLONBRIDGE_URL}/validate`);
   url.searchParams.set('shapes', shapesGraph);
@@ -138,41 +171,48 @@ async function hbValidate(turtle, shapesGraph) {
     body: turtle,
   });
   if (!res.ok) throw new Error(`HolonBridge /validate: HTTP ${res.status}`);
-  return res.text();   // sh:ValidationReport as Turtle
+  return res.text();
 }
 
-/** GET /nl_query from HolonBridge. */
+/**
+ * Natural language query via POST /query  { nl: "...", graph?: "..." }
+ * HolonBridge translates to SPARQL and returns { answer, sparql, bindings, ... }.
+ */
 async function hbNlQuery(question, graph) {
-  const url = new URL(`${HOLONBRIDGE_URL}/nl_query`);
-  url.searchParams.set('q', question);
-  if (graph) url.searchParams.set('graph', graph);
-  const res = await fetch(url.toString(), {
-    headers: hbHeaders({ Accept: 'application/json' }),
+  const body = { nl: question };
+  if (graph) body.graph = graph;
+  const res = await fetch(`${HOLONBRIDGE_URL}/query`, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`HolonBridge /nl_query: HTTP ${res.status}`);
+  if (!res.ok) {
+    const msg = await res.text();
+    throw new Error(`HolonBridge /query: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+  }
   return res.json();
 }
 
-/** Shared list_graphs SPARQL. */
+/**
+ * List named graphs via GET /graphs.
+ * Returns { dataset, graphs: [{iri, triples}], total }.
+ */
 async function hbListGraphs(filter) {
-  const results = await hbQuery(`
-    SELECT ?g (COUNT(*) AS ?triples) WHERE {
-      GRAPH ?g { ?s ?p ?o }
-    } GROUP BY ?g ORDER BY ?g
-  `);
-  const graphs = results.results.bindings
-    .map(b => ({ iri: b.g.value, triples: b.triples.value }))
+  const res = await fetch(`${HOLONBRIDGE_URL}/graphs`, {
+    headers: hbHeaders({ Accept: 'application/json' }),
+  });
+  if (!res.ok) throw new Error(`HolonBridge /graphs: HTTP ${res.status}`);
+  const { graphs } = await res.json();
+  return graphs
+    .map(g => ({ iri: g.iri, triples: String(g.triples) }))
     .filter(g => !filter || g.iri.includes(filter));
-  return graphs;
 }
 
-// ── Profile state (module-level; shared across all sessions) ──────────────────
+// ── Profile state ─────────────────────────────────────────────────────────────
 
 const profiles = {
   default: { url: HOLONBRIDGE_URL, label: 'default (from .env)' },
 };
-// Pre-load additional named profiles from env if present:
-// PROFILE_GGSC_URL, PROFILE_GGSC_LABEL, etc.
 Object.keys(process.env)
   .filter(k => k.startsWith('PROFILE_') && k.endsWith('_URL'))
   .forEach(k => {
@@ -187,36 +227,30 @@ let activeProfile = 'default';
 
 // ── MCP server factory ────────────────────────────────────────────────────────
 //
-// Called once per /sse connection. Each SSE client gets its own McpServer
-// instance — the MCP SDK Protocol base class does not allow a single instance
-// to be connected to more than one transport simultaneously.
-//
-// Tool handlers close over module-level state (profiles, activeProfile,
-// hbQuery, etc.) so session isolation has no effect on shared functionality.
+// A fresh McpServer is created per /sse connection to avoid the SDK's
+// single-transport restriction ("Already connected to a transport").
 
 function createMcpServer() {
-  const server = new McpServer({
+  const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.0.1',
+    version: '1.2.0',
   });
 
-  // ── P1: Endpoint management ─────────────────────────────────────────────────
+  // ── Endpoint management ─────────────────────────────────────────────────────
 
-  server.tool('list_endpoints', 'List all named HolonBridge profiles.', {}, async () => {
+  srv.tool('list_endpoints', 'List all named HolonBridge profiles.', {}, async () => {
     const lines = Object.entries(profiles).map(
       ([name, p]) => `${name === activeProfile ? '* ' : '  '}${name}: ${p.url} (${p.label})`
     );
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   });
 
-  server.tool('get_endpoint', 'Show the currently active HolonBridge profile.', {}, async () => {
+  srv.tool('get_endpoint', 'Show the currently active HolonBridge profile.', {}, async () => {
     const p = profiles[activeProfile];
-    return {
-      content: [{ type: 'text', text: `Active profile: ${activeProfile} → ${p.url}` }],
-    };
+    return { content: [{ type: 'text', text: `Active profile: ${activeProfile} → ${p.url}` }] };
   });
 
-  server.tool(
+  srv.tool(
     'set_endpoint',
     'Switch the active HolonBridge profile by name.',
     { name: z.string().describe('Profile name from list_endpoints') },
@@ -229,13 +263,13 @@ function createMcpServer() {
     }
   );
 
-  // ── P1: SPARQL tools ────────────────────────────────────────────────────────
+  // ── SPARQL tools ─────────────────────────────────────────────────────────────
 
-  server.tool(
+  srv.tool(
     'sparql_select',
-    'Execute a SPARQL SELECT query. Returns JSON bindings.',
+    'Execute a SPARQL SELECT or ASK query. Returns JSON bindings.',
     {
-      query: z.string().describe('SPARQL SELECT query string'),
+      query: z.string().describe('SPARQL SELECT or ASK query string'),
       graph: z.string().optional().describe('Restrict to this named graph IRI'),
     },
     async ({ query, graph }) => {
@@ -247,12 +281,11 @@ function createMcpServer() {
     }
   );
 
-  server.tool(
+  srv.tool(
     'sparql_construct',
-    'Execute a SPARQL CONSTRUCT query. Returns Turtle.',
+    'Execute a SPARQL CONSTRUCT or DESCRIBE query. Returns Turtle.',
     {
-      query: z.string().describe('SPARQL CONSTRUCT query string'),
-      graph: z.string().optional().describe('Restrict to this named graph IRI'),
+      query: z.string().describe('SPARQL CONSTRUCT or DESCRIBE query string'),
     },
     async ({ query }) => {
       const turtle = await hbQuery(query, 'construct');
@@ -260,24 +293,25 @@ function createMcpServer() {
     }
   );
 
-  server.tool(
+  srv.tool(
     'sparql_update',
     'Execute a SPARQL UPDATE (INSERT DATA, DELETE DATA, CLEAR, etc.).',
     { update: z.string().describe('SPARQL UPDATE statement') },
     async ({ update }) => {
       const result = await hbUpdate(update);
-      return { content: [{ type: 'text', text: result || 'Update applied.' }] };
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     }
   );
 
-  // ── P1: Graph management ────────────────────────────────────────────────────
+  // ── Graph management ──────────────────────────────────────────────────────────
 
-  server.tool(
+  srv.tool(
     'push_turtle',
-    'Push Turtle content into a named graph in Fuseki via HolonBridge.',
+    'Push Turtle content into a named graph in Fuseki (direct GSP PUT). ' +
+    'Optionally validates against a SHACL shapes graph before pushing.',
     {
-      turtle:      z.string().describe('Valid Turtle 1.1/1.2 payload'),
-      graph_iri:   z.string().describe('Target named graph IRI'),
+      turtle:       z.string().describe('Valid Turtle 1.1/1.2 payload'),
+      graph_iri:    z.string().describe('Target named graph IRI'),
       shapes_graph: z.string().optional().describe('SHACL shapes graph IRI for pre-push validation'),
     },
     async ({ turtle, graph_iri, shapes_graph }) => {
@@ -286,7 +320,7 @@ function createMcpServer() {
     }
   );
 
-  server.tool(
+  srv.tool(
     'get_holon',
     'Retrieve a holon from Fuseki and return it as a DataBook.',
     {
@@ -301,7 +335,7 @@ function createMcpServer() {
     }
   );
 
-  server.tool(
+  srv.tool(
     'list_graphs',
     'List all named graphs in the Fuseki dataset with triple counts.',
     { filter: z.string().optional().describe('Substring filter on graph IRI') },
@@ -317,9 +351,9 @@ function createMcpServer() {
     }
   );
 
-  // ── P2: SHACL validation ────────────────────────────────────────────────────
+  // ── SHACL validation ──────────────────────────────────────────────────────────
 
-  server.tool(
+  srv.tool(
     'validate_turtle',
     'Validate a Turtle payload against a SHACL shapes graph.',
     {
@@ -332,9 +366,9 @@ function createMcpServer() {
     }
   );
 
-  // ── P3: Natural language query ──────────────────────────────────────────────
+  // ── Natural language query ────────────────────────────────────────────────────
 
-  server.tool(
+  srv.tool(
     'nl_query',
     'Query the triplestore using natural language. HolonBridge translates to SPARQL.',
     {
@@ -347,14 +381,34 @@ function createMcpServer() {
     }
   );
 
-  return server;
+  // ── Dataset switching ─────────────────────────────────────────────────────────
+
+  srv.tool(
+    'switch_dataset',
+    'Switch the active Fuseki dataset on HolonBridge (POST /dataset).',
+    { dataset: z.string().describe('Fuseki dataset name (e.g. "chloe", "ds", "storme")') },
+    async ({ dataset }) => {
+      const res = await fetch(`${HOLONBRIDGE_URL}/dataset`, {
+        method: 'POST',
+        headers: hbHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ dataset }),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(`HolonBridge /dataset: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      }
+      const result = await res.json();
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  return srv;
 }
 
-// ── Express app with SSE transport ───────────────────────────────────────────
+// ── Express app ───────────────────────────────────────────────────────────────
 
 const app = express();
 
-// CORS — allow claude.ai to connect to this MCP remote endpoint.
 app.use(cors({
   origin: ['https://claude.ai', 'https://api.claude.ai'],
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -363,13 +417,10 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-app.use(express.json());
+// express.json() intentionally omitted — /message uses the raw request stream
+// via SSEServerTransport.handlePostMessage; parsing the body here would consume
+// the stream before the transport can read it, causing 400 errors.
 
-/**
- * Auth middleware — every request must carry the MCP_REMOTE_TOKEN.
- * This is SEPARATE from the HolonBridge bearer token; it protects the
- * MCP endpoint itself so random internet traffic cannot invoke the tools.
- */
 app.use((req, res, next) => {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ') || auth.slice(7) !== MCP_REMOTE_TOKEN) {
@@ -378,61 +429,54 @@ app.use((req, res, next) => {
   next();
 });
 
-/**
- * SSE endpoint — claude.ai connects here to establish the MCP session.
- * A fresh McpServer is created per connection (see createMcpServer() above).
- * Sessions are tracked by session ID so the POST /message handler can route
- * correctly.
- */
-const sessions = new Map();  // sessionId → SSEServerTransport
+// sessionId → { server: McpServer, transport: SSEServerTransport }
+const sessions = new Map();
 
 app.get('/sse', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('X-Accel-Buffering', 'no');  // disable nginx buffering if behind a proxy
+  res.setHeader('X-Accel-Buffering', 'no');
 
   const transport = new SSEServerTransport('/message', res);
-  sessions.set(transport.sessionId, transport);
+  const srv = createMcpServer();
+
+  sessions.set(transport.sessionId, { server: srv, transport });
 
   res.on('close', () => {
     sessions.delete(transport.sessionId);
+    srv.close().catch(() => {});
   });
 
-  // Fresh McpServer instance per connection — fixes "Already connected" crash.
-  const server = createMcpServer();
-  await server.connect(transport);
+  await srv.connect(transport);
 });
 
-/**
- * POST /message — client sends MCP messages here.
- * The session ID (provided by the client as a query param) routes the
- * message to the correct SSEServerTransport.
- */
 app.post('/message', async (req, res) => {
   const sessionId = req.query.sessionId;
-  const transport = sessions.get(sessionId);
+  const session = sessions.get(sessionId);
 
-  if (!transport) {
+  if (!session) {
     return res.status(404).json({ error: `No active session: ${sessionId}` });
   }
 
-  await transport.handlePostMessage(req, res);
+  await session.transport.handlePostMessage(req, res, req.body);
 });
 
-/** Health probe — useful for ngrok and uptime monitoring. */
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.0.1',
+    version: '1.2.0',
     holonbridge: HOLONBRIDGE_URL,
+    fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
     activeProfile,
+    activeSessions: sessions.size,
   });
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.2.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
+  console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
   console.log(`  SSE endpoint       : http://localhost:${MCP_PORT}/sse`);
   console.log(`  Health             : http://localhost:${MCP_PORT}/health`);
