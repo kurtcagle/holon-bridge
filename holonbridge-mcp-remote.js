@@ -234,7 +234,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.6.0',
+    version: '1.7.0',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -443,24 +443,17 @@ app.options('*', cors());
 // ── Minimal OAuth 2.0 + PKCE implementation ──────────────────────────────────
 //
 // Claude's MCP client (2025+) implements the MCP Authorization spec using
-// authorization_code + PKCE flow.  We implement the minimum viable surface:
-//
-//   1. GET  /.well-known/oauth-protected-resource  → points at our auth server
-//   2. GET  /.well-known/oauth-authorization-server → advertises our endpoints
-//   3. GET  /authorize?redirect_uri&state&code_challenge → redirects with code
-//   4. POST /token { grant_type=authorization_code, code } → returns access token
-//
+// authorization_code + PKCE flow, with dynamic client registration.
 // This is NOT real OAuth — it's a static token dispenser that speaks OAuth's
-// vocabulary.  MCP_REMOTE_TOKEN is the issued access_token; the PKCE verifier
-// is accepted but not cryptographically checked.  All real auth enforcement
-// happens in the Bearer middleware below.
+// vocabulary.  MCP_REMOTE_TOKEN is the issued access_token.
 
 const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io';
 
-// One-time auth codes: code → { redirect_uri, state }.  Short-lived in memory.
-const authCodes = new Map();
+const authCodes = new Map();         // code → { redirect_uri, state, client_id }
+const registeredClients = new Map(); // client_id → client metadata
 
-app.get('/.well-known/oauth-protected-resource', (_req, res) => {
+app.get('/.well-known/oauth-protected-resource', (req, res) => {
+  console.log('[OAuth] GET /.well-known/oauth-protected-resource');
   res.json({
     resource:                 MCP_PUBLIC_URL,
     authorization_servers:    [MCP_PUBLIC_URL],
@@ -468,7 +461,8 @@ app.get('/.well-known/oauth-protected-resource', (_req, res) => {
   });
 });
 
-app.get('/.well-known/oauth-protected-resource/sse', (_req, res) => {
+app.get('/.well-known/oauth-protected-resource/sse', (req, res) => {
+  console.log('[OAuth] GET /.well-known/oauth-protected-resource/sse');
   res.json({
     resource:                 MCP_PUBLIC_URL,
     authorization_servers:    [MCP_PUBLIC_URL],
@@ -476,51 +470,75 @@ app.get('/.well-known/oauth-protected-resource/sse', (_req, res) => {
   });
 });
 
-app.get('/.well-known/oauth-authorization-server', (_req, res) => {
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+  console.log('[OAuth] GET /.well-known/oauth-authorization-server');
   res.json({
     issuer:                                MCP_PUBLIC_URL,
     authorization_endpoint:                `${MCP_PUBLIC_URL}/authorize`,
     token_endpoint:                        `${MCP_PUBLIC_URL}/token`,
+    registration_endpoint:                 `${MCP_PUBLIC_URL}/register`,
     grant_types_supported:                 ['authorization_code', 'client_credentials'],
     response_types_supported:              ['code'],
     code_challenge_methods_supported:      ['S256', 'plain'],
-    token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+  });
+});
+
+// Dynamic client registration (RFC 7591)
+app.post('/register', express.json(), (req, res) => {
+  console.log('[OAuth] POST /register body:', JSON.stringify(req.body));
+  const client_id     = randomUUID();
+  const client_secret = randomUUID();
+  registeredClients.set(client_id, { ...(req.body ?? {}), client_id, client_secret });
+  console.log(`[OAuth] Registered client_id=${client_id}`);
+  res.status(201).json({
+    client_id,
+    client_secret,
+    client_id_issued_at:      Math.floor(Date.now() / 1000),
+    client_secret_expires_at: 0,
+    ...(req.body ?? {}),
   });
 });
 
 // Authorization endpoint — issues a one-time code and redirects back.
 app.get('/authorize', (req, res) => {
-  const { redirect_uri, state } = req.query;
+  console.log('[OAuth] GET /authorize query:', JSON.stringify(req.query));
+  const { redirect_uri, state, client_id } = req.query;
   if (!redirect_uri) {
     return res.status(400).json({ error: 'redirect_uri is required' });
   }
   const code = randomUUID();
-  authCodes.set(code, { redirect_uri, state });
-  // Clean up after 5 minutes
+  authCodes.set(code, { redirect_uri, state, client_id });
   setTimeout(() => authCodes.delete(code), 5 * 60 * 1000);
 
   const url = new URL(redirect_uri);
   url.searchParams.set('code', code);
   if (state) url.searchParams.set('state', state);
+  console.log(`[OAuth] Redirecting with code to ${redirect_uri}`);
   return res.redirect(url.toString());
 });
 
-// Token endpoint — exchanges auth code (or client_credentials) for MCP_REMOTE_TOKEN.
+// Token endpoint — exchanges code for MCP_REMOTE_TOKEN.
 app.post('/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
+  console.log('[OAuth] POST /token body:', JSON.stringify(req.body));
   const { grant_type, code } = req.body ?? {};
 
   if (grant_type === 'authorization_code') {
     if (!code || !authCodes.has(code)) {
+      console.log('[OAuth] /token invalid_grant, code:', code);
       return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown or expired code.' });
     }
-    authCodes.delete(code);  // one-time use
+    authCodes.delete(code);
+    console.log('[OAuth] /token issued access_token (authorization_code)');
     return res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer', expires_in: 86400 });
   }
 
   if (grant_type === 'client_credentials') {
+    console.log('[OAuth] /token issued access_token (client_credentials)');
     return res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer', expires_in: 86400 });
   }
 
+  console.log('[OAuth] /token unsupported_grant_type:', grant_type);
   return res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
@@ -571,7 +589,7 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.6.0',
+    version: '1.7.0',
     holonbridge: HOLONBRIDGE_URL,
     fusekiGsp: FUSEKI_GSP,
     profiles: Object.keys(profiles),
@@ -581,7 +599,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.6.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.7.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
   console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
   console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
