@@ -29,6 +29,8 @@
  *   MCP_PORT=3032
  *   MCP_PUBLIC_URL=https://kurtcagle-mcp.ngrok.io  # your public ngrok/tunnel URL
  *   FUSEKI_GSP=http://localhost:3030/ds/data        # for push_turtle (direct GSP)
+ *                                                   # dataset segment is updated
+ *                                                   # at runtime by switch_dataset
  *
  * Token relationship (TODO: split properly when per-user scoping is added):
  *   HB_BEARER_TOKEN      — protects HolonBridge from the MCP remote
@@ -38,14 +40,21 @@
  *
  * Changelog
  * ─────────
- *   2026-06-26 v1.2  Fix POST /message 400: remove express.json() middleware;
- *                    pass req.body explicitly to handlePostMessage.
- *   2026-06-26 v1.1  Fix "Already connected" crash: create McpServer per
- *                    SSE connection instead of sharing one instance.
- *   2026-06-26 v1.2  Align all HolonBridge helper functions to v2.9.0 routes:
- *                    /sparql-select, /sparql-construct, /sparql-update,
- *                    GET /graphs, POST /query (NL). push_turtle uses direct
- *                    Fuseki GSP (HolonBridge v2.9.0 has no write route).
+ *   2026-06-28 v1.8.0  Fix push_turtle writes to wrong dataset: FUSEKI_GSP was
+ *                      hardcoded in .env and never updated when switch_dataset
+ *                      was called. Now derives jenaBase from FUSEKI_GSP once at
+ *                      startup; tracks activeFusekiDataset in module state;
+ *                      switch_dataset syncs it on success; hbPushTurtle builds
+ *                      the GSP URL dynamically as jenaBase/activeFusekiDataset/data.
+ *   2026-06-26 v1.7.1  (previous — see git log)
+ *   2026-06-26 v1.2    Fix POST /message 400: remove express.json() middleware;
+ *                      pass req.body explicitly to handlePostMessage.
+ *   2026-06-26 v1.1    Fix "Already connected" crash: create McpServer per
+ *                      SSE connection instead of sharing one instance.
+ *   2026-06-26 v1.2    Align all HolonBridge helper functions to v2.9.0 routes:
+ *                      /sparql-select, /sparql-construct, /sparql-update,
+ *                      GET /graphs, POST /query (NL). push_turtle uses direct
+ *                      Fuseki GSP (HolonBridge v2.9.0 has no write route).
  */
 
 import 'dotenv/config';
@@ -68,6 +77,21 @@ const {
 
 if (!HB_BEARER_TOKEN)  throw new Error('HB_BEARER_TOKEN is required in .env');
 if (!MCP_REMOTE_TOKEN) throw new Error('MCP_REMOTE_TOKEN is required in .env');
+
+// ── GSP dataset tracking ──────────────────────────────────────────────────────
+//
+// FUSEKI_GSP encodes the initial dataset in its path: .../ds/data
+// We extract the Jena base URL and the dataset name separately so that
+// switch_dataset can update the target without restarting the process.
+//
+// Pattern: http://localhost:3030/{dataset}/data
+//          └────── jenaBase ────┘└─ ds ─┘
+//
+// hbPushTurtle rebuilds the GSP URL on every call:
+//   `${jenaBase}/${activeFusekiDataset}/data?graph=<encoded IRI>`
+
+const jenaBase = FUSEKI_GSP.replace(/\/[^/]+\/data\/?$/, '');   // "http://localhost:3030"
+let activeFusekiDataset = FUSEKI_GSP.match(/\/([^/]+)\/data\/?$/)?.[1] ?? 'ds';
 
 // ── HolonBridge HTTP helpers (aligned to v2.9.0 routes) ──────────────────────
 
@@ -131,7 +155,11 @@ async function hbUpdate(sparql) {
  *
  * HolonBridge v2.9.0 has no write route — GET /graph is read-only and there
  * is no PUT /graph.  The direct Fuseki GSP endpoint is used instead.
- * Set FUSEKI_GSP in .env (default: http://localhost:3030/ds/data).
+ *
+ * The target dataset is tracked in activeFusekiDataset (updated by
+ * switch_dataset) so that push_turtle always writes to the same dataset
+ * that SPARQL queries are hitting.  The GSP URL is rebuilt on each call:
+ *   http://localhost:3030/{activeFusekiDataset}/data?graph=<encoded IRI>
  *
  * The optional shapes_graph argument triggers a validate-before-push call
  * via HolonBridge's POST /validate route.
@@ -142,7 +170,8 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph) {
     await hbValidate(turtle, shapesGraph);  // throws on violation
   }
 
-  const url = `${FUSEKI_GSP}?graph=${encodeURIComponent(graphIri)}`;
+  const gspEndpoint = `${jenaBase}/${activeFusekiDataset}/data`;
+  const url = `${gspEndpoint}?graph=${encodeURIComponent(graphIri)}`;
   const res = await fetch(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'text/turtle' },
@@ -150,7 +179,7 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph) {
   });
   if (!res.ok) {
     const msg = await res.text();
-    throw new Error(`Fuseki GSP PUT: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    throw new Error(`Fuseki GSP PUT [${activeFusekiDataset}]: HTTP ${res.status} — ${msg.slice(0, 200)}`);
   }
   return `Pushed to <${graphIri}> via Fuseki GSP — HTTP ${res.status}`;
 }
@@ -244,7 +273,7 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.7.1',
+    version: '1.8.0',
   });
 
   // ── Endpoint management ─────────────────────────────────────────────────────
@@ -319,6 +348,7 @@ function createMcpServer() {
   srv.tool(
     'push_turtle',
     'Push Turtle content into a named graph in Fuseki (direct GSP PUT). ' +
+    'Writes to the dataset currently active via switch_dataset. ' +
     'Optionally validates against a SHACL shapes graph before pushing.',
     {
       turtle:       z.string().describe('Valid Turtle 1.1/1.2 payload'),
@@ -414,6 +444,7 @@ function createMcpServer() {
   srv.tool(
     'switch_dataset',
     'Switch the active Fuseki dataset on HolonBridge (POST /dataset). ' +
+    'Also updates the GSP target used by push_turtle. ' +
     'Session-scoped; does not persist across HolonBridge restarts.',
     { dataset: z.string().describe('Fuseki dataset name (e.g. "chloe", "ds", "storme")') },
     async ({ dataset }) => {
@@ -427,6 +458,8 @@ function createMcpServer() {
         throw new Error(`HolonBridge /dataset: HTTP ${res.status} — ${msg.slice(0, 200)}`);
       }
       const result = await res.json();
+      // Sync the GSP target so push_turtle writes to the right dataset
+      activeFusekiDataset = dataset;
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -599,9 +632,11 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.7.1',
+    version: '1.8.0',
     holonbridge: HOLONBRIDGE_URL,
-    fusekiGsp: FUSEKI_GSP,
+    jenaBase,
+    fusekiGspDataset: activeFusekiDataset,
+    fusekiGspEndpoint: `${jenaBase}/${activeFusekiDataset}/data`,
     profiles: Object.keys(profiles),
     activeProfile,
     activeSessions: sessions.size,
@@ -609,10 +644,11 @@ app.get('/health', (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.7.1 listening on :${MCP_PORT}`);
-  console.log(`  HolonBridge target : ${HOLONBRIDGE_URL}`);
-  console.log(`  Fuseki GSP         : ${FUSEKI_GSP}`);
-  console.log(`  Profiles           : ${Object.keys(profiles).join(', ')}`);
-  console.log(`  SSE endpoint       : http://localhost:${MCP_PORT}/sse`);
-  console.log(`  Health             : http://localhost:${MCP_PORT}/health`);
+  console.log(`holonbridge-mcp-remote v1.8.0 listening on :${MCP_PORT}`);
+  console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
+  console.log(`  Jena base           : ${jenaBase}`);
+  console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
+  console.log(`  Profiles            : ${Object.keys(profiles).join(', ')}`);
+  console.log(`  SSE endpoint        : http://localhost:${MCP_PORT}/sse`);
+  console.log(`  Health              : http://localhost:${MCP_PORT}/health`);
 });
