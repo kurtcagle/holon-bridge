@@ -23,17 +23,17 @@ claude.ai (web)       curl / DataBook CLI / scripts
      │                          │
      ▼                          ▼
 holonbridge-mcp-remote    ──────── HolonBridge REST API
-:3032  (ngrok: kurtcagle-mcp.ngrok.io)     :3031  (ngrok: kurtcagle.ngrok.io)
-                                                   │
-                                            Apache Jena Fuseki
-                                                  :3030  (internal only)
+:3032  (public: yourServer-mcp.example.com)   :3031  (public: yourServer.example.com)
+                                                      │
+                                               Apache Jena Fuseki
+                                                     :3030  (internal only)
 ```
 
 | Service | Local port | Public URL | Notes |
 |---|---|---|---|
 | Jena 6.0 Fuseki | 3030 | — | Never expose publicly |
-| HolonBridge REST | 3031 | `kurtcagle.ngrok.io` | curl, DataBook CLI, artifacts |
-| MCP remote SSE | 3032 | `kurtcagle-mcp.ngrok.io` | claude.ai integration |
+| HolonBridge REST | 3031 | `yourServer.example.com` | curl, DataBook CLI, artifacts |
+| MCP remote SSE | 3032 | `yourServer-mcp.example.com` | claude.ai integration |
 
 ---
 
@@ -41,9 +41,44 @@ holonbridge-mcp-remote    ──────── HolonBridge REST API
 
 - **Node.js ≥ 18.0.0**
 - **Apache Jena Fuseki 6.x** — download from https://jena.apache.org/download/
-- **ngrok** account (free tier works) — https://ngrok.com
 - **Anthropic API key** — required for `nl_query` NL→SPARQL translation
 - (Optional) **GitHub PAT** — for `github-push` / `github-delete` endpoints
+
+---
+
+## Public access: ngrok vs direct hosting
+
+Both HolonBridge REST (:3031) and the MCP remote (:3032) need to be reachable
+over public HTTPS. How you do this depends on your setup:
+
+**If you are running locally (laptop / dev machine):**
+Use [ngrok](https://ngrok.com) (free tier works) to create temporary or
+persistent HTTPS tunnels to your local ports. This is the quickest way to get
+started without any server infrastructure.
+
+```bash
+ngrok http --url=yourServer.ngrok.io 3031       # HolonBridge REST
+ngrok http --url=yourServer-mcp.ngrok.io 3032   # MCP remote
+```
+
+**If you are hosting on a public server (VPS, cloud VM, etc.):**
+ngrok is not required. Configure your web server (nginx, Caddy, etc.) to
+reverse-proxy ports 3031 and 3032 under your own domain and let it handle TLS.
+
+```nginx
+# Example nginx blocks
+server {
+    server_name yourServer.example.com;
+    location / { proxy_pass http://localhost:3031; }
+}
+server {
+    server_name yourServer-mcp.example.com;
+    location / { proxy_pass http://localhost:3032; }
+}
+```
+
+In either case, set `HOLONBRIDGE_URL` and `MCP_PUBLIC_URL` in
+`mcp-remote/.env` to whichever public URLs you end up with.
 
 ---
 
@@ -139,10 +174,10 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 # Optional: GitHub integration (for /github-push and /github-delete endpoints)
 # Generate at: https://github.com/settings/tokens
-# Required scopes: repo (read + write contents)
+# Required scopes: Contents (read + write)
 GITHUB_PAT=ghp_...
-GITHUB_OWNER=kurtcagle
-GITHUB_REPO=chloe
+GITHUB_OWNER=<your-github-username>
+GITHUB_REPO=<your-repo-name>
 
 # Server port (default: 3031)
 PORT=3031
@@ -163,9 +198,10 @@ cp .env.mcp-remote.example mcp-remote/.env
 Edit `mcp-remote/.env`:
 
 ```env
-# Public ngrok URL of HolonBridge REST (not localhost — the MCP remote is a
-# separate process that cannot reach HolonBridge via localhost in all setups)
-HOLONBRIDGE_URL=https://kurtcagle.ngrok.io
+# Public HTTPS URL of HolonBridge REST
+# If using ngrok: https://yourServer.ngrok.io
+# If hosted directly: https://yourServer.example.com
+HOLONBRIDGE_URL=https://yourServer.example.com
 
 # Paste Token 1 here (same value as BEARER_TOKEN in root .env)
 HB_BEARER_TOKEN=<your-holonbridge-bearer-token>
@@ -177,15 +213,17 @@ MCP_REMOTE_TOKEN=<your-mcp-remote-token>
 MCP_PORT=3032
 
 # Your public MCP remote URL (used in OAuth metadata responses)
-MCP_PUBLIC_URL=https://kurtcagle-mcp.ngrok.io
+# If using ngrok: https://yourServer-mcp.ngrok.io
+# If hosted directly: https://yourServer-mcp.example.com
+MCP_PUBLIC_URL=https://yourServer-mcp.example.com
 
 # Optional: legacy GSP tracking (no longer used by push_turtle, kept for /health)
 FUSEKI_GSP=http://localhost:3030/ds/data
 
 # Optional named profiles for federation
 # Pattern: PROFILE_<NAME>_URL and PROFILE_<NAME>_LABEL
-# PROFILE_GGSC_URL=https://ggsc.holongraph.com
-# PROFILE_GGSC_LABEL=UN GGSC production bridge
+# PROFILE_GGSC_URL=https://ggsc.example.com
+# PROFILE_GGSC_LABEL=GGSC production bridge
 # PROFILE_LOCAL_URL=http://localhost:3031
 # PROFILE_LOCAL_LABEL=local dev
 ```
@@ -236,30 +274,36 @@ node holonbridge-mcp-remote.js
 Expected output:
 ```
 holonbridge-mcp-remote v1.9.0 listening on :3032
-  HolonBridge target  : https://kurtcagle.ngrok.io
+  HolonBridge target  : https://yourServer.example.com
   Profiles            : default
   SSE endpoint        : http://localhost:3032/sse
   Health              : http://localhost:3032/health
 ```
 
-### Step 4 — Open two ngrok tunnels
+### Step 4 — Expose publicly
 
+**Option A — ngrok (local dev):**
 ```bash
 # Terminal A — HolonBridge REST
-ngrok http --url=kurtcagle.ngrok.io 3031
+ngrok http --url=yourServer.ngrok.io 3031
 
 # Terminal B — MCP remote
-ngrok http --url=kurtcagle-mcp.ngrok.io 3032
+ngrok http --url=yourServer-mcp.ngrok.io 3032
 ```
 
-Both subdomains are reserved and persist across restarts (ngrok free tier).
+Reserved ngrok subdomains persist across restarts. Free tier works fine for
+development; upgrade to ngrok paid for tunnels that don't idle out.
 
-Verify:
+**Option B — direct hosting (VPS / cloud):**
+Point your reverse proxy at ports 3031 and 3032 and skip ngrok entirely.
+See the [Public access](#public-access-ngrok-vs-direct-hosting) section above.
+
+Verify either way:
 ```bash
-curl https://kurtcagle.ngrok.io/health \
+curl https://yourServer.example.com/health \
   -H "Authorization: Bearer <BEARER_TOKEN>"
 
-curl https://kurtcagle-mcp.ngrok.io/health \
+curl https://yourServer-mcp.example.com/health \
   -H "Authorization: Bearer <MCP_REMOTE_TOKEN>"
 ```
 
@@ -268,14 +312,14 @@ curl https://kurtcagle-mcp.ngrok.io/health \
 ## Connect to claude.ai
 
 1. Open **claude.ai → Settings → Integrations → Add custom integration**
-2. **URL:** `https://kurtcagle-mcp.ngrok.io/sse`
+2. **URL:** `https://yourServer-mcp.example.com/sse`
 3. **Authorization header:** `Authorization: Bearer <MCP_REMOTE_TOKEN>`
 4. Save — Claude discovers the 12 MCP tools automatically.
 
 At the start of each session, call `switch_dataset` to set the active Fuseki
 dataset:
 ```
-switch_dataset("chloe")   # or "storme", "ggsc", etc.
+switch_dataset("ds")   # or whatever dataset name you configured
 ```
 
 ---
@@ -387,15 +431,15 @@ To connect to a second HolonBridge instance (e.g. a collaborator's server),
 add profile entries to `mcp-remote/.env`:
 
 ```env
-PROFILE_GGSC_URL=https://ggsc-bridge.ngrok.io
-PROFILE_GGSC_LABEL=GGSC production bridge
+PROFILE_PARTNER_URL=https://partner-bridge.example.com
+PROFILE_PARTNER_LABEL=Partner production bridge
 ```
 
 Then from claude.ai:
 ```
-set_endpoint("ggsc")     # switch to GGSC bridge
-sparql_select(...)       # queries run against GGSC's Fuseki
-set_endpoint("default")  # switch back
+set_endpoint("partner")  # switch to partner bridge
+sparql_select(...)       # queries run against partner's Fuseki
+set_endpoint("default") # switch back
 ```
 
 Each profile points at a different HolonBridge REST instance. The MCP remote
@@ -413,8 +457,8 @@ claude.ai's auth header. Check for trailing spaces.
 `HB_BEARER_TOKEN` in `mcp-remote/.env` doesn't match `BEARER_TOKEN` in root `.env`.
 
 **ECONNREFUSED from MCP remote**
-`HOLONBRIDGE_URL` is set to `localhost` — the MCP remote is a separate process
-and needs the public ngrok URL, not a local address.
+`HOLONBRIDGE_URL` is pointing at `localhost` — the MCP remote is a separate
+process and needs the public URL of HolonBridge, not a local address.
 
 **push_turtle overwrites graph data**
 Expected if you called it without `mode="append"` on a pre-v1.9.0 server.
@@ -427,7 +471,7 @@ Ensure data has `rdfs:label` annotations. Use full context in the question:
 
 **ngrok session expired (`POST /message` returns 404)**
 The free ngrok tier idles after 30s of inactivity. Reconnect from claude.ai,
-or upgrade to ngrok paid for persistent tunnels.
+or upgrade to ngrok paid for persistent tunnels — or switch to direct hosting.
 
 **`PREFIX` syntax error in push_turtle**
 Turtle payloads must use `@prefix` declarations, not SPARQL `PREFIX` keyword.
