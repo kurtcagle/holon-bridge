@@ -6,432 +6,315 @@
 #
 # Options:
 #   -d, --dataset DATASET    Default dataset (default: ds)
-#   -j, --jena-dir DIR       Jena installation directory (default: /opt/homebrew/opt/jena)
-#   -D, --jena-data DIR      Fuseki databases directory (default: $HOME/.holonbridge/databases)
-#   -b, --bridge-dir DIR     HolonBridge project directory (default: $HOME/.holonbridge/holon-bridge)
-#   -n, --ngrok-url URL      Reserved ngrok subdomain (default: kurtcagle.ngrok.io)
+#   -j, --jena-dir DIR       Jena installation directory
+#                            (default: /opt/homebrew/opt/jena)
+#   -D, --jena-data DIR      Fuseki databases directory
+#                            (default: $HOME/.holonbridge/databases)
+#   -b, --bridge-dir DIR     holon-bridge repo root
+#                            (default: $HOME/.holonbridge/holon-bridge)
+#   -n, --ngrok-url URL      ngrok subdomain for HolonBridge REST :3031
+#   -m, --mcp-ngrok-url URL  ngrok subdomain for MCP remote :3032
 #   -l, --log-dir DIR        Log directory (default: $HOME/.holonbridge/logs)
-#   --system                 Install as system daemons in /Library/LaunchDaemons (requires sudo)
-#   --uninstall              Stop and remove the launchd agents/daemons
+#   --skip-ngrok             Omit ngrok plists (reverse-proxy or direct hosting)
+#   --system                 Install as system LaunchDaemons (requires sudo)
+#   --uninstall              Stop and remove all plists
 #   -h, --help               Show this help
 #
-# By default installs as user LaunchAgents (~/Library/LaunchAgents), which run
-# when the user is logged in.  Use --system for boot-time daemons (requires sudo).
+# Creates five launchd plists (or three with --skip-ngrok):
 #
-# Creates three launchd plists, in dependency order:
+#   io.holonbridge.fuseki        Jena Fuseki triplestore (:3030)
+#   io.holonbridge.ngrok         ngrok tunnel → HolonBridge REST (:3031)
+#   io.holonbridge.bridge        HolonBridge REST API (:3031)
+#   io.holonbridge.ngrok-mcp     ngrok tunnel → MCP remote (:3032)
+#   io.holonbridge.mcp-remote    MCP remote SSE server (:3032)
 #
-#   io.holonbridge.fuseki.plist         -- Jena Fuseki triplestore
-#   io.holonbridge.ngrok.plist          -- ngrok tunnel
-#   io.holonbridge.bridge.plist         -- HolonBridge Node.js server
-#
-# After install:
-#   launchctl start io.holonbridge.bridge   (starts bridge; Fuseki + ngrok already running)
-#   launchctl stop  io.holonbridge.bridge
-#   tail -f $HOME/.holonbridge/logs/holonbridge.log
-#   tail -f $HOME/.holonbridge/logs/fuseki.log
-#   tail -f $HOME/.holonbridge/logs/ngrok.log
+# Start the full stack:
+#   launchctl start io.holonbridge.fuseki
+#   launchctl start io.holonbridge.ngrok       # (if not --skip-ngrok)
+#   launchctl start io.holonbridge.bridge
+#   launchctl start io.holonbridge.ngrok-mcp   # (if not --skip-ngrok)
+#   launchctl start io.holonbridge.mcp-remote
 #
 # To uninstall:
 #   ./install-holonbridge-launchd.sh --uninstall
 
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
+[[ "$(uname)" != "Darwin" ]] && { echo "macOS only. For Linux use install-holonbridge-service.sh" >&2; exit 1; }
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
 
 DATASET="ds"
 JENA_DIR="/opt/homebrew/opt/jena"
 JENA_DATA="$HOME/.holonbridge/databases"
 BRIDGE_DIR="$HOME/.holonbridge/holon-bridge"
-NGROK_URL="kurtcagle.ngrok.io"
+NGROK_URL="yourServer.ngrok.io"
+MCP_NGROK_URL="yourServer-mcp.ngrok.io"
 LOG_DIR="$HOME/.holonbridge/logs"
+SKIP_NGROK=false
 SYSTEM_MODE=false
 UNINSTALL=false
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+# ── Argument parsing ──────────────────────────────────────────────────────────
 
-usage() {
-    grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -35
-    exit 0
-}
+usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -40; exit 0; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -d|--dataset)    DATASET="$2";    shift 2 ;;
-        -j|--jena-dir)   JENA_DIR="$2";   shift 2 ;;
-        -D|--jena-data)  JENA_DATA="$2";  shift 2 ;;
-        -b|--bridge-dir) BRIDGE_DIR="$2"; shift 2 ;;
-        -n|--ngrok-url)  NGROK_URL="$2";  shift 2 ;;
-        -l|--log-dir)    LOG_DIR="$2";    shift 2 ;;
-        --system)        SYSTEM_MODE=true; shift ;;
-        --uninstall)     UNINSTALL=true;   shift ;;
-        -h|--help)       usage ;;
+        -d|--dataset)       DATASET="$2";       shift 2 ;;
+        -j|--jena-dir)      JENA_DIR="$2";      shift 2 ;;
+        -D|--jena-data)     JENA_DATA="$2";     shift 2 ;;
+        -b|--bridge-dir)    BRIDGE_DIR="$2";    shift 2 ;;
+        -n|--ngrok-url)     NGROK_URL="$2";     shift 2 ;;
+        -m|--mcp-ngrok-url) MCP_NGROK_URL="$2"; shift 2 ;;
+        -l|--log-dir)       LOG_DIR="$2";       shift 2 ;;
+        --skip-ngrok)       SKIP_NGROK=true;    shift ;;
+        --system)           SYSTEM_MODE=true;   shift ;;
+        --uninstall)        UNINSTALL=true;     shift ;;
+        -h|--help)          usage ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
 
-# ---------------------------------------------------------------------------
-# Platform check
-# ---------------------------------------------------------------------------
-
-if [[ "$(uname)" != "Darwin" ]]; then
-    echo "This script is for macOS only. For Linux, use install-holonbridge-service.sh" >&2
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Install paths
-# ---------------------------------------------------------------------------
+MCP_DIR="$BRIDGE_DIR/mcp-remote"
 
 if [[ "$SYSTEM_MODE" == true ]]; then
-    if [[ $EUID -ne 0 ]]; then
-        echo "Error: --system mode requires sudo." >&2
-        exit 1
-    fi
+    [[ $EUID -ne 0 ]] && { echo "--system requires sudo." >&2; exit 1; }
     PLIST_DIR="/Library/LaunchDaemons"
-    LAUNCHCTL_SCOPE="system"
+    SCOPE="system"
 else
     PLIST_DIR="$HOME/Library/LaunchAgents"
-    LAUNCHCTL_SCOPE="gui/$(id -u)"
+    SCOPE="gui/$(id -u)"
 fi
 
-PLIST_FUSEKI="$PLIST_DIR/io.holonbridge.fuseki.plist"
-PLIST_NGROK="$PLIST_DIR/io.holonbridge.ngrok.plist"
-PLIST_BRIDGE="$PLIST_DIR/io.holonbridge.bridge.plist"
-
-# ---------------------------------------------------------------------------
-# Colours
-# ---------------------------------------------------------------------------
-
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-RED='\033[0;31m'
-NC='\033[0m'
-
+GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 log_step() { echo -e "${CYAN}[$(date '+%H:%M:%S')] $*${NC}"; }
 log_ok()   { echo -e "${GREEN}[$(date '+%H:%M:%S')] OK  $*${NC}"; }
-log_err()  { echo -e "${RED}[$(date '+%H:%M:%S')] ERR $*${NC}" >&2; }
 
-# ---------------------------------------------------------------------------
-# Uninstall path
-# ---------------------------------------------------------------------------
+# ── Uninstall ─────────────────────────────────────────────────────────────────
 
 if [[ "$UNINSTALL" == true ]]; then
     log_step "Uninstalling HolonBridge launchd services..."
-    for label in io.holonbridge.bridge io.holonbridge.ngrok io.holonbridge.fuseki; do
-        if launchctl print "$LAUNCHCTL_SCOPE/$label" &>/dev/null 2>&1; then
-            launchctl bootout "$LAUNCHCTL_SCOPE/$label" 2>/dev/null || true
-            log_ok "Unloaded $label"
-        else
-            echo "  $label not loaded -- skipping"
-        fi
+    for label in io.holonbridge.mcp-remote io.holonbridge.ngrok-mcp \
+                 io.holonbridge.bridge io.holonbridge.ngrok io.holonbridge.fuseki; do
+        launchctl bootout "$SCOPE/$label" 2>/dev/null || true
+        rm -f "$PLIST_DIR/$label.plist"
+        log_ok "Removed: $label"
     done
-    rm -f "$PLIST_FUSEKI" "$PLIST_NGROK" "$PLIST_BRIDGE"
-    log_ok "Plist files removed."
-    echo ""
-    echo "  Databases and logs retained at:"
-    echo "    $JENA_DATA"
-    echo "    $LOG_DIR"
-    echo ""
     exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Validate dependencies
-# ---------------------------------------------------------------------------
+# ── Validate dependencies ─────────────────────────────────────────────────────
 
 FUSEKI_BIN="$JENA_DIR/libexec/bin/fuseki-server"
-# Homebrew may put it in libexec or bin depending on version
-if [[ ! -x "$FUSEKI_BIN" ]]; then
-    FUSEKI_BIN="$JENA_DIR/bin/fuseki-server"
-fi
-if [[ ! -x "$FUSEKI_BIN" ]]; then
-    # Try searching PATH
-    FUSEKI_BIN=$(command -v fuseki-server 2>/dev/null || true)
-fi
-if [[ -z "$FUSEKI_BIN" || ! -x "$FUSEKI_BIN" ]]; then
-    log_err "fuseki-server not found. Install via Homebrew: brew install jena"
-    log_err "Or set --jena-dir to your Jena installation."
-    exit 1
-fi
+[[ ! -x "$FUSEKI_BIN" ]] && FUSEKI_BIN="$JENA_DIR/bin/fuseki-server"
+[[ ! -x "$FUSEKI_BIN" ]] && FUSEKI_BIN=$(command -v fuseki-server 2>/dev/null || true)
+[[ -z "$FUSEKI_BIN" || ! -x "$FUSEKI_BIN" ]] && {
+    echo "fuseki-server not found. Install: brew install jena" >&2; exit 1
+}
 
 NODE_BIN=$(command -v node 2>/dev/null || true)
-if [[ -z "$NODE_BIN" ]]; then
-    log_err "node not found. Install via: brew install node"
-    exit 1
+[[ -z "$NODE_BIN" ]] && { echo "node not found. Install: brew install node" >&2; exit 1; }
+
+if [[ "$SKIP_NGROK" == false ]]; then
+    NGROK_BIN=$(command -v ngrok 2>/dev/null || true)
+    [[ -z "$NGROK_BIN" ]] && { echo "ngrok not found. Install: brew install ngrok or use --skip-ngrok" >&2; exit 1; }
 fi
 
-NGROK_BIN=$(command -v ngrok 2>/dev/null || true)
-if [[ -z "$NGROK_BIN" ]]; then
-    log_err "ngrok not found. Install via: brew install ngrok"
-    exit 1
-fi
+[[ ! -d "$BRIDGE_DIR" ]]         && { echo "bridge-dir not found: $BRIDGE_DIR" >&2; exit 1; }
+[[ ! -f "$BRIDGE_DIR/server.js" ]] && { echo "server.js not found in $BRIDGE_DIR" >&2; exit 1; }
+[[ ! -d "$MCP_DIR" ]]            && { echo "mcp-remote dir not found: $MCP_DIR" >&2; exit 1; }
 
-if [[ ! -d "$BRIDGE_DIR" ]]; then
-    log_err "HolonBridge directory not found: $BRIDGE_DIR"
-    log_err "Clone the repo: git clone https://github.com/kurtcagle/holon-bridge $BRIDGE_DIR"
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Create directories
-# ---------------------------------------------------------------------------
+# ── Directories and env file ──────────────────────────────────────────────────
 
 mkdir -p "$LOG_DIR" "$JENA_DATA" "$PLIST_DIR"
-
-# ---------------------------------------------------------------------------
-# Environment file
-# ---------------------------------------------------------------------------
 
 ENV_FILE="$HOME/.holonbridge/holonbridge.env"
 mkdir -p "$(dirname "$ENV_FILE")"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     cat > "$ENV_FILE" << EOF
-# HolonBridge environment configuration
-# Edit these values, then reload the services.
+# HolonBridge environment -- edit before starting services
 
 JENA_DIR=$JENA_DIR
 JENA_DATA=$JENA_DATA
 BRIDGE_DIR=$BRIDGE_DIR
-NGROK_URL=$NGROK_URL
+MCP_DIR=$MCP_DIR
 DATASET=$DATASET
 
-# Anthropic API key (required for NL query)
-ANTHROPIC_API_KEY=your-key-here
-
-# HolonBridge server settings
-JENA_BASE=http://localhost:3030
-JENA_DATASET=$DATASET
+ANTHROPIC_API_KEY=your-anthropic-api-key
+FUSEKI_URL=http://localhost:3030
+FUSEKI_DATASET=$DATASET
 PORT=3031
-MAX_RETRIES=2
-CLAUDE_MODEL=claude-sonnet-4-6
 SHACL_REQUIRED=false
-LOG_SPARQL=false
-LOG_PROMPTS=false
+
+BEARER_TOKEN=your-holonbridge-bearer-token
+
+HOLONBRIDGE_URL=https://$NGROK_URL
+HB_BEARER_TOKEN=your-holonbridge-bearer-token
+MCP_REMOTE_TOKEN=your-mcp-remote-token
+MCP_PORT=3032
+MCP_PUBLIC_URL=https://$MCP_NGROK_URL
+FUSEKI_GSP=http://localhost:3030/ds/data
 EOF
     chmod 600 "$ENV_FILE"
     log_ok "Environment file written: $ENV_FILE"
-    echo "  --> Edit ANTHROPIC_API_KEY before starting."
+    echo "  --> Edit $ENV_FILE and set your tokens before starting."
 fi
 
-# ---------------------------------------------------------------------------
-# Helper: build EnvironmentVariables XML block from env file
-# ---------------------------------------------------------------------------
+# ── Helper: write a launchd plist ────────────────────────────────────────────
 
-env_xml() {
-    echo "    <key>EnvironmentVariables</key>"
-    echo "    <dict>"
-    # Always include PATH so node/fuseki can find each other
-    echo "        <key>PATH</key>"
-    echo "        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
+write_plist() {
+    local label="$1"; local plist_file="$PLIST_DIR/$label.plist"
+    local program_args="$2"
+    local working_dir="$3"
+    local log_base="$LOG_DIR/$label"
+
+    local env_block
+    env_block="    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
     while IFS='=' read -r key val; do
         [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-        # Strip inline comments
-        val="${val%%#*}"
-        val="${val%"${val##*[![:space:]]}"}"   # trim trailing whitespace
-        echo "        <key>$key</key>"
-        echo "        <string>$val</string>"
+        val="${val%%#*}"; val="${val%"${val##*[![:space:]]}"}")
+        env_block+="
+        <key>$key</key>
+        <string>$val</string>"
     done < "$ENV_FILE"
-    echo "    </dict>"
+    env_block+="
+    </dict>"
+
+    cat > "$plist_file" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+$program_args
+    </array>
+$env_block
+    <key>WorkingDirectory</key>
+    <string>$working_dir</string>
+    <key>StandardOutPath</key>
+    <string>${log_base}.log</string>
+    <key>StandardErrorPath</key>
+    <string>${log_base}-error.log</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>
+EOF
+    log_ok "Written: $plist_file"
 }
 
-# ---------------------------------------------------------------------------
-# 1. io.holonbridge.fuseki.plist
-# ---------------------------------------------------------------------------
+# ── 1. io.holonbridge.fuseki ──────────────────────────────────────────────────
 
-log_step "Writing Jena Fuseki plist..."
-
-cat > "$PLIST_FUSEKI" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.holonbridge.fuseki</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>$FUSEKI_BIN</string>
+log_step "Writing Fuseki plist..."
+write_plist "io.holonbridge.fuseki" \
+    "        <string>$FUSEKI_BIN</string>
         <string>--update</string>
         <string>--loc</string>
-        <string>$JENA_DATA</string>
-    </array>
+        <string>$JENA_DATA</string>" \
+    "$JENA_DATA"
 
-$(env_xml)
+# ── 2. io.holonbridge.ngrok (optional) ───────────────────────────────────────
 
-    <key>WorkingDirectory</key>
-    <string>$JENA_DATA</string>
-
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/fuseki.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/fuseki-error.log</string>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>RunAtLoad</key>
-    <false/>
-
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
-</dict>
-</plist>
-EOF
-
-log_ok "Written: $PLIST_FUSEKI"
-
-# ---------------------------------------------------------------------------
-# 2. io.holonbridge.ngrok.plist
-# ---------------------------------------------------------------------------
-
-log_step "Writing ngrok plist..."
-
-cat > "$PLIST_NGROK" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.holonbridge.ngrok</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>$NGROK_BIN</string>
+if [[ "$SKIP_NGROK" == false ]]; then
+    log_step "Writing ngrok (bridge) plist..."
+    write_plist "io.holonbridge.ngrok" \
+        "        <string>$NGROK_BIN</string>
         <string>http</string>
         <string>--url=$NGROK_URL</string>
-        <string>3031</string>
-    </array>
+        <string>3031</string>" \
+        "$HOME"
+fi
 
-$(env_xml)
+# ── 3. io.holonbridge.bridge ──────────────────────────────────────────────────
 
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/ngrok.log</string>
+log_step "Writing HolonBridge REST plist..."
+write_plist "io.holonbridge.bridge" \
+    "        <string>$NODE_BIN</string>
+        <string>server.js</string>" \
+    "$BRIDGE_DIR"
 
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/ngrok-error.log</string>
+# ── 4. io.holonbridge.ngrok-mcp (optional) ───────────────────────────────────
 
-    <key>KeepAlive</key>
-    <true/>
+if [[ "$SKIP_NGROK" == false ]]; then
+    log_step "Writing ngrok (MCP) plist..."
+    write_plist "io.holonbridge.ngrok-mcp" \
+        "        <string>$NGROK_BIN</string>
+        <string>http</string>
+        <string>--url=$MCP_NGROK_URL</string>
+        <string>3032</string>" \
+        "$HOME"
+fi
 
-    <key>RunAtLoad</key>
-    <false/>
+# ── 5. io.holonbridge.mcp-remote ─────────────────────────────────────────────
 
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
-</dict>
-</plist>
-EOF
+log_step "Writing MCP remote plist..."
+write_plist "io.holonbridge.mcp-remote" \
+    "        <string>$NODE_BIN</string>
+        <string>holonbridge-mcp-remote.js</string>" \
+    "$MCP_DIR"
 
-log_ok "Written: $PLIST_NGROK"
-
-# ---------------------------------------------------------------------------
-# 3. io.holonbridge.bridge.plist
-# ---------------------------------------------------------------------------
-
-log_step "Writing HolonBridge plist..."
-
-cat > "$PLIST_BRIDGE" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>io.holonbridge.bridge</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>$NODE_BIN</string>
-        <string>server.js</string>
-        <string>-d</string>
-        <string>$DATASET</string>
-    </array>
-
-$(env_xml)
-
-    <key>WorkingDirectory</key>
-    <string>$BRIDGE_DIR</string>
-
-    <key>StandardOutPath</key>
-    <string>$LOG_DIR/holonbridge.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>$LOG_DIR/holonbridge-error.log</string>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>RunAtLoad</key>
-    <false/>
-
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
-
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>65536</integer>
-    </dict>
-</dict>
-</plist>
-EOF
-
-log_ok "Written: $PLIST_BRIDGE"
-
-# ---------------------------------------------------------------------------
-# Load into launchd
-# ---------------------------------------------------------------------------
+# ── Load plists ───────────────────────────────────────────────────────────────
 
 log_step "Loading plists into launchd..."
-
-for plist in "$PLIST_FUSEKI" "$PLIST_NGROK" "$PLIST_BRIDGE"; do
+for plist in "$PLIST_DIR/io.holonbridge.fuseki.plist" \
+             "$PLIST_DIR/io.holonbridge.bridge.plist" \
+             "$PLIST_DIR/io.holonbridge.mcp-remote.plist"; do
     label=$(basename "$plist" .plist)
-    # Unload first if already registered (idempotent reinstall)
-    launchctl bootout "$LAUNCHCTL_SCOPE/$label" 2>/dev/null || true
-    launchctl bootstrap "$LAUNCHCTL_SCOPE" "$plist"
+    launchctl bootout "$SCOPE/$label" 2>/dev/null || true
+    launchctl bootstrap "$SCOPE" "$plist"
     log_ok "Loaded: $label"
 done
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
+if [[ "$SKIP_NGROK" == false ]]; then
+    for plist in "$PLIST_DIR/io.holonbridge.ngrok.plist" \
+                 "$PLIST_DIR/io.holonbridge.ngrok-mcp.plist"; do
+        label=$(basename "$plist" .plist)
+        launchctl bootout "$SCOPE/$label" 2>/dev/null || true
+        launchctl bootstrap "$SCOPE" "$plist"
+        log_ok "Loaded: $label"
+    done
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
-log_ok "HolonBridge launchd agents installed."
+log_ok "HolonBridge launchd services installed."
 echo ""
-echo "  Start all three services (in order):"
+echo "  Start all services (in order):"
 echo "    launchctl start io.holonbridge.fuseki"
-echo "    launchctl start io.holonbridge.ngrok"
+[[ "$SKIP_NGROK" == false ]] && echo "    launchctl start io.holonbridge.ngrok"
 echo "    launchctl start io.holonbridge.bridge"
+[[ "$SKIP_NGROK" == false ]] && echo "    launchctl start io.holonbridge.ngrok-mcp"
+echo "    launchctl start io.holonbridge.mcp-remote"
 echo ""
-echo "  Or use the start script:"
-echo "    ./start-holonbridge.sh -b $BRIDGE_DIR"
-echo ""
-echo "  Stop:"
+echo "  Stop all:"
+echo "    launchctl stop io.holonbridge.mcp-remote"
+[[ "$SKIP_NGROK" == false ]] && echo "    launchctl stop io.holonbridge.ngrok-mcp"
 echo "    launchctl stop io.holonbridge.bridge"
-echo "    launchctl stop io.holonbridge.ngrok"
+[[ "$SKIP_NGROK" == false ]] && echo "    launchctl stop io.holonbridge.ngrok"
 echo "    launchctl stop io.holonbridge.fuseki"
 echo ""
-echo "  Status:"
-echo "    launchctl print gui/\$(id -u)/io.holonbridge.bridge"
-echo ""
 echo "  Logs:"
-echo "    tail -f $LOG_DIR/holonbridge.log"
-echo "    tail -f $LOG_DIR/fuseki.log"
-echo "    tail -f $LOG_DIR/ngrok.log"
+echo "    tail -f $LOG_DIR/io.holonbridge.bridge.log"
+echo "    tail -f $LOG_DIR/io.holonbridge.mcp-remote.log"
+echo "    tail -f $LOG_DIR/io.holonbridge.fuseki.log"
 echo ""
 echo "  Config: $ENV_FILE"
-if grep -q 'your-key-here' "$ENV_FILE" 2>/dev/null; then
-    echo "  WARNING: Set ANTHROPIC_API_KEY in $ENV_FILE before starting."
-fi
+grep -q 'your-' "$ENV_FILE" 2>/dev/null && \
+    echo "  WARNING: Edit $ENV_FILE -- placeholder values still present."
 echo ""
 echo "  To uninstall:"
 echo "    ./install-holonbridge-launchd.sh --uninstall"

@@ -1,49 +1,70 @@
 #Requires -Version 5.1
 # Start-HolonBridge-Headless.ps1
-# Headless service launcher -- all output goes to log files.
+# Headless launcher for the HolonBridge NSSM service.
+# Starts Jena Fuseki and HolonBridge REST; output goes to log files.
+# The MCP remote is managed by the separate HolonbridgeMcpRemote service.
 # Edit holonbridge.config.ps1 to change paths and settings.
+
 $cfg = Join-Path $PSScriptRoot 'holonbridge.config.ps1'
 if (Test-Path $cfg) { . $cfg } else {
-    Write-Error "Config file not found: $cfg"
-    exit 1
+    Write-Error "Config file not found: $cfg"; exit 1
 }
-$LogDir  = Join-Path $PSScriptRoot 'logs'
+
+$LogDir    = Join-Path $PSScriptRoot 'logs'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
-$fusekiLog   = Join-Path $LogDir 'fuseki.log'
-$ngrokLog    = Join-Path $LogDir 'ngrok.log'
-$bridgeLog   = Join-Path $LogDir 'holonbridge.log'
-"[$(Get-Date)] === HolonBridge startup ===" | Add-Content $bridgeLog
-"[$(Get-Date)] PSScriptRoot: $PSScriptRoot"  | Add-Content $bridgeLog
-"[$(Get-Date)] JenaDir:      $JenaDir"       | Add-Content $bridgeLog
-"[$(Get-Date)] JenaData:     $JenaData"      | Add-Content $bridgeLog
-"[$(Get-Date)] BridgeDir:    $BridgeDir"     | Add-Content $bridgeLog
-"[$(Get-Date)] Dataset:      $Dataset"       | Add-Content $bridgeLog
-"[$(Get-Date)] Script loaded OK -- defining functions..." | Add-Content $bridgeLog
-function Wait-Http ([string]$url, [int]$timeoutSec = 30) {
+
+$fusekiLog = Join-Path $LogDir 'fuseki.log'
+$bridgeLog = Join-Path $LogDir 'holonbridge.log'
+
+function Log ([string]$file, [string]$msg) {
+    "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $msg" | Add-Content $file
+}
+
+function Wait-Http ([string]$url, [int]$timeoutSec = 60) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
         try {
             $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 -EA Stop
             if ($r.StatusCode -lt 400) { return $true }
-        } catch {}
+        } catch { }
         Start-Sleep -Milliseconds 500
     }
     return $false
 }
-# 1. Jena Fuseki (assumed to be running as a separate service)
-"[$(Get-Date)] Checking Fuseki is reachable..." | Add-Content $fusekiLog
-if (-not (Wait-Http 'http://localhost:3030/$/ping' 30)) {
-    "[$(Get-Date)] ERROR: Fuseki not reachable on :3030 -- is the Fuseki service running?" | Add-Content $fusekiLog; exit 1
+
+Log $bridgeLog "=== HolonBridge service start ==="
+Log $bridgeLog "BridgeDir : $BridgeDir"
+Log $bridgeLog "Dataset   : $Dataset"
+
+# ── 1. Jena Fuseki ────────────────────────────────────────────────────────────
+
+$fusekiBin = Join-Path $JenaDir 'bin\fuseki-server.bat'
+if (-not (Test-Path $fusekiBin)) {
+    Log $bridgeLog "ERROR: fuseki-server.bat not found at $fusekiBin"; exit 1
 }
-"[$(Get-Date)] Fuseki is up." | Add-Content $fusekiLog
-$fuseki = $null   # no child process to kill on exit
-# 2. ngrok (running independently -- no check needed)
-"[$(Get-Date)] Assuming ngrok is running independently." | Add-Content $ngrokLog
-$ngrok = $null
-# 3. HolonBridge (foreground so NSSM can track/restart it)
-"[$(Get-Date)] Starting HolonBridge (dataset: $Dataset)..." | Add-Content $bridgeLog
+
+Log $fusekiLog "Starting Jena Fuseki..."
+$fuseki = Start-Process -FilePath $fusekiBin `
+    -ArgumentList "--update --loc `"$JenaData`"" `
+    -RedirectStandardOutput $fusekiLog `
+    -RedirectStandardError  $fusekiLog `
+    -NoNewWindow -PassThru
+
+if (-not (Wait-Http 'http://localhost:3030/$/ping' 60)) {
+    Log $fusekiLog "ERROR: Fuseki did not start within 60s."
+    Log $bridgeLog "ERROR: Fuseki did not start."; exit 1
+}
+Log $bridgeLog "Fuseki is up."
+
+# ── 2. HolonBridge REST (foreground — NSSM tracks this process) ───────────────
+
+Log $bridgeLog "Starting HolonBridge REST..."
 Set-Location $BridgeDir
-& node server.js -d $Dataset 2>&1 | Tee-Object -FilePath $bridgeLog -Append
-# If HolonBridge exits, kill children so NSSM restarts cleanly
-"[$(Get-Date)] HolonBridge exited -- stopping child processes." | Add-Content $bridgeLog
-@($fuseki, $ngrok) | Where-Object { $_ -and -not $_.HasExited } | ForEach-Object { $_.Kill() }
+& node server.js 2>&1 | ForEach-Object {
+    $_ | Add-Content $bridgeLog
+    $_
+}
+
+# If server.js exits, kill Fuseki so NSSM restarts the whole service cleanly
+Log $bridgeLog "HolonBridge REST exited — stopping Fuseki."
+if ($fuseki -and -not $fuseki.HasExited) { $fuseki.Kill() }
