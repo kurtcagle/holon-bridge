@@ -48,6 +48,25 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-01 v1.10.1 FIX: set_endpoint was cosmetic. Every hb* HTTP helper
+ *                      (hbQuery, hbUpdate, hbPushTurtle, hbGetHolon,
+ *                      hbValidate, hbNlQuery, hbListGraphs) plus the inline
+ *                      list_datasets/switch_dataset fetches called the
+ *                      module-level HOLONBRIDGE_URL constant directly,
+ *                      ignoring activeProfile entirely — so switching
+ *                      profiles never redirected any actual query, push, or
+ *                      dataset call; only get_endpoint/list_endpoints ever
+ *                      read activeProfile. Introduced activeBaseUrl(), the
+ *                      single source of truth for "which bridge do we talk
+ *                      to right now," and routed every HTTP call through it.
+ *                      /health now reports activeBridge alongside the
+ *                      configured default, so this class of bug is visible
+ *                      without having to compare dataset listings by hand.
+ *                      This bug predates and was not introduced by v1.10.0;
+ *                      it was exposed by v1.10.0 making profile-switching
+ *                      to a *meaningfully different* bridge possible for the
+ *                      first time (previously all named profiles pointed at
+ *                      variations of the same local setup).
  *   2026-07-01 v1.10.0 Registry-backed profile discovery. list_endpoints,
  *                      get_endpoint, and set_endpoint now merge static
  *                      .env PROFILE_<NAME>_URL entries with live results
@@ -119,8 +138,9 @@ const hbHeaders = (extra = {}) => ({
 });
 
 async function hbQuery(sparql, type = 'select') {
+  const base = activeBaseUrl();
   if (type === 'construct') {
-    const res = await fetch(`${HOLONBRIDGE_URL}/sparql-construct`, {
+    const res = await fetch(`${base}/sparql-construct`, {
       method: 'POST',
       headers: hbHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ query: sparql }),
@@ -131,7 +151,7 @@ async function hbQuery(sparql, type = 'select') {
     }
     return res.text();
   } else {
-    const res = await fetch(`${HOLONBRIDGE_URL}/sparql-select`, {
+    const res = await fetch(`${base}/sparql-select`, {
       method: 'POST',
       headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
       body: JSON.stringify({ sparql }),
@@ -145,7 +165,7 @@ async function hbQuery(sparql, type = 'select') {
 }
 
 async function hbUpdate(sparql) {
-  const res = await fetch(`${HOLONBRIDGE_URL}/sparql-update`, {
+  const res = await fetch(`${activeBaseUrl()}/sparql-update`, {
     method: 'POST',
     headers: hbHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ update: sparql }),
@@ -161,7 +181,7 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
   if (shapesGraph) {
     await hbValidate(turtle, shapesGraph);
   }
-  const res = await fetch(`${HOLONBRIDGE_URL}/update`, {
+  const res = await fetch(`${activeBaseUrl()}/update`, {
     method: 'POST',
     headers: hbHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ turtle, graph: graphIri, mode }),
@@ -175,7 +195,7 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
 }
 
 async function hbGetHolon(holonIri, projectionMode = 'immersive') {
-  const url = new URL(`${HOLONBRIDGE_URL}/holon/${encodeURIComponent(holonIri)}`);
+  const url = new URL(`${activeBaseUrl()}/holon/${encodeURIComponent(holonIri)}`);
   url.searchParams.set('projection', projectionMode);
   const res = await fetch(url.toString(), {
     headers: hbHeaders({ Accept: 'text/markdown' }),
@@ -185,7 +205,7 @@ async function hbGetHolon(holonIri, projectionMode = 'immersive') {
 }
 
 async function hbValidate(turtle, shapesGraph) {
-  const url = new URL(`${HOLONBRIDGE_URL}/validate`);
+  const url = new URL(`${activeBaseUrl()}/validate`);
   url.searchParams.set('shapes', shapesGraph);
   const res = await fetch(url.toString(), {
     method: 'POST',
@@ -199,7 +219,7 @@ async function hbValidate(turtle, shapesGraph) {
 async function hbNlQuery(question, graph) {
   const body = { nl: question };
   if (graph) body.graph = graph;
-  const res = await fetch(`${HOLONBRIDGE_URL}/query`, {
+  const res = await fetch(`${activeBaseUrl()}/query`, {
     method: 'POST',
     headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
     body: JSON.stringify(body),
@@ -212,7 +232,7 @@ async function hbNlQuery(question, graph) {
 }
 
 async function hbListGraphs(filter) {
-  const res = await fetch(`${HOLONBRIDGE_URL}/graphs`, {
+  const res = await fetch(`${activeBaseUrl()}/graphs`, {
     headers: hbHeaders({ Accept: 'application/json' }),
   });
   if (!res.ok) throw new Error(`HolonBridge /graphs: HTTP ${res.status}`);
@@ -307,6 +327,27 @@ async function getMergedProfiles({ force = false } = {}) {
   return { ...profiles, ...registryProfiles };
 }
 
+// ── Active base URL resolution ──────────────────────────────────────────────────
+//
+// PRIOR BUG (present through v1.10.0): every hb* HTTP helper below called the
+// module-level HOLONBRIDGE_URL constant directly, ignoring activeProfile
+// entirely. set_endpoint updated activeProfile, which only get_endpoint and
+// list_endpoints ever read — so switching profiles never actually redirected
+// any query, push, or dataset call. This function is the single source of
+// truth for "which bridge do we talk to right now," and every HTTP call
+// below must go through it rather than referencing HOLONBRIDGE_URL directly.
+//
+// Synchronous by design: it reads whatever is already in `profiles` (static)
+// and `registryCache.profiles` (last-fetched registry snapshot) without
+// triggering a network call on every single query. set_endpoint forces a
+// fresh registry pull *before* updating activeProfile, so by the time any
+// subsequent call runs, the cache reflects the profile that was just chosen.
+
+function activeBaseUrl() {
+  const merged = { ...profiles, ...registryCache.profiles };
+  return merged[activeProfile]?.url ?? HOLONBRIDGE_URL;
+}
+
 // ── MCP server factory ──────────────────────────────────────────────────────────────
 //
 // A fresh McpServer is created per /sse connection to avoid the SDK's
@@ -315,7 +356,7 @@ async function getMergedProfiles({ force = false } = {}) {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.10.0',
+    version: '1.10.1',
   });
 
   srv.tool(
@@ -488,7 +529,7 @@ function createMcpServer() {
     'List all Fuseki datasets available on this HolonBridge instance (GET /datasets).',
     {},
     async () => {
-      const res = await fetch(`${HOLONBRIDGE_URL}/datasets`, {
+      const res = await fetch(`${activeBaseUrl()}/datasets`, {
         headers: hbHeaders({ Accept: 'application/json' }),
       });
       if (!res.ok) {
@@ -503,10 +544,11 @@ function createMcpServer() {
   srv.tool(
     'switch_dataset',
     'Switch the active Fuseki dataset on HolonBridge (POST /dataset). ' +
-    'Session-scoped; does not persist across HolonBridge restarts.',
+    'Session-scoped; does not persist across HolonBridge restarts. ' +
+    'Operates against whichever bridge is currently active (see set_endpoint).',
     { dataset: z.string().describe('Fuseki dataset name (e.g. "chloe", "ds", "storme")') },
     async ({ dataset }) => {
-      const res = await fetch(`${HOLONBRIDGE_URL}/dataset`, {
+      const res = await fetch(`${activeBaseUrl()}/dataset`, {
         method: 'POST',
         headers: hbHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ dataset }),
@@ -676,8 +718,9 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.10.0',
+    version: '1.10.1',
     holonbridge: HOLONBRIDGE_URL,
+    activeBridge: activeBaseUrl(),
     jenaBase,
     fusekiGspDataset: activeFusekiDataset,
     fusekiGspEndpoint: `${jenaBase}/${activeFusekiDataset}/data`,
@@ -688,7 +731,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.10.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.10.1 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
