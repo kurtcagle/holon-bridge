@@ -37,8 +37,29 @@
  *   OAuth client_secret  — Claude sends this during /token exchange; must equal
  *                          MCP_REMOTE_TOKEN for the Bearer check on /sse to pass
  *
+ * NOTE on registry-backed profiles (see below): querying GET /registry uses
+ * this bridge's own HB_BEARER_TOKEN, which is sufficient to read federation
+ * metadata (which bridges exist, their URL, their health). It is NOT
+ * sufficient to authenticate SPARQL/push calls against a *different* bridge
+ * once switched via set_endpoint — that still depends on whatever auth the
+ * target bridge (e.g. Ben's GGSC instance) itself requires. The interbridge
+ * token model (shared vs. per-bridge credentials) is a separate open question
+ * from registry discovery and is not resolved by this change.
+ *
  * Changelog
  * ─────────
+ *   2026-07-01 v1.10.0 Registry-backed profile discovery. list_endpoints,
+ *                      get_endpoint, and set_endpoint now merge static
+ *                      .env PROFILE_<NAME>_URL entries with live results
+ *                      from GET /registry on HolonBridge (federated bridge
+ *                      registry, GitHub-backed, health-checked server-side).
+ *                      Any bridge registered in the federation — e.g. Ben's
+ *                      GGSC bridge — becomes switchable via set_endpoint
+ *                      without manual config edits or a restart. Registry
+ *                      results are cached 30s; set_endpoint forces a fresh
+ *                      pull so newly-registered bridges are available
+ *                      immediately. Falls back to static/cached profiles if
+ *                      the registry call fails (non-fatal).
  *   2026-06-28 v1.9.0  Route push_turtle through HolonBridge REST (/update)
  *                      instead of calling Fuseki GSP directly. Benefits:
  *                      - mode defaults to 'append' (POST/merge) not 'replace' (PUT)
@@ -201,10 +222,10 @@ async function hbListGraphs(filter) {
     .filter(g => !filter || g.iri.includes(filter));
 }
 
-// ── Profile state ───────────────────────────────────────────────────────────────
+// ── Static (.env) profile state ─────────────────────────────────────────────────
 
 const profiles = {
-  default: { url: HOLONBRIDGE_URL, label: 'default (from .env)' },
+  default: { url: HOLONBRIDGE_URL, label: 'default (from .env)', source: 'static' },
 };
 Object.keys(process.env)
   .filter(k => k.startsWith('PROFILE_') && k.endsWith('_URL'))
@@ -213,10 +234,78 @@ Object.keys(process.env)
     profiles[name] = {
       url: process.env[k],
       label: process.env[`PROFILE_${name.toUpperCase()}_LABEL`] || name,
+      source: 'static',
     };
   });
 
 let activeProfile = 'default';
+
+// ── Registry-backed profiles ────────────────────────────────────────────────────
+//
+// In addition to the static .env profiles above, profiles are pulled live
+// from HolonBridge's federated bridge registry (GET /registry), which is
+// sourced from a GitHub-backed RDF registry graph and health-checked
+// server-side (see registry/session-init.js and registry/server-integration.md
+// in this repo). This lets any bridge registered in the federation — e.g.
+// Ben Wortley's GGSC bridge — become switchable via set_endpoint without
+// manual profile edits or a restart, and stays current as the registry grows
+// past two nodes.
+//
+// Cached for REGISTRY_CACHE_MAX_AGE_MS to avoid hitting /registry on every
+// tool call; set_endpoint forces a fresh pull so a bridge registered moments
+// ago is immediately available. On fetch failure, falls back to the last
+// good cache (or empty, pre-first-fetch) rather than throwing — registry
+// unavailability should never break the static profiles.
+
+const REGISTRY_CACHE_MAX_AGE_MS = 30_000;
+let registryCache = { fetchedAt: 0, profiles: {} };
+
+function slugFromIri(iri) {
+  // "https://w3id.org/holonbridge/registry/ben-ggsc" -> "ben-ggsc"
+  return iri.split('/').filter(Boolean).pop();
+}
+
+async function fetchRegistryProfiles({ force = false } = {}) {
+  const age = Date.now() - registryCache.fetchedAt;
+  if (!force && registryCache.fetchedAt && age < REGISTRY_CACHE_MAX_AGE_MS) {
+    return registryCache.profiles;
+  }
+  try {
+    const res = await fetch(`${HOLONBRIDGE_URL}/registry`, {
+      headers: hbHeaders({ Accept: 'application/json' }),
+    });
+    if (!res.ok) {
+      console.warn(`[registry] GET /registry: HTTP ${res.status} — keeping previous cache`);
+      return registryCache.profiles;
+    }
+    const { bridges = [] } = await res.json();
+    const fresh = {};
+    for (const b of bridges) {
+      if (!b.iri || !b.url) continue;
+      const slug = slugFromIri(b.iri);
+      fresh[slug] = {
+        url: b.url,
+        label: b.label || slug,
+        reachable: b.health?.reachable ?? b.reachable ?? null,
+        latencyMs: b.health?.latencyMs ?? b.latencyMs ?? null,
+        source: 'registry',
+      };
+    }
+    registryCache = { fetchedAt: Date.now(), profiles: fresh };
+    return fresh;
+  } catch (err) {
+    console.warn('[registry] fetch failed (non-fatal, using previous cache):', err.message);
+    return registryCache.profiles;
+  }
+}
+
+async function getMergedProfiles({ force = false } = {}) {
+  const registryProfiles = await fetchRegistryProfiles({ force });
+  // Static profiles are the fallback layer; registry entries win on name
+  // collision since they carry live health data. Distinct slugs (e.g.
+  // "default" vs. "kurtcagle-primary") simply appear as separate entries.
+  return { ...profiles, ...registryProfiles };
+}
 
 // ── MCP server factory ──────────────────────────────────────────────────────────────
 //
@@ -226,31 +315,59 @@ let activeProfile = 'default';
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.9.0',
+    version: '1.10.0',
   });
 
-  srv.tool('list_endpoints', 'List all named HolonBridge profiles.', {}, async () => {
-    const lines = Object.entries(profiles).map(
-      ([name, p]) => `${name === activeProfile ? '* ' : '  '}${name}: ${p.url} (${p.label})`
-    );
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  });
+  srv.tool(
+    'list_endpoints',
+    'List all known HolonBridge profiles — static .env profiles plus live results ' +
+    'from the federated bridge registry (GET /registry), including reachability.',
+    {},
+    async () => {
+      const merged = await getMergedProfiles();
+      const lines = Object.entries(merged).map(([name, p]) => {
+        const marker  = name === activeProfile ? '* ' : '  ';
+        const health  = p.reachable === true ? ' ✓ reachable'
+                       : p.reachable === false ? ' ✗ unreachable'
+                       : '';
+        const latency = p.latencyMs != null ? ` (${p.latencyMs}ms)` : '';
+        const src     = p.source === 'registry' ? ' [registry]' : ' [static]';
+        return `${marker}${name}: ${p.url} (${p.label})${health}${latency}${src}`;
+      });
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
 
   srv.tool('get_endpoint', 'Show the currently active HolonBridge profile.', {}, async () => {
-    const p = profiles[activeProfile];
-    return { content: [{ type: 'text', text: `Active profile: ${activeProfile} → ${p.url}` }] };
+    const merged = await getMergedProfiles();
+    const p = merged[activeProfile];
+    return {
+      content: [{
+        type: 'text',
+        text: `Active profile: ${activeProfile} → ${p?.url ?? 'unknown (profile no longer present)'}`,
+      }],
+    };
   });
 
   srv.tool(
     'set_endpoint',
-    'Switch the active HolonBridge profile by name.',
+    'Switch the active HolonBridge profile by name — static config or any bridge ' +
+    'currently in the live federation registry.',
     { name: z.string().describe('Profile name from list_endpoints') },
     async ({ name }) => {
-      if (!profiles[name]) {
-        return { content: [{ type: 'text', text: `Unknown profile "${name}". Available: ${Object.keys(profiles).join(', ')}` }] };
+      // Force a fresh registry pull so a bridge registered moments ago is
+      // switchable immediately, without waiting out the cache window.
+      const merged = await getMergedProfiles({ force: true });
+      if (!merged[name]) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Unknown profile "${name}". Available: ${Object.keys(merged).join(', ')}`,
+          }],
+        };
       }
       activeProfile = name;
-      return { content: [{ type: 'text', text: `Switched to profile "${name}" → ${profiles[name].url}` }] };
+      return { content: [{ type: 'text', text: `Switched to profile "${name}" → ${merged[name].url}` }] };
     }
   );
 
@@ -554,27 +671,29 @@ app.post('/message', async (req, res) => {
   await session.transport.handlePostMessage(req, res, req.body);
 });
 
-app.get('/health', (_req, res) => {
+app.get('/health', async (_req, res) => {
+  const merged = await getMergedProfiles();
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.9.0',
+    version: '1.10.0',
     holonbridge: HOLONBRIDGE_URL,
     jenaBase,
     fusekiGspDataset: activeFusekiDataset,
     fusekiGspEndpoint: `${jenaBase}/${activeFusekiDataset}/data`,
-    profiles: Object.keys(profiles),
+    profiles: Object.keys(merged),
     activeProfile,
     activeSessions: sessions.size,
   });
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.9.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.10.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
-  console.log(`  Profiles            : ${Object.keys(profiles).join(', ')}`);
+  console.log(`  Static profiles     : ${Object.keys(profiles).join(', ')}`);
+  console.log(`  Registry-backed     : fetched on demand from ${HOLONBRIDGE_URL}/registry (cached ${REGISTRY_CACHE_MAX_AGE_MS / 1000}s)`);
   console.log(`  SSE endpoint        : http://localhost:${MCP_PORT}/sse`);
   console.log(`  Health              : http://localhost:${MCP_PORT}/health`);
 });
