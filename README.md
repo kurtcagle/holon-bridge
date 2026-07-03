@@ -42,7 +42,6 @@ holonbridge-mcp-remote    ──────── HolonBridge REST API
 - **Node.js ≥ 18.0.0**
 - **Apache Jena Fuseki 6.x** — download from https://jena.apache.org/download/
 - **Anthropic API key** — required for `nl_query` NL→SPARQL translation
-- (Optional) **GitHub PAT** — for `github-push` / `github-delete` endpoints
 
 ---
 
@@ -171,13 +170,6 @@ BEARER_TOKEN=<your-holonbridge-bearer-token>
 
 # NL→SPARQL (required for nl_query endpoint)
 ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: GitHub integration (for /github-push and /github-delete endpoints)
-# Generate at: https://github.com/settings/tokens
-# Required scopes: Contents (read + write)
-GITHUB_PAT=ghp_...
-GITHUB_OWNER=<your-github-username>
-GITHUB_REPO=<your-repo-name>
 
 # Server port (default: 3031)
 PORT=3031
@@ -399,7 +391,6 @@ All endpoints require `Authorization: Bearer <BEARER_TOKEN>`.
 | GET | `/graphs` | — | List named graphs + triple counts |
 | GET | `/health` | — | Health check + version |
 | GET | `/description` | — | Full capability description |
-| POST | `/github-push` | `{ owner, repo, branch, path, content, message }` | Push file to GitHub (requires `GITHUB_PAT`) |
 
 ---
 
@@ -409,7 +400,6 @@ All endpoints require `Authorization: Bearer <BEARER_TOKEN>`.
 |---|---|---|
 | `BEARER_TOKEN` | root `.env` | Authenticates all callers to HolonBridge REST |
 | `ANTHROPIC_API_KEY` | root `.env` | Powers `nl_query` NL→SPARQL translation |
-| `GITHUB_PAT` | root `.env` | Enables `/github-push` and `/github-delete` |
 | `HB_BEARER_TOKEN` | `mcp-remote/.env` | MCP remote → HolonBridge auth (same value as `BEARER_TOKEN`) |
 | `MCP_REMOTE_TOKEN` | `mcp-remote/.env` | Authenticates claude.ai → MCP remote |
 
@@ -417,11 +407,6 @@ To generate `BEARER_TOKEN` / `MCP_REMOTE_TOKEN`:
 ```bash
 openssl rand -hex 32
 ```
-
-To generate a `GITHUB_PAT`:
-- Go to https://github.com/settings/tokens
-- Create a **fine-grained PAT** scoped to the target repo
-- Required permission: **Contents: Read and write**
 
 ---
 
