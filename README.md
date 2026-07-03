@@ -163,8 +163,8 @@ Create `.env` in the repo root:
 
 ```env
 # Fuseki connection
-FUSEKI_URL=http://localhost:3030
-FUSEKI_DATASET=ds
+JENA_BASE=http://localhost:3030
+JENA_DATASET=holon
 
 # Auth — paste Token 1 here
 BEARER_TOKEN=<your-holonbridge-bearer-token>

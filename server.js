@@ -16,7 +16,7 @@
  *
  * Dataset selection (lowest to highest precedence)
  * ------------------------------------------------
- *   1. JENA_DATASET env var          (dataset name only, e.g. "ds")
+ *   1. JENA_DATASET env var          (dataset name only, e.g. "holon")
  *   2. -d / --dataset CLI flag       (dataset name only)
  *   3. POST /dataset at runtime      (overrides all of the above)
  *   4. JENA_ENDPOINT env var         (overrides SPARQL URL entirely -- legacy)
@@ -25,7 +25,7 @@
  * ------------------------
  *   context/
  *     {server}/          e.g. localhost-3030  or  kurtcagle.ngrok.io
- *       {dataset}/       e.g. ds  or  ggsc
+ *       {dataset}/       e.g. holon  or  ggsc
  *         01-prefixes.databook.md
  *         02-classes.databook.md
  *         03-named-queries.databook.md
@@ -101,7 +101,7 @@ const LOG_PROMPTS = process.env.LOG_PROMPTS           === 'true'
 // --- Mutable dataset state ----------------------------------------------------
 // module-level lets so POST /dataset can hot-swap them at runtime
 
-let DATASET        = parseDatasetArg() ?? process.env.JENA_DATASET ?? 'ds'
+let DATASET        = parseDatasetArg() ?? process.env.JENA_DATASET ?? 'holon'
 let JENA_SPARQL    = process.env.JENA_ENDPOINT ?? `${JENA_BASE}/${DATASET}/sparql`
 let JENA_UPDATE    = `${JENA_BASE}/${DATASET}/update`
 let JENA_GSP       = `${JENA_BASE}/${DATASET}/data`
