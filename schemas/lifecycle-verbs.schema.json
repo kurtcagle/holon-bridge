@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://w3id.org/holon/schemas/lifecycle-verbs.schema.json",
+  "title": "Holon Lifecycle Verb Signatures",
+  "description": "Source-of-truth contract for the eleven holon lifecycle verbs. The JS library (lib/lifecycle.js) and any future Python bindings are both generated consumers of this schema, not independent implementations. Namespace: https://w3id.org/holon/ (intentionally ahead of the older https://ontologist.io/ns/holon# namespace used by the sce/HGA spec pending reconciliation).",
+  "$defs": {
+    "ActorRef": {
+      "type": "object",
+      "description": "The agent performing an operation. Required on every mutating verb for the prov:wasGeneratedBy trail and the authorise() capability check.",
+      "properties": {
+        "iri": { "type": "string", "format": "iri" },
+        "role": { "type": "string" }
+      },
+      "required": ["iri"],
+      "additionalProperties": false
+    },
+    "Capability": {
+      "type": "string",
+      "enum": ["Read", "Write", "Promote", "Grant", "Owner"],
+      "description": "Owner implies Read+Write+Promote+Grant. Grant permits issuing RoleBindings with capability subset <= grantor's own (escalation guard)."
+    },
+    "AgentKind": {
+      "type": "string",
+      "enum": ["Agent", "Persona", "Actor"]
+    },
+    "HolonStatus": {
+      "type": "string",
+      "enum": ["Candidate", "Registered", "Tombstoned"]
+    },
+    "ClientMode": {
+      "type": "string",
+      "enum": ["cinematic", "immersive", "active-inference", "exploded-view"]
+    },
+    "TransmissionMode": {
+      "type": "string",
+      "enum": ["eager", "lazy"]
+    },
+    "DataBookRef": {
+      "type": "object",
+      "description": "A DataBook document (markdown with fenced turtle/sparql/shacl blocks + YAML frontmatter). Every verb is DataBook-in / DataBook-out at the boundary; Turtle/SPARQL/JSON are internal transport only.",
+      "properties": {
+        "markdown": { "type": "string" }
+      },
+      "required": ["markdown"],
+      "additionalProperties": false
+    }
+  },
+  "verbs": {
+    "createRootHolon": {
+      "description": "Establishes the pattern for all holons in a dataset -- not an instance. Sets naming convention for <base>/schema, <base>/scene, <base>/events named graphs and registers the index holon.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "baseIri": { "type": "string", "format": "iri" },
+          "label": { "type": "string" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["baseIri", "label", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:CreateRootHolonCommand",
+      "requiresCapability": null
+    },
+    "addSchema": {
+      "description": "Pushes OWL/taxonomy/SHACL/named-query fenced blocks into <holon>/schema, tagged holon:hasSchema. NodeShapes here may carry holon:holonEligible / holon:eligibleChildSchema.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "schemaDataBook": { "$ref": "#/$defs/DataBookRef" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "schemaDataBook", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:AddSchemaCommand",
+      "requiresCapability": "Write"
+    },
+    "addEntity": {
+      "description": "Adds instance data conforming to the holon's schema into <holon>/scene. If the matched NodeShape carries holon:holonEligible true, writes an unresolved holon:portalPotential marker rather than minting a holon.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "entityDataBook": { "$ref": "#/$defs/DataBookRef" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "entityDataBook", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:AddEntityCommand",
+      "requiresCapability": "Write"
+    },
+    "promoteEntity": {
+      "description": "Resolves an entity's holon:portalPotential into an actual child holon (lazy realization). Mints child schema/scene/event graphs seeded from holon:eligibleChildSchema, leaves a portal stub (holon:targetHolon) in the parent scene graph. Rejects if no unresolved potential exists.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityIri": { "type": "string", "format": "iri" },
+          "childBaseIri": { "type": "string", "format": "iri" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["entityIri", "actor"]
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "parent": { "$ref": "#/$defs/DataBookRef" },
+          "child": { "$ref": "#/$defs/DataBookRef" }
+        },
+        "required": ["parent", "child"]
+      },
+      "commandType": "holon:PromoteEntityCommand",
+      "requiresCapability": "Promote"
+    },
+    "addProjection": {
+      "description": "Registers a named query + prompt block + transmission mode + client mode against a holon. Does not mutate the scene graph.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "spec": {
+            "type": "object",
+            "properties": {
+              "queryIri": { "type": "string", "format": "iri" },
+              "promptBlockIri": { "type": "string", "format": "iri" },
+              "mode": { "$ref": "#/$defs/TransmissionMode" },
+              "clientMode": { "$ref": "#/$defs/ClientMode" }
+            },
+            "required": ["queryIri", "mode", "clientMode"]
+          },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "spec", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:AddProjectionCommand",
+      "requiresCapability": "Write"
+    },
+    "modifyEntity": {
+      "description": "Standard CommandEvent: validate against schema, DELETE/INSERT on scene graph, prov:wasDerivedFrom prior state.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityIri": { "type": "string", "format": "iri" },
+          "patchDataBook": { "$ref": "#/$defs/DataBookRef" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["entityIri", "patchDataBook", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:ModifyEntityCommand",
+      "requiresCapability": "Write"
+    },
+    "annotateProperty": {
+      "description": "Adds a reified event or annotation on a specific entity property using RDF 1.2 / Turtle 1.2 native reification (not RDF-star quoted triples, not classic rdf:Statement).",
+      "params": {
+        "type": "object",
+        "properties": {
+          "entityIri": { "type": "string", "format": "iri" },
+          "property": { "type": "string", "format": "iri" },
+          "annotation": {
+            "type": "object",
+            "properties": {
+              "value": {},
+              "note": { "type": "string" },
+              "eventType": { "type": "string", "enum": ["AssertionEvent", "CommandEvent"] }
+            },
+            "required": ["value", "eventType"]
+          },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["entityIri", "property", "annotation", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:AnnotatePropertyCommand",
+      "requiresCapability": "Write"
+    },
+    "listHolonContents": {
+      "description": "Pure projection -- SPARQL SELECT/CONSTRUCT scoped to <holon>/scene. No event written. Read-only.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "typeFilter": { "type": "string", "format": "iri" },
+          "includeChildren": { "type": "boolean", "default": false },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": null,
+      "requiresCapability": "Read"
+    },
+    "editMetadata": {
+      "description": "Edits the holon's registry record (title, description, status) -- not the scene graph.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "patch": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string" },
+              "description": { "type": "string" },
+              "status": { "$ref": "#/$defs/HolonStatus" }
+            }
+          },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "patch", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:EditMetadataCommand",
+      "requiresCapability": "Write"
+    },
+    "deleteHolon": {
+      "description": "Tombstones a holon (status -> Tombstoned). Event graph is untouched (append-only). Hard purge is a separate, explicitly-gated operation (purgeHolon).",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:DeleteHolonCommand",
+      "requiresCapability": "Owner"
+    },
+    "purgeHolon": {
+      "description": "Secondary GC operation on an already-tombstoned holon. Scheduling TBD. Distinct from the test-only clearHolarchy utility, which is recursive and unconditional and lives outside this verb set entirely.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "actor": { "$ref": "#/$defs/ActorRef" },
+          "confirm": { "const": true }
+        },
+        "required": ["holonIri", "actor", "confirm"]
+      },
+      "returns": { "type": "null" },
+      "commandType": null,
+      "requiresCapability": "Owner"
+    },
+    "designateAgent": {
+      "description": "Registers a prov:Agent/Persona/Actor with a holon:RoleBinding scoped to this holon. Enforces the escalation guard: grantor must hold Grant capability, and issued capability must be a subset of the grantor's own.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "holonIri": { "type": "string", "format": "iri" },
+          "agent": {
+            "type": "object",
+            "properties": {
+              "iri": { "type": "string", "format": "iri" },
+              "name": { "type": "string" },
+              "kind": { "$ref": "#/$defs/AgentKind" },
+              "capability": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/Capability" }
+              }
+            },
+            "required": ["iri", "name", "kind", "capability"]
+          },
+          "grantedBy": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["holonIri", "agent", "grantedBy"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:DesignateAgentCommand",
+      "requiresCapability": "Grant"
+    }
+  }
+}
