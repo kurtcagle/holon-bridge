@@ -72,6 +72,7 @@ import { buildQuery, retryQuery, interpretResults }                 from './lib/
 import { buildResponseDataBook }                                    from './lib/format.js'
 import { validateWithShacl }                                        from './lib/shacl.js'
 import { validateHandler }                                          from './lib/validate.js'
+import { getHolonHandler }                                          from './lib/holon.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
          GRAPHS as REGISTRY_GRAPHS }                                from './registry/session-init.js'
@@ -1206,6 +1207,7 @@ app.get('/description', async (_req, res) => {
       { method: 'GET',  path: '/graphs',         description: 'Live query: list all named graphs in the active dataset with triple counts.' },
       { method: 'GET',  path: '/graph',          description: 'Fetch RDF content of a single named graph via GSP. Query params: iri=<encoded IRI>, format=turtle|trig.' },
       { method: 'GET',  path: '/named-queries',  description: 'List all registered named queries with source (rdf|filesystem).' },
+      { method: 'GET',  path: '/holon/:iri',    description: 'Retrieve a holon as a projection DataBook (text/markdown). :iri is the full holon IRI, percent-encoded as a single path segment. Query param projection=immersive|cinematic|active_inference|exploded_view (default immersive). Targets the https://ontologist.io/ns/holon# / holon:isPartOf model actually populated in Fuseki -- see lib/holon.js header for the namespace-reconciliation note against lib/lifecycle.js.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
@@ -2341,6 +2343,21 @@ app.post('/validate', async (req, res) => {
   await validateHandler(req, res, { JENA_BASE, DATASET, SHACL_GRAPH })
 })
 
+// -- GET /holon/:iri ------------------------------------------------------------
+//
+// Retrieve a holon as a projection DataBook (text/markdown). See
+// lib/holon.js for full documentation, including the namespace-
+// reconciliation note against lib/lifecycle.js's newer holon model.
+//
+// :iri is the full holon IRI, percent-encoded by the caller as a single
+// path segment (Express decodes route params automatically).
+// Query param: projection=immersive|cinematic|active_inference|exploded_view
+// (default: immersive).
+
+app.get('/holon/:iri', async (req, res) => {
+  await getHolonHandler(req, res, { JENA_SPARQL })
+})
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -2355,6 +2372,7 @@ app.use((_req, res) => {
       'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
       'GET  /message/:id', 'GET  /description', 'GET  /health',
         'POST /validate',
+        'GET  /holon/:iri',
         'GET  /registry', 'POST /registry/refresh'
     ]
   })
