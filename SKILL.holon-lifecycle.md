@@ -240,15 +240,17 @@ the `prov:wasGeneratedBy` trail and for the `authorise()` capability check.
 | P4 MCP tool group | `holonbridge-mcp` | Agent-callable wrappers over the same library (not yet built -- next step) |
 | This skill | `/mnt/skills/user/holon-lifecycle/` | Design rationale and vocabulary reference |
 
-**Known gaps in the current build** (flagged inline in `lifecycle.js` as
-`NOTE`/`TODO` comments, not silently glossed over):
-- `promoteEntity`'s resolution step doesn't yet DELETE the resolved
-  `holon:portalPotential` triple -- needs a `sparql_update` wrapper in
-  `sparql.js`, which doesn't exist yet (only `runQuery`/`runConstruct`/
-  `pushToGraph` via GSP do).
-- `editMetadata` and `deleteHolon` append new status/title triples via GSP
-  POST rather than replacing prior values via DELETE/INSERT -- same
-  missing `sparql_update` wrapper dependency.
+**`sparql.js` now has a real UPDATE primitive.** `runUpdate()`,
+`deriveUpdateEndpoint()`, and a `replaceTriples()` convenience wrapper
+(atomic DELETE/INSERT/WHERE) were added to close the gap flagged in the
+first build. `promoteEntity`'s portal-potential resolution, `editMetadata`'s
+per-field updates, and `deleteHolon`'s status flip (plus removal of the
+parent's portal reference) all now use `replaceTriples`/`runUpdate` instead
+of GSP append-only POSTs -- prior values are properly retracted, not left
+alongside new ones.
+
+**Remaining known gaps in the current build** (flagged inline in
+`lifecycle.js` as `NOTE`/`TODO` comments, not silently glossed over):
 - `addEntity`'s eligibility-matching SPARQL is a stub -- it detects that
   *a* holon-eligible shape exists in the schema graph but doesn't yet join
   that against the specific entity's asserted `rdf:type` from the pushed
@@ -257,11 +259,14 @@ the `prov:wasGeneratedBy` trail and for the `authorise()` capability check.
   implemented as "don't write a new binding," which is correct per the
   design decision above, but hasn't been tested against a multi-level
   promotion chain.
-
-These are first-build gaps, not silent shortcuts -- the fix in every case
-is the same missing primitive (`sparql_update` in `sparql.js`), so that's
-the natural next infrastructure step before the eligibility-matching and
-metadata-update gaps can close properly.
+- `deleteHolon`'s removal of the parent's portal reference is implemented
+  as outright triple removal rather than a `holon:TombstonedTarget`
+  marker -- open question noted inline on whether the parent's scene graph
+  should retain a record that a crossing point existed and was closed.
+- `resolveCapabilities()`'s registry queries assume a `?registryGraph`
+  variable pattern that hasn't been validated against how the registry is
+  actually laid out in a live Fuseki dataset (default graph vs. a
+  dedicated named graph) -- worth confirming before first real test run.
 
 ---
 
