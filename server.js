@@ -1202,6 +1202,12 @@ app.get('/datasets', async (_req, res) => {
 app.get('/description', async (_req, res) => {
   let shaclTriples = null
   try { shaclTriples = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH) } catch (_) {}
+  // Fresh read, not the boot-time `sessionState` const below -- focus
+  // changes continuously as GET /holon calls come in, so a boot-time
+  // snapshot would go stale immediately. dataset/jenaBase/shaclRequired
+  // deliberately keep using the boot-time snapshot below (they describe
+  // "what this process booted with," not live state).
+  const liveSessionState = loadSessionState()
 
   res.json({
     service: 'holon-bridge', version: '2.9.0',
@@ -1233,6 +1239,7 @@ app.get('/description', async (_req, res) => {
       { method: 'GET',  path: '/graph',          description: 'Fetch RDF content of a single named graph via GSP. Query params: iri=<encoded IRI>, format=turtle|trig.' },
       { method: 'GET',  path: '/named-queries',  description: 'List all registered named queries with source (rdf|filesystem).' },
       { method: 'GET',  path: '/holon/:iri',    description: 'Retrieve a holon as a projection DataBook (text/markdown). :iri is the full holon IRI, percent-encoded as a single path segment. Query param projection=immersive|cinematic|active_inference|exploded_view (default immersive). Targets the https://ontologist.io/ns/holon# / holon:isPartOf model actually populated in Fuseki -- see lib/holon.js header for the namespace-reconciliation note against lib/lifecycle.js.' },
+      { method: 'GET',  path: '/holon',         description: 'Same as GET /holon/:iri but with no IRI -- resolves the holon to show via persisted focus for the active dataset, falling back to that dataset\'s holon:Home instance if no focus has been persisted yet. Every successful call on either route persists its resolved IRI as the new focus. See sessionState.currentFocus below and GET /holon\'s response metadata (resolvedVia: explicit|persisted-focus|holon-home) for observability into which path produced the answer.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
@@ -1259,11 +1266,14 @@ app.get('/description', async (_req, res) => {
       persistedJenaBase: sessionState.jenaBase ?? null,
       persistedShaclRequired: sessionState.shaclRequired ?? null,
       persistedUpdatedAt: sessionState.updatedAt ?? null,
+      currentFocus: liveSessionState.focusByDataset?.[DATASET] ?? null,
       note: 'persistedDataset/persistedJenaBase/persistedShaclRequired are what this bridge booted with, ' +
             'read from .bridge-session-state.json. If they don\'t match the "dataset"/"jenaBase"/"shacl.required" ' +
             'fields above, this process has switched since boot -- that\'s normal. If restoredFromDisk is false ' +
             'and you expected persisted state (e.g. right after a restart), the state file is missing or was ' +
-            'never written.'
+            'never written. currentFocus, unlike the persisted* fields above, is read fresh on every call, not ' +
+            'cached from boot -- it is the IRI GET /holon (no :iri) will resolve to right now for this dataset, ' +
+            'updated by every successful GET /holon call.'
     },
     agentHints: [
       'Call GET /description at session start to orient yourself.',
@@ -2381,19 +2391,30 @@ app.post('/validate', async (req, res) => {
   await validateHandler(req, res, { JENA_BASE, DATASET, SHACL_GRAPH })
 })
 
-// -- GET /holon/:iri ------------------------------------------------------------
+// -- GET /holon and GET /holon/:iri ----------------------------------------------
 //
 // Retrieve a holon as a projection DataBook (text/markdown). See
 // lib/holon.js for full documentation, including the namespace-
-// reconciliation note against lib/lifecycle.js's newer holon model.
+// reconciliation note against lib/lifecycle.js's newer holon model and
+// the default-focus resolution mechanism below.
 //
-// :iri is the full holon IRI, percent-encoded by the caller as a single
-// path segment (Express decodes route params automatically).
-// Query param: projection=immersive|cinematic|active_inference|exploded_view
-// (default: immersive).
+// GET /holon/:iri -- :iri is the full holon IRI, percent-encoded by the
+// caller as a single path segment (Express decodes route params
+// automatically).
+//
+// GET /holon (no :iri) -- resolves the holon to show via persisted focus
+// for the active dataset, falling back to that dataset's holon:Home
+// instance. Both routes accept the same query param:
+// projection=immersive|cinematic|active_inference|exploded_view
+// (default: immersive). Every successful call on either route persists
+// its resolved IRI as the new focus for DATASET.
+
+app.get('/holon', async (req, res) => {
+  await getHolonHandler(req, res, { JENA_SPARQL, DATASET })
+})
 
 app.get('/holon/:iri', async (req, res) => {
-  await getHolonHandler(req, res, { JENA_SPARQL })
+  await getHolonHandler(req, res, { JENA_SPARQL, DATASET })
 })
 
 // -- 404 fallback --------------------------------------------------------------
@@ -2410,7 +2431,7 @@ app.use((_req, res) => {
       'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
       'GET  /message/:id', 'GET  /description', 'GET  /health',
         'POST /validate',
-        'GET  /holon/:iri',
+        'GET  /holon', 'GET  /holon/:iri',
         'GET  /registry', 'POST /registry/refresh'
     ]
   })
