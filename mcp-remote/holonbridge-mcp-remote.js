@@ -48,6 +48,27 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-07 v1.10.3 FIX: hbPushTurtle()'s shapes_graph parameter was
+ *                      non-blocking. It called hbValidate() and awaited the
+ *                      result, but never inspected report.conforms — a
+ *                      validation report with conforms:false is a normal
+ *                      successful HTTP response, not a thrown error, so
+ *                      nothing stopped the subsequent /update push. Before
+ *                      v1.10.2 this was accidentally masked: hbValidate()
+ *                      always threw (the v1.10.1 /validate contract bug),
+ *                      so shapes_graph always blocked the push — for the
+ *                      wrong reason (broken endpoint, not real violations).
+ *                      Fixed in v1.10.2, the accidental gate disappeared:
+ *                      confirmed live that a sol:Planet instance missing
+ *                      every required property (mass, meanRadius,
+ *                      orbitalPeriod, distanceFromSun, moonCount, orbits)
+ *                      still pushed successfully with shapes_graph set.
+ *                      Fix: hbPushTurtle() now checks report.conforms and
+ *                      throws — listing focusNode/path/message per
+ *                      violation — before the /update call, so a
+ *                      non-conforming payload never reaches the target
+ *                      graph. Conforming payloads and calls without
+ *                      shapes_graph are unaffected.
  *   2026-07-07 v1.10.2 FIX: hbValidate() was calling /validate with the old
  *                      contract (raw Turtle body, Content-Type: text/turtle,
  *                      shapes graph as a `?shapes=` query param). The route
@@ -199,7 +220,20 @@ async function hbUpdate(sparql) {
 
 async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
   if (shapesGraph) {
-    await hbValidate(turtle, shapesGraph);
+    const report = await hbValidate(turtle, shapesGraph);
+    if (report.conforms === false) {
+      const violationLines = (report.violations ?? []).map((v, i) => {
+        const focus = v.focusNode ? ` on <${v.focusNode}>` : '';
+        const path  = v.path ? ` at ${v.path}` : '';
+        const msg   = v.message ? ` — ${v.message}` : '';
+        return `  ${i + 1}.${focus}${path}${msg}`;
+      });
+      throw new Error(
+        `SHACL validation failed against <${shapesGraph}> — push aborted. ` +
+        `${report.violationCount ?? report.violations?.length ?? 0} violation(s):\n` +
+        (violationLines.length ? violationLines.join('\n') : '  (see rawReport for details)')
+      );
+    }
   }
   const res = await fetch(`${activeBaseUrl()}/update`, {
     method: 'POST',
@@ -406,7 +440,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.10.2',
+    version: '1.10.3',
   });
 
   srv.tool(
@@ -768,7 +802,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.10.2',
+    version: '1.10.3',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -781,7 +815,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.10.2 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.10.3 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
