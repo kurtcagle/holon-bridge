@@ -73,6 +73,7 @@ import { buildResponseDataBook }                                    from './lib/
 import { validateWithShacl }                                        from './lib/shacl.js'
 import { validateHandler }                                          from './lib/validate.js'
 import { getHolonHandler }                                          from './lib/holon.js'
+import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
          GRAPHS as REGISTRY_GRAPHS }                                from './registry/session-init.js'
@@ -90,10 +91,25 @@ function parseDatasetArg() {
   return null
 }
 
+// --- Persisted session state ---------------------------------------------------
+//
+// Read before anything else derives its config. Precedence (highest to
+// lowest): CLI arg / explicit env var > persisted session state (last
+// known values from before the most recent restart) > hardcoded default.
+// See lib/session-state.js for why this exists and why it's a local file
+// rather than a Fuseki graph.
+
+const sessionState = loadSessionState()
+if (Object.keys(sessionState).length > 0) {
+  console.log(`[Bridge] Restored session state from disk (last updated ${sessionState.updatedAt ?? 'unknown'}): ` +
+    `dataset=${sessionState.dataset ?? '(none)'}, jenaBase=${sessionState.jenaBase ?? '(none)'}, ` +
+    `shaclRequired=${sessionState.shaclRequired ?? '(none)'}`)
+}
+
 // --- Config -------------------------------------------------------------------
 
 const PORT        = parseInt(process.env.PORT        ?? '3031', 10)
-let   JENA_BASE   = process.env.JENA_BASE             ?? 'http://localhost:3030'
+let   JENA_BASE   = process.env.JENA_BASE             ?? sessionState.jenaBase ?? 'http://localhost:3030'
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES ?? '2', 10)
 const MODEL       = process.env.CLAUDE_MODEL          ?? 'claude-sonnet-4-6'
 const LOG_SPARQL  = process.env.LOG_SPARQL            === 'true'
@@ -102,12 +118,14 @@ const LOG_PROMPTS = process.env.LOG_PROMPTS           === 'true'
 // --- Mutable dataset state ----------------------------------------------------
 // module-level lets so POST /dataset can hot-swap them at runtime
 
-let DATASET        = parseDatasetArg() ?? process.env.JENA_DATASET ?? 'ds'
+let DATASET        = parseDatasetArg() ?? process.env.JENA_DATASET ?? sessionState.dataset ?? 'ds'
 let JENA_SPARQL    = process.env.JENA_ENDPOINT ?? `${JENA_BASE}/${DATASET}/sparql`
 let JENA_UPDATE    = `${JENA_BASE}/${DATASET}/update`
 let JENA_GSP       = `${JENA_BASE}/${DATASET}/data`
 let SHACL_GRAPH    = process.env.SHACL_GRAPH ?? `urn:${DATASET}:shacl`
-let SHACL_REQUIRED = process.env.SHACL_REQUIRED === 'true'
+let SHACL_REQUIRED = process.env.SHACL_REQUIRED !== undefined
+  ? process.env.SHACL_REQUIRED === 'true'
+  : (sessionState.shaclRequired ?? false)
 
 /** IRI of the named-queries graph for the active dataset. */
 function namedQueriesGraphIri() { return `urn:${DATASET}:named-queries` }
@@ -195,6 +213,13 @@ function rebuildEndpoints(dataset, base) {
   JENA_UPDATE = `${JENA_BASE}/${DATASET}/update`
   JENA_GSP    = `${JENA_BASE}/${DATASET}/data`
   SHACL_GRAPH = process.env.SHACL_GRAPH  ?? `urn:${DATASET}:shacl`
+  // Write-through: persist immediately so a later restart (clean or not)
+  // comes back up pointed at this dataset/base rather than silently
+  // reverting to the hardcoded default. Called on both the happy path
+  // (POST /dataset, POST /fuseki-url) and the rollback path (dataset
+  // switch failure reverting to prevDataset/prevBase) -- both are the
+  // currently-true active state and both deserve to survive a restart.
+  saveSessionState({ dataset: DATASET, jenaBase: JENA_BASE })
 }
 
 // --- Context loader -----------------------------------------------------------
@@ -1228,6 +1253,18 @@ app.get('/description', async (_req, res) => {
             ? 'SHACL triple count unavailable (Jena unreachable at description time).'
             : `${shaclTriples} shape triples loaded -- /update is armed.`
     },
+    sessionState: {
+      restoredFromDisk: Object.keys(sessionState).length > 0,
+      persistedDataset: sessionState.dataset ?? null,
+      persistedJenaBase: sessionState.jenaBase ?? null,
+      persistedShaclRequired: sessionState.shaclRequired ?? null,
+      persistedUpdatedAt: sessionState.updatedAt ?? null,
+      note: 'persistedDataset/persistedJenaBase/persistedShaclRequired are what this bridge booted with, ' +
+            'read from .bridge-session-state.json. If they don\'t match the "dataset"/"jenaBase"/"shacl.required" ' +
+            'fields above, this process has switched since boot -- that\'s normal. If restoredFromDisk is false ' +
+            'and you expected persisted state (e.g. right after a restart), the state file is missing or was ' +
+            'never written.'
+    },
     agentHints: [
       'Call GET /description at session start to orient yourself.',
       'Call GET /datasets to see available datasets, then POST /dataset to switch.',
@@ -1267,6 +1304,7 @@ app.post('/shacl-mode', (req, res) => {
     return res.status(400).json({ error: '"required" must be a boolean.' })
 
   SHACL_REQUIRED = required
+  saveSessionState({ shaclRequired: SHACL_REQUIRED })
   const msg = SHACL_REQUIRED
     ? `SHACL gate enabled -- /update requires shapes in <${SHACL_GRAPH}>.`
     : `SHACL gate disabled -- /update will push without validation.`
