@@ -48,6 +48,26 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-07 v1.10.2 FIX: hbValidate() was calling /validate with the old
+ *                      contract (raw Turtle body, Content-Type: text/turtle,
+ *                      shapes graph as a `?shapes=` query param). The route
+ *                      handler (lib/validate.js, v2.9.1+) was refactored to
+ *                      require a JSON body of { dataGraph, shapesGraph } where
+ *                      dataGraph is the IRI of an *already-loaded* named graph
+ *                      — it fetches that graph via GSP and delegates to
+ *                      validateWithShacl(). Since hbValidate() never sent
+ *                      dataGraph, every call hit the route's own 400 guard
+ *                      ('"dataGraph" is required...'), regardless of dataset,
+ *                      shapes graph content, or payload — including trivial
+ *                      two-triple payloads. This also broke push_turtle
+ *                      whenever a shapes_graph was supplied, since
+ *                      hbPushTurtle() calls hbValidate() first in that case.
+ *                      Fix: hbValidate() now pushes the submitted Turtle to a
+ *                      short-lived temp graph via the existing hbPushTurtle
+ *                      path (mode='replace', no shapes_graph so no recursion),
+ *                      calls /validate with the correct JSON contract against
+ *                      that temp graph, then drops it (best-effort, does not
+ *                      block the returned report on cleanup success).
  *   2026-07-01 v1.10.1 FIX: set_endpoint was cosmetic. Every hb* HTTP helper
  *                      (hbQuery, hbUpdate, hbPushTurtle, hbGetHolon,
  *                      hbValidate, hbNlQuery, hbListGraphs) plus the inline
@@ -69,7 +89,7 @@
  *                      variations of the same local setup).
  *   2026-07-01 v1.10.0 Registry-backed profile discovery. list_endpoints,
  *                      get_endpoint, and set_endpoint now merge static
- *                      .env PROFILE_<NAME>_URL entries with live results
+ *                      .env PROFILE_<n>_URL entries with live results
  *                      from GET /registry on HolonBridge (federated bridge
  *                      registry, GitHub-backed, health-checked server-side).
  *                      Any bridge registered in the federation — e.g. Ben's
@@ -204,16 +224,46 @@ async function hbGetHolon(holonIri, projectionMode = 'immersive') {
   return res.text();
 }
 
+/**
+ * Validate a Turtle payload against a SHACL shapes graph.
+ *
+ * The current /validate route (lib/validate.js, v2.9.1+) only validates a
+ * named graph that already exists in the dataset — it takes JSON
+ * { dataGraph, shapesGraph } and fetches dataGraph via GSP internally. It
+ * does not accept raw Turtle in the request body.
+ *
+ * To preserve this tool's existing contract (accept raw Turtle directly,
+ * the way validate_turtle and push_turtle's shapes_graph option both do),
+ * we push the submitted Turtle into a short-lived temp graph first, run
+ * /validate against that graph's IRI, then drop the temp graph. Mirrors the
+ * temp-graph pattern lib/shacl.js already uses server-side against Fuseki
+ * directly — this does the equivalent through the public REST surface.
+ */
 async function hbValidate(turtle, shapesGraph) {
-  const url = new URL(`${activeBaseUrl()}/validate`);
-  url.searchParams.set('shapes', shapesGraph);
-  const res = await fetch(url.toString(), {
-    method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'text/turtle' }),
-    body: turtle,
-  });
-  if (!res.ok) throw new Error(`HolonBridge /validate: HTTP ${res.status}`);
-  return res.text();
+  const tempGraph = `urn:holonbridge-mcp:validate-temp:${Date.now()}`;
+
+  // Push without a shapesGraph so this doesn't recurse back into hbValidate.
+  await hbPushTurtle(turtle, tempGraph, null, 'replace');
+
+  let result;
+  try {
+    const res = await fetch(`${activeBaseUrl()}/validate`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+      body: JSON.stringify({ dataGraph: tempGraph, shapesGraph }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HolonBridge /validate: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    }
+    result = await res.json();
+  } finally {
+    // Best-effort cleanup — don't let a failed DROP mask or block the
+    // validation result itself.
+    await hbUpdate(`DROP SILENT GRAPH <${tempGraph}>`).catch(() => {});
+  }
+
+  return result;
 }
 
 async function hbNlQuery(question, graph) {
@@ -356,7 +406,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.10.1',
+    version: '1.10.2',
   });
 
   srv.tool(
@@ -507,7 +557,7 @@ function createMcpServer() {
     },
     async ({ turtle, shapes_graph }) => {
       const report = await hbValidate(turtle, shapes_graph);
-      return { content: [{ type: 'text', text: report }] };
+      return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
     }
   );
 
@@ -718,7 +768,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.10.1',
+    version: '1.10.2',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -731,7 +781,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.10.1 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.10.2 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
