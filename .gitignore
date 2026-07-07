@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.local
+
+# Per-instance session state (dataset/jenaBase/shaclRequired persisted
+# across restarts) -- see lib/session-state.js. Deliberately untracked:
+# this is live, host-specific operational state, not configuration.
+.bridge-session-state.json
+.bridge-session-state.json.tmp
