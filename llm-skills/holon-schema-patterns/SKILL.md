@@ -2,18 +2,16 @@
 name: holon-schema-patterns
 description: >
   Design patterns for extending the holon data model with new domain
-  schemas — when to model something as containment vs. connection, when
-  to split a predicate by scale vs. when dual-assertion is fine, how to
-  mark cross-cutting facets so they don't get mistaken for primary
-  taxonomy, and how a holon can be a connection-peer in one tree while
-  simultaneously being the containment root of its own. Load this skill
-  whenever adding a new geo:/sol:/domain-specific class or property to
-  urn:{dataset}:ontology, whenever a new kind of relationship doesn't
-  obviously fit isPartOf or an existing connection predicate, or whenever
-  reviewing whether a proposed model change will actually be visible to
-  get_holon. This is a modeling-pattern skill, not an API reference —
-  see the holonbridge skill for REST/MCP mechanics and the sce skill for
-  the broader HGA/SCE pipeline architecture. Also trigger on: "holon
+  schemas — containment vs. connection, when to split a predicate by
+  scale vs. when dual-assertion is fine, marking cross-cutting facets
+  vs. primary taxonomy, and how a holon can be a connection-peer in one
+  tree while also being the containment root of its own. Load whenever
+  adding a new geo:/sol:/domain class or property to
+  urn:{dataset}:ontology, whenever a relationship doesn't obviously fit
+  isPartOf or an existing connection predicate, or when checking whether
+  a model change will actually be visible to get_holon. Modeling-pattern
+  skill, not an API reference — see holonbridge for REST/MCP mechanics
+  and sce for the broader HGA/SCE architecture. Also trigger on: "holon
   role discovery", "isPartOf vs isConnectedTo", "containment vs
   connection", "composition facet", "administrativePartOf",
   "subPropertyOf holon", "holon:Home", "default focus", "multi-tree
