@@ -48,6 +48,19 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-09 v1.11.0 Add propose_property_update tool, wrapping HolonBridge's
+ *                      lifecycle verb proposeAgentPropertyUpdate (POST
+ *                      /holon/:iri/property, lib/lifecycle.js). Before this,
+ *                      none of lib/lifecycle.js's thirteen verbs were reachable
+ *                      through this MCP remote at all -- only the pre-lifecycle
+ *                      surface (query/update/push/validate/get_holon) was
+ *                      exposed. This is the first lifecycle verb wired through,
+ *                      chosen because it's the one with an actual near-term use
+ *                      (Adventure Mode agent health/wealth changes going through
+ *                      a real SHACL-gated propose/approve pair instead of raw
+ *                      sparql_update with no enforcement at all). The other
+ *                      twelve verbs remain unexposed here pending the same
+ *                      treatment.
  *   2026-07-07 v1.10.3 FIX: hbPushTurtle()'s shapes_graph parameter was
  *                      non-blocking. It called hbValidate() and awaited the
  *                      result, but never inspected report.conforms — a
@@ -259,6 +272,32 @@ async function hbGetHolon(holonIri, projectionMode = 'immersive') {
 }
 
 /**
+ * Propose->validate->apply a delta to a numeric agent property via
+ * HolonBridge's proposeAgentPropertyUpdate lifecycle verb (POST
+ * /holon/:iri/property, lib/lifecycle.js). Validated against the
+ * property's governing SHACL shape BEFORE any write on the HolonBridge
+ * side -- a rejection comes back as a non-2xx HTTP response (409 for
+ * CommandRejected, 403 for UnauthorisedError), surfaced here as a thrown
+ * Error carrying the response body so the violation detail isn't lost.
+ */
+async function hbProposePropertyUpdate(agentIri, property, delta, rationale, actorIri, capProperty, floor) {
+  const url = `${activeBaseUrl()}/holon/${encodeURIComponent(agentIri)}/property`;
+  const body = { property, delta, rationale, actor: { iri: actorIri } };
+  if (capProperty !== undefined) body.capProperty = capProperty;
+  if (floor !== undefined) body.floor = floor;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`HolonBridge /holon/.../property: HTTP ${res.status} — ${text.slice(0, 400)}`);
+  }
+  return text;
+}
+
+/**
  * Validate a Turtle payload against a SHACL shapes graph.
  *
  * The current /validate route (lib/validate.js, v2.9.1+) only validates a
@@ -440,7 +479,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.10.3',
+    version: '1.11.0',
   });
 
   srv.tool(
@@ -563,6 +602,32 @@ function createMcpServer() {
     async ({ holon_iri, projection_mode }) => {
       const databook = await hbGetHolon(holon_iri, projection_mode);
       return { content: [{ type: 'text', text: databook }] };
+    }
+  );
+
+  srv.tool(
+    'propose_property_update',
+    'Propose, validate, and (if valid) apply a delta to a numeric agent property -- ' +
+    'e.g. https://schema.org/healthPoints or https://schema.org/currentWealth -- via ' +
+    "HolonBridge's proposeAgentPropertyUpdate lifecycle verb (POST /holon/:iri/property). " +
+    "Validated against the property's governing SHACL shape (e.g. AgentHealthShape, " +
+    'AgentWealthShape) BEFORE anything is written -- a rejected proposal throws with no ' +
+    'trace left in either the holons or events graph. On success, writes a ' +
+    'holon:ModelUpdateRequest + holon:ModelUpdateApprove event pair plus the new value ' +
+    'on the agent. Pass cap_property (e.g. maxHealthPoints) to cap the result at another ' +
+    "property's current value, mirroring the existing healthPoints capping behaviour.",
+    {
+      agent_iri:    z.string().describe('IRI of the agent whose property is changing'),
+      property:     z.string().describe('Full IRI of the numeric property, e.g. https://schema.org/currentWealth'),
+      delta:        z.number().describe('Signed amount to add (negative to subtract/spend)'),
+      rationale:    z.string().describe('Short human-readable reason for this change'),
+      actor_iri:    z.string().describe('IRI of the actor performing this change (holon:agent / prov:wasGeneratedBy)'),
+      cap_property: z.string().optional().describe('Optional IRI of a property to cap the result at, e.g. https://schema.org/maxHealthPoints'),
+      floor:        z.number().optional().describe('Optional floor for the result (default 0)'),
+    },
+    async ({ agent_iri, property, delta, rationale, actor_iri, cap_property, floor }) => {
+      const result = await hbProposePropertyUpdate(agent_iri, property, delta, rationale, actor_iri, cap_property, floor);
+      return { content: [{ type: 'text', text: result }] };
     }
   );
 
@@ -802,7 +867,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.10.3',
+    version: '1.11.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -815,7 +880,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.10.3 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.11.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
