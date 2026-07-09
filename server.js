@@ -73,6 +73,10 @@ import { buildResponseDataBook }                                    from './lib/
 import { validateWithShacl }                                        from './lib/shacl.js'
 import { validateHandler }                                          from './lib/validate.js'
 import { getHolonHandler }                                          from './lib/holon.js'
+import { createRootHolon, addSchema, addEntity, promoteEntity, addProjection,
+         modifyEntity, annotateProperty, listHolonContents, editMetadata,
+         deleteHolon, purgeHolon, designateAgent, moveHolon,
+         CommandRejected, UnauthorisedError }                        from './lib/lifecycle.js'
 import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
@@ -1238,8 +1242,21 @@ app.get('/description', async (_req, res) => {
       { method: 'GET',  path: '/graphs',         description: 'Live query: list all named graphs in the active dataset with triple counts.' },
       { method: 'GET',  path: '/graph',          description: 'Fetch RDF content of a single named graph via GSP. Query params: iri=<encoded IRI>, format=turtle|trig.' },
       { method: 'GET',  path: '/named-queries',  description: 'List all registered named queries with source (rdf|filesystem).' },
-      { method: 'GET',  path: '/holon/:iri',    description: 'Retrieve a holon as a projection DataBook (text/markdown). :iri is the full holon IRI, percent-encoded as a single path segment. Query param projection=immersive|cinematic|active_inference|exploded_view (default immersive). Targets the https://ontologist.io/ns/holon# / holon:isPartOf model actually populated in Fuseki -- see lib/holon.js header for the namespace-reconciliation note against lib/lifecycle.js.' },
+      { method: 'GET',  path: '/holon/:iri',    description: 'Retrieve a holon as a projection DataBook (text/markdown). :iri is the full holon IRI, percent-encoded as a single path segment. Query param projection=immersive|cinematic|active_inference|exploded_view (default immersive).' },
       { method: 'GET',  path: '/holon',         description: 'Same as GET /holon/:iri but with no IRI -- resolves the holon to show via persisted focus for the active dataset, falling back to that dataset\'s holon:Home instance if no focus has been persisted yet. Every successful call on either route persists its resolved IRI as the new focus. See sessionState.currentFocus below and GET /holon\'s response metadata (resolvedVia: explicit|persisted-focus|holon-home) for observability into which path produced the answer.' },
+      { method: 'POST', path: '/holon',         description: '[LIFECYCLE] createRootHolon -- establishes a new holon and its schema/scene/events graph triad. Body: { baseIri, label, actor: {iri, role?}, rootLocked?: boolean }. NOTE: assumes the per-holon graph triad lib/lifecycle.js mints -- not the flat-graph model most live datasets (including Adventure Mode geography) actually use.' },
+      { method: 'POST', path: '/holon/:iri/schema',     description: '[LIFECYCLE] addSchema. Body: { schemaDataBook: {markdown}, actor }.' },
+      { method: 'POST', path: '/holon/:iri/entity',     description: '[LIFECYCLE] addEntity. Body: { entityDataBook: {markdown}, actor }.' },
+      { method: 'POST', path: '/entity/:iri/promote',   description: '[LIFECYCLE] promoteEntity -- resolves holon:portalPotential into a realised child holon. Body: { childBaseIri?, actor }.' },
+      { method: 'POST', path: '/holon/:iri/projection', description: '[LIFECYCLE] addProjection. Body: { spec: {queryIri, promptBlockIri?, mode, clientMode}, actor }.' },
+      { method: 'POST', path: '/entity/:iri/modify',    description: '[LIFECYCLE] modifyEntity. Body: { patchDataBook: {markdown}, actor }.' },
+      { method: 'POST', path: '/entity/:iri/annotate',  description: '[LIFECYCLE] annotateProperty -- RDF 1.2 reified annotation. Body: { property, annotation: {value, note?, eventType}, actor }.' },
+      { method: 'GET',  path: '/holon/:iri/contents',   description: '[LIFECYCLE] listHolonContents -- read-only SPARQL SELECT/CONSTRUCT scoped to the holon\'s scene graph. Query params: actorIri (required), typeFilter?, includeChildren?.' },
+      { method: 'POST', path: '/holon/:iri/metadata',   description: '[LIFECYCLE] editMetadata -- title/description/status on the holon\'s registry record. Body: { patch: {title?, description?, status?}, actor }.' },
+      { method: 'DELETE', path: '/holon/:iri',          description: '[LIFECYCLE] deleteHolon -- tombstones (status -> Tombstoned); event graph untouched. Body: { actor }.' },
+      { method: 'POST', path: '/holon/:iri/purge',      description: '[LIFECYCLE] purgeHolon -- hard GC on an already-Tombstoned holon. Body: { actor, confirm: true }.' },
+      { method: 'POST', path: '/holon/:iri/agent',      description: '[LIFECYCLE] designateAgent -- grants a RoleBinding. Body: { agent: {iri, name, kind, capability: [...]}, grantedBy: {iri, role?} }.' },
+      { method: 'POST', path: '/holon/:iri/move',       description: '[LIFECYCLE] moveHolon -- reparents :iri to newParentIri. Containment-role-aware: detects and preserves whichever predicate (e.g. geo:administrativePartOf) the existing link uses, rather than overwriting it with a generic one. Body: { newParentIri, actor: {iri, role?}, force?: boolean }.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
@@ -1796,7 +1813,7 @@ ORDER BY ?g`
 //   format (optional) -- "turtle" (default) or "trig"
 //
 // Example: GET /graph?iri=https%3A%2F%2Fw3id.org%2Fggsc%2Fchloe%2Fpersons
-
+//
 app.get('/graph', async (req, res) => {
   const { iri, format = 'turtle' } = req.query
 
@@ -2417,6 +2434,250 @@ app.get('/holon/:iri', async (req, res) => {
   await getHolonHandler(req, res, { JENA_SPARQL, DATASET })
 })
 
+// -- Lifecycle verbs (P4) -------------------------------------------------------
+//
+// Thin REST wrappers around lib/lifecycle.js's twelve holon lifecycle verbs.
+// Wired 2026-07-09 -- previously lib/lifecycle.js existed but no route ever
+// called it. Every mutating verb requires an explicit actor in the request
+// body -- { actor: { iri, role? } } -- since this bridge has no per-request
+// user identity beyond the shared Bearer token. The actor IRI is what ends
+// up in prov:wasGeneratedBy and in RoleBinding capability checks; callers
+// are responsible for supplying the right one.
+//
+// STATUS: createRootHolon through listHolonContents (the first eight verbs)
+// assume the per-holon schema/scene/events graph triad lib/lifecycle.js's
+// graphsFor() mints -- no live dataset currently uses that topology (see
+// lib/holon.js's header). Calling those against an existing flat-graph
+// holon (e.g. a geo:Country) mints new, disconnected {iri}/schema etc.
+// graphs alongside the real data rather than operating on it. editMetadata,
+// deleteHolon, purgeHolon, designateAgent, and moveHolon are graph-topology-
+// agnostic (or touch only a per-holon scene graph that harmlessly doesn't
+// exist for flat-graph holons) and are the ones actually verified against
+// live Adventure Mode data so far -- see this session's chat history for
+// the France/Europe/Earth/home RoleBinding walk that confirmed moveHolon's
+// authorisation path end-to-end.
+//
+// Errors: CommandRejected -> 409, UnauthorisedError -> 403, else -> 500.
+
+function getLifecycleConn() {
+  return { sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP, jenaBase: JENA_BASE, dataset: DATASET }
+}
+
+function requireActor(body, field = 'actor') {
+  const actor = body?.[field]
+  if (!actor || typeof actor !== 'object' || !actor.iri || typeof actor.iri !== 'string')
+    throw { status: 400, body: { error: `"${field}" is required and must be an object: { iri, role? }.` } }
+  return actor
+}
+
+function handleLifecycleError(err, res) {
+  if (err && typeof err.status === 'number' && err.body) return res.status(err.status).json(err.body)
+  if (err instanceof CommandRejected)
+    return res.status(409).json({ error: err.message, commandType: err.commandType })
+  if (err instanceof UnauthorisedError)
+    return res.status(403).json({ error: err.message, actorIri: err.actorIri, holonIri: err.holonIri, capability: err.capability })
+  console.error('[Bridge] Lifecycle verb error:', err)
+  return res.status(500).json({ error: 'Internal bridge error', message: err.message })
+}
+
+// -- POST /holon -- createRootHolon -----------------------------------------------
+//
+// Body: { baseIri, label, actor: {iri, role?}, rootLocked?: boolean }
+
+app.post('/holon', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { baseIri, label, rootLocked } = req.body ?? {}
+    if (!baseIri || typeof baseIri !== 'string' || !label || typeof label !== 'string')
+      return res.status(400).json({ error: '"baseIri" and "label" are required strings.' })
+    const doc = await createRootHolon(getLifecycleConn(), { baseIri, label, actor, rootLocked })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/schema -- addSchema ------------------------------------------
+//
+// Body: { schemaDataBook: { markdown }, actor }
+
+app.post('/holon/:iri/schema', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { schemaDataBook } = req.body ?? {}
+    if (!schemaDataBook?.markdown || typeof schemaDataBook.markdown !== 'string')
+      return res.status(400).json({ error: '"schemaDataBook.markdown" is required.' })
+    const doc = await addSchema(getLifecycleConn(), req.params.iri, schemaDataBook, actor)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/entity -- addEntity ------------------------------------------
+//
+// Body: { entityDataBook: { markdown }, actor }
+
+app.post('/holon/:iri/entity', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { entityDataBook } = req.body ?? {}
+    if (!entityDataBook?.markdown || typeof entityDataBook.markdown !== 'string')
+      return res.status(400).json({ error: '"entityDataBook.markdown" is required.' })
+    const doc = await addEntity(getLifecycleConn(), req.params.iri, entityDataBook, actor)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /entity/:iri/promote -- promoteEntity ------------------------------------
+//
+// Body: { childBaseIri?, actor }
+// Response: { parent: <databook markdown>, child: <databook markdown> }
+
+app.post('/entity/:iri/promote', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { childBaseIri } = req.body ?? {}
+    const result = await promoteEntity(getLifecycleConn(), req.params.iri, { childBaseIri, actor })
+    return res.json({ parent: result.parent, child: result.child })
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/projection -- addProjection -----------------------------------
+//
+// Body: { spec: { queryIri, promptBlockIri?, mode: 'eager'|'lazy', clientMode }, actor }
+
+app.post('/holon/:iri/projection', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { spec } = req.body ?? {}
+    if (!spec?.queryIri || !spec?.mode || !spec?.clientMode)
+      return res.status(400).json({ error: '"spec.queryIri", "spec.mode", and "spec.clientMode" are required.' })
+    const doc = await addProjection(getLifecycleConn(), req.params.iri, spec, actor)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /entity/:iri/modify -- modifyEntity --------------------------------------
+//
+// Body: { patchDataBook: { markdown }, actor }
+
+app.post('/entity/:iri/modify', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { patchDataBook } = req.body ?? {}
+    if (!patchDataBook?.markdown || typeof patchDataBook.markdown !== 'string')
+      return res.status(400).json({ error: '"patchDataBook.markdown" is required.' })
+    const doc = await modifyEntity(getLifecycleConn(), req.params.iri, patchDataBook, actor)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /entity/:iri/annotate -- annotateProperty --------------------------------
+//
+// Body: { property, annotation: { value, note?, eventType: 'AssertionEvent'|'CommandEvent' }, actor }
+
+app.post('/entity/:iri/annotate', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { property, annotation } = req.body ?? {}
+    if (!property || typeof property !== 'string' || !annotation || annotation.value === undefined || !annotation.eventType)
+      return res.status(400).json({ error: '"property" (string) and "annotation.{value,eventType}" are required.' })
+    const doc = await annotateProperty(getLifecycleConn(), req.params.iri, property, annotation, actor)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- GET /holon/:iri/contents -- listHolonContents ----------------------------------
+//
+// Read-only. Query params: actorIri (required), typeFilter?, includeChildren?
+
+app.get('/holon/:iri/contents', async (req, res) => {
+  try {
+    const { actorIri, typeFilter, includeChildren } = req.query
+    if (!actorIri || typeof actorIri !== 'string')
+      return res.status(400).json({ error: 'Query param "actorIri" is required.' })
+    const doc = await listHolonContents(getLifecycleConn(), req.params.iri, {
+      typeFilter: typeFilter || undefined,
+      includeChildren: includeChildren === 'true',
+      actor: { iri: actorIri }
+    })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/metadata -- editMetadata --------------------------------------
+//
+// Body: { patch: { title?, description?, status?: 'Candidate'|'Registered'|'Tombstoned' }, actor }
+
+app.post('/holon/:iri/metadata', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { patch } = req.body ?? {}
+    if (!patch || typeof patch !== 'object')
+      return res.status(400).json({ error: '"patch" is required.' })
+    const doc = await editMetadata(getLifecycleConn(), req.params.iri, patch, actor)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- DELETE /holon/:iri -- deleteHolon ------------------------------------------------
+//
+// Body: { actor }. Tombstones (status -> Tombstoned); event graph untouched.
+
+app.delete('/holon/:iri', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const doc = await deleteHolon(getLifecycleConn(), req.params.iri, { actor })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/purge -- purgeHolon ---------------------------------------------
+//
+// Body: { actor, confirm: true }. Hard GC on an already-Tombstoned holon.
+
+app.post('/holon/:iri/purge', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { confirm } = req.body ?? {}
+    await purgeHolon(getLifecycleConn(), req.params.iri, { actor, confirm })
+    return res.json({ purged: true, iri: req.params.iri })
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/agent -- designateAgent -----------------------------------------
+//
+// Body: { agent: { iri, name, kind: 'Agent'|'Persona'|'Actor', capability: [...] }, grantedBy: { iri, role? } }
+
+app.post('/holon/:iri/agent', async (req, res) => {
+  try {
+    const grantedBy = requireActor(req.body, 'grantedBy')
+    const { agent } = req.body ?? {}
+    if (!agent?.iri || !agent?.name || !agent?.kind || !Array.isArray(agent?.capability))
+      return res.status(400).json({ error: '"agent.{iri,name,kind,capability[]}" are required.' })
+    const doc = await designateAgent(getLifecycleConn(), req.params.iri, agent, grantedBy)
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /holon/:iri/move -- moveHolon -----------------------------------------------
+//
+// Body: { newParentIri, actor: {iri, role?}, force?: boolean }
+//
+// Reparents :iri to newParentIri. Containment-role-aware (see lib/lifecycle.js):
+// detects and preserves whichever predicate (e.g. geo:administrativePartOf)
+// the existing link uses, rather than replacing it with a generic one.
+
+app.post('/holon/:iri/move', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { newParentIri, force } = req.body ?? {}
+    if (!newParentIri || typeof newParentIri !== 'string')
+      return res.status(400).json({ error: '"newParentIri" is required.' })
+    const doc = await moveHolon(getLifecycleConn(), req.params.iri, { newParentIri, actor, force })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- end lifecycle verbs -----------------------------------------------------------
+
 // -- 404 fallback --------------------------------------------------------------
 
 app.use((_req, res) => {
@@ -2432,6 +2693,12 @@ app.use((_req, res) => {
       'GET  /message/:id', 'GET  /description', 'GET  /health',
         'POST /validate',
         'GET  /holon', 'GET  /holon/:iri',
+        'POST /holon', 'POST /holon/:iri/schema', 'POST /holon/:iri/entity',
+        'POST /entity/:iri/promote', 'POST /holon/:iri/projection',
+        'POST /entity/:iri/modify', 'POST /entity/:iri/annotate',
+        'GET  /holon/:iri/contents', 'POST /holon/:iri/metadata',
+        'DELETE /holon/:iri', 'POST /holon/:iri/purge',
+        'POST /holon/:iri/agent', 'POST /holon/:iri/move',
         'GET  /registry', 'POST /registry/refresh'
     ]
   })
