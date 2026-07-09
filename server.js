@@ -76,6 +76,7 @@ import { getHolonHandler }                                          from './lib/
 import { createRootHolon, addSchema, addEntity, promoteEntity, addProjection,
          modifyEntity, annotateProperty, listHolonContents, editMetadata,
          deleteHolon, purgeHolon, designateAgent, moveHolon,
+         proposeAgentPropertyUpdate,
          CommandRejected, UnauthorisedError }                        from './lib/lifecycle.js'
 import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
 import { initSession, loadRegistryCache,
@@ -1257,6 +1258,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/holon/:iri/purge',      description: '[LIFECYCLE] purgeHolon -- hard GC on an already-Tombstoned holon. Body: { actor, confirm: true }.' },
       { method: 'POST', path: '/holon/:iri/agent',      description: '[LIFECYCLE] designateAgent -- grants a RoleBinding. Body: { agent: {iri, name, kind, capability: [...]}, grantedBy: {iri, role?} }.' },
       { method: 'POST', path: '/holon/:iri/move',       description: '[LIFECYCLE] moveHolon -- reparents :iri to newParentIri. Containment-role-aware: detects and preserves whichever predicate (e.g. geo:administrativePartOf) the existing link uses, rather than overwriting it with a generic one. Body: { newParentIri, actor: {iri, role?}, force?: boolean }.' },
+      { method: 'POST', path: '/holon/:iri/property',   description: '[LIFECYCLE] proposeAgentPropertyUpdate -- propose->validate->apply a delta to a numeric agent property (e.g. schema:healthPoints, schema:currentWealth). Validated against the property\'s governing SHACL shape (e.g. AgentHealthShape, AgentWealthShape) BEFORE any write; a rejection (409) leaves no trace. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair to the events graph plus the new value on the agent. Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
@@ -2676,6 +2678,36 @@ app.post('/holon/:iri/move', async (req, res) => {
   } catch (err) { return handleLifecycleError(err, res) }
 })
 
+// -- POST /holon/:iri/property -- proposeAgentPropertyUpdate ---------------------------
+//
+// Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }
+//
+// Propose->validate->apply a delta to a numeric agent property (e.g.
+// schema:healthPoints, schema:currentWealth). Validated against whatever
+// SHACL shape governs that property BEFORE anything is written -- a
+// rejected proposal (409) leaves no trace in either the holons or events
+// graph. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair
+// to urn:{dataset}:events and the new value to urn:{dataset}:holons.
+// Operates on the flat Adventure-Mode-style graphs, not the per-holon
+// schema/scene/events triad the rest of this verb family assumes.
+
+app.post('/holon/:iri/property', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { property, delta, rationale, capProperty, floor } = req.body ?? {}
+    if (!property || typeof property !== 'string')
+      return res.status(400).json({ error: '"property" (full IRI) is required.' })
+    if (typeof delta !== 'number' || !Number.isFinite(delta))
+      return res.status(400).json({ error: '"delta" must be a finite number.' })
+    if (!rationale || typeof rationale !== 'string')
+      return res.status(400).json({ error: '"rationale" is required.' })
+    const doc = await proposeAgentPropertyUpdate(getLifecycleConn(), req.params.iri, {
+      property, delta, rationale, actor, capProperty, floor
+    })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
 // -- end lifecycle verbs -----------------------------------------------------------
 
 // -- 404 fallback --------------------------------------------------------------
@@ -2698,7 +2730,7 @@ app.use((_req, res) => {
         'POST /entity/:iri/modify', 'POST /entity/:iri/annotate',
         'GET  /holon/:iri/contents', 'POST /holon/:iri/metadata',
         'DELETE /holon/:iri', 'POST /holon/:iri/purge',
-        'POST /holon/:iri/agent', 'POST /holon/:iri/move',
+        'POST /holon/:iri/agent', 'POST /holon/:iri/move', 'POST /holon/:iri/property',
         'GET  /registry', 'POST /registry/refresh'
     ]
   })
