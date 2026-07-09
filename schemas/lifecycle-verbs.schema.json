@@ -272,7 +272,7 @@
       "requiresCapability": "Grant"
     },
     "moveHolon": {
-      "description": "Reparents a holon -- changes holon:parentHolon from its current value (if any) to newParentIri. A structural containment-tree move, distinct from tracking an agent's current position within a scene. Holons flagged holon:rootLocked true (typically set via createRootHolon's rootLocked param) refuse the move unless force is true, guarding intentional root structures (registries, corridor spines, journeys indexes) against accidental reparenting.",
+      "description": "Reparents a holon -- changes holon:isPartOf (aligned 2026-07-09 from an earlier holon:parentHolon predicate to match the containment predicate actually populated in live datasets) from its current value (if any) to newParentIri. A structural containment-tree move, distinct from tracking an agent's current position within a scene. Holons flagged holon:rootLocked true (typically set via createRootHolon's rootLocked param) refuse the move unless force is true, guarding intentional root structures (registries, corridor spines, journeys indexes) against accidental reparenting. Note isPartOf is sparsely populated by design in most datasets -- a holon with no existing parent is common, not an error.",
       "params": {
         "type": "object",
         "properties": {
