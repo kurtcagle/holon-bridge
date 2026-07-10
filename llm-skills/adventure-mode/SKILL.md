@@ -259,13 +259,21 @@ substitutes for it.
   `ti-user` agents).
 - **One-line description** — `holon:description` if present, else
   `rdfs:comment`.
-- **Up / Back row** — two buttons side by side.
+- **Up / Back row** — two buttons side by side. Each shows the
+  direction icon plus the *target's* label and type tag, not just the
+  bare word "Up"/"Back" — e.g. "Up — Italy (Country)" and "Back —
+  Vaticano (GeoFeature)". The generic word still anchors the icon (via
+  `aria-label` at minimum) so the direction reads clearly even when
+  scanning quickly, but the visible text always names where the
+  button actually goes.
 - **Previous / Next row** — a second row, directly below Up/Back,
   visually distinguished (e.g. `ti-chevron-left`/`ti-chevron-right`
   icons instead of `ti-arrow-up`/`ti-corner-up-left`) so it doesn't
-  read as a duplicate of Up/Back. Disable with "No previous scene" /
-  "Story continues here" style labels when absent, same disable-not-hide
-  rule as Up/Back.
+  read as a duplicate of Up/Back. Same labeling rule as Up/Back —
+  "Previous — Florence (City)", "Next — Vaticano (GeoFeature)" — not
+  bare "Previous"/"Next". Disable with "No previous scene" / "Story
+  continues here" style labels when absent, same disable-not-hide rule
+  as Up/Back.
 - **Scene section** — muted label "Scene — direct children", one
   full-width button per child (label + type tag + trailing `↗`). If
   there are none, keep the heading and show a muted "None yet at this
@@ -289,12 +297,12 @@ substitutes for it.
   </div>
   <p style="font-size:14px; color:var(--text-secondary); margin:0 0 1.25rem;">[One-line description]</p>
   <div style="display:flex; gap:8px; margin-bottom:0.5rem;">
-    <button onclick="sendPrompt('Go to holon [parent IRI]')" style="flex:1;"><i class="ti ti-arrow-up" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Up</button>
-    <button onclick="sendPrompt('Go to holon [previous-visited IRI]')" style="flex:1;"><i class="ti ti-corner-up-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Back</button>
+    <button onclick="sendPrompt('Go to holon [parent IRI]')" style="flex:1;" aria-label="Up"><i class="ti ti-arrow-up" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Up — [parent label] <span style="font-size:12px; color:var(--text-muted);">([parent type])</span></button>
+    <button onclick="sendPrompt('Go to holon [previous-visited IRI]')" style="flex:1;" aria-label="Back"><i class="ti ti-corner-up-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Back — [back-target label] <span style="font-size:12px; color:var(--text-muted);">([back-target type])</span></button>
   </div>
   <div style="display:flex; gap:8px; margin-bottom:1.25rem;">
-    <button onclick="sendPrompt('Go to holon [narration-previous IRI]')" style="flex:1;"><i class="ti ti-chevron-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Previous</button>
-    <button onclick="sendPrompt('Go to holon [narration-next IRI]')" style="flex:1;"><i class="ti ti-chevron-right" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Next</button>
+    <button onclick="sendPrompt('Go to holon [narration-previous IRI]')" style="flex:1;" aria-label="Previous"><i class="ti ti-chevron-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Previous — [prev label] <span style="font-size:12px; color:var(--text-muted);">([prev type])</span></button>
+    <button onclick="sendPrompt('Go to holon [narration-next IRI]')" style="flex:1;" aria-label="Next">Next — [next label] <span style="font-size:12px; color:var(--text-muted);">([next type])</span><i class="ti ti-chevron-right" style="font-size:16px; vertical-align:-3px; margin-left:6px;" aria-hidden="true"></i></button>
   </div>
   <div style="font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Scene — direct children</div>
   <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:1.25rem;">
