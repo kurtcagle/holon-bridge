@@ -48,6 +48,17 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-10 v1.12.0 Add create_agent tool, wrapping HolonBridge's
+ *                      lifecycle verb createAgent (POST /agent,
+ *                      lib/lifecycle.js). Second lifecycle verb exposed
+ *                      through this MCP remote (after propose_property_update
+ *                      in v1.11.0). Mints an Agent holon with baseline
+ *                      values for its trackable properties, writing a
+ *                      CreationEvent plus one PropertyBaselineEvent per
+ *                      property -- closes the provenance gap where every
+ *                      Adventure Mode agent up to this point had
+ *                      healthPoints/currentWealth asserted as bare triples
+ *                      with no event-graph record of their starting values.
  *   2026-07-09 v1.11.0 Add propose_property_update tool, wrapping HolonBridge's
  *                      lifecycle verb proposeAgentPropertyUpdate (POST
  *                      /holon/:iri/property, lib/lifecycle.js). Before this,
@@ -298,6 +309,34 @@ async function hbProposePropertyUpdate(agentIri, property, delta, rationale, act
 }
 
 /**
+ * Mint a new Agent holon via HolonBridge's createAgent lifecycle verb
+ * (POST /agent, lib/lifecycle.js). Writes a CreationEvent plus one
+ * PropertyBaselineEvent per trackable property; each property's governing
+ * shape/capProperty/floor resolves from ontology metadata unless overridden
+ * per-property in trackableProperties. A single baseline that violates its
+ * shape rejects the whole creation -- surfaced here as a thrown Error
+ * carrying the response body (409 with violation detail, not a silent
+ * partial write).
+ */
+async function hbCreateAgent(agentIri, label, agentKind, actorIri, description, extraTurtle, trackableProperties) {
+  const url = `${activeBaseUrl()}/agent`;
+  const body = { agentIri, label, agentKind, actor: { iri: actorIri } };
+  if (description !== undefined) body.description = description;
+  if (extraTurtle !== undefined) body.extraTurtle = extraTurtle;
+  if (trackableProperties !== undefined) body.trackableProperties = trackableProperties;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`HolonBridge /agent: HTTP ${res.status} — ${text.slice(0, 400)}`);
+  }
+  return text;
+}
+
+/**
  * Validate a Turtle payload against a SHACL shapes graph.
  *
  * The current /validate route (lib/validate.js, v2.9.1+) only validates a
@@ -479,7 +518,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.11.0',
+    version: '1.12.0',
   });
 
   srv.tool(
@@ -627,6 +666,46 @@ function createMcpServer() {
     },
     async ({ agent_iri, property, delta, rationale, actor_iri, cap_property, floor }) => {
       const result = await hbProposePropertyUpdate(agent_iri, property, delta, rationale, actor_iri, cap_property, floor);
+      return { content: [{ type: 'text', text: result }] };
+    }
+  );
+
+  srv.tool(
+    'create_agent',
+    "Mint a new Agent holon via HolonBridge's createAgent lifecycle verb (POST /agent). " +
+    'Writes a holon:CreationEvent plus one holon:PropertyBaselineEvent per trackable ' +
+    "property, closing the provenance gap where an agent's starting healthPoints/" +
+    'currentWealth would otherwise be asserted as bare triples with no event-graph record. ' +
+    "Each trackable property's governing shape/capProperty/floor resolves from ontology " +
+    'metadata (holon:governedByShape/holon:capProperty/holon:floor) unless overridden ' +
+    'per-property. A single baseline that violates its shape rejects the ENTIRE creation ' +
+    '(no partial agent). extra_turtle is for static, non-tracked properties (species, ' +
+    'gender, currentLocation, etc.) that do not need baseline events -- append raw Turtle ' +
+    'triples with <agent_iri> as the implied subject.',
+    {
+      agent_iri:  z.string().describe('IRI for the new agent'),
+      label:      z.string().describe('rdfs:label for the agent, e.g. "Lina"'),
+      agent_kind: z.string().describe('holon:agentKind value, e.g. "npc" or "player"'),
+      actor_iri:  z.string().describe('IRI of the actor creating this agent (holon:agent / prov:wasGeneratedBy)'),
+      description: z.string().optional().describe('Optional holon:description for the agent'),
+      extra_turtle: z.string().optional().describe('Optional raw Turtle for static, non-tracked properties on the agent'),
+      trackable_properties: z.array(z.object({
+        property:     z.string().describe('Full IRI of the trackable property, e.g. https://schema.org/currentWealth'),
+        value:        z.number().describe('Baseline value'),
+        cap_property: z.string().optional().describe('Override the ontology-declared cap property'),
+        cap_value:    z.number().optional().describe("The cap property's own starting value (e.g. maxHealthPoints), required if this property has a capProperty"),
+        floor:        z.number().optional().describe('Override the ontology-declared floor'),
+      })).optional().describe('Baseline values for trackable properties (e.g. healthPoints, currentWealth)'),
+    },
+    async ({ agent_iri, label, agent_kind, actor_iri, description, extra_turtle, trackable_properties }) => {
+      const mapped = trackable_properties?.map(tp => ({
+        property: tp.property,
+        value: tp.value,
+        ...(tp.cap_property !== undefined ? { capProperty: tp.cap_property } : {}),
+        ...(tp.cap_value !== undefined ? { capValue: tp.cap_value } : {}),
+        ...(tp.floor !== undefined ? { floor: tp.floor } : {}),
+      }));
+      const result = await hbCreateAgent(agent_iri, label, agent_kind, actor_iri, description, extra_turtle, mapped);
       return { content: [{ type: 'text', text: result }] };
     }
   );
@@ -867,7 +946,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.11.0',
+    version: '1.12.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -880,7 +959,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.11.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.12.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
