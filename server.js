@@ -77,6 +77,7 @@ import { createRootHolon, addSchema, addEntity, promoteEntity, addProjection,
          modifyEntity, annotateProperty, listHolonContents, editMetadata,
          deleteHolon, purgeHolon, designateAgent, moveHolon,
          proposeAgentPropertyUpdate, createAgent,
+         formGroup, joinGroup, leaveGroup,
          CommandRejected, UnauthorisedError }                        from './lib/lifecycle.js'
 import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
 import { initSession, loadRegistryCache,
@@ -1260,6 +1261,9 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/holon/:iri/move',       description: '[LIFECYCLE] moveHolon -- reparents :iri to newParentIri. Containment-role-aware: detects and preserves whichever predicate (e.g. geo:administrativePartOf) the existing link uses, rather than overwriting it with a generic one. Body: { newParentIri, actor: {iri, role?}, force?: boolean }.' },
       { method: 'POST', path: '/holon/:iri/property',   description: '[LIFECYCLE] proposeAgentPropertyUpdate -- propose->validate->apply a delta to a numeric agent property (e.g. schema:healthPoints, schema:currentWealth). Validated against the property\'s governing SHACL shape (e.g. AgentHealthShape, AgentWealthShape) BEFORE any write; a rejection (409) leaves no trace. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair to the events graph plus the new value on the agent. Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }.' },
       { method: 'POST', path: '/agent',                 description: '[LIFECYCLE] createAgent -- mints an Agent holon with baseline values for its trackable properties, writing a holon:CreationEvent plus one holon:PropertyBaselineEvent per property. Each property\'s governing shape/capProperty/floor resolves from ontology metadata (holon:governedByShape/holon:capProperty/holon:floor) unless overridden. One violating baseline rejects the whole creation (409) -- no partial agent. Body: { agentIri, label, agentKind, description?, extraTurtle?, trackableProperties?: [{property, value, capProperty?, capValue?, floor?}], actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group',                 description: '[LIFECYCLE] formGroup -- creates a holon:Group, a spatial/co-location carrier (tour party, vehicle passengers) distinct from an organizational Team/Corporation (capability/authority, modeled via RoleBinding). Forms at the active member\'s current location; every initial member\'s own currentLocation is removed in favor of the group\'s. Exactly one initial member must be active. Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group/:iri/join',        description: '[LIFECYCLE] joinGroup -- adds a member to an existing group; their own currentLocation is removed, defaulting to isActive false. Body: { memberIri, actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group/:iri/leave',       description: '[LIFECYCLE] leaveGroup -- removes a member, restoring their own currentLocation (copied from the group\'s). If the leaving member is active and others remain, handoffTo is required naming a successor. Auto-dissolves (tombstones) the group once membership drops to one, restoring that sole member\'s independent currentLocation. Body: { memberIri, actor: {iri, role?}, handoffTo?: string }.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
@@ -2750,6 +2754,72 @@ app.post('/agent', async (req, res) => {
   } catch (err) { return handleLifecycleError(err, res) }
 })
 
+// -- POST /group -- formGroup ---------------------------------------------------
+//
+// Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }
+//
+// Creates a holon:Group -- a spatial/co-location carrier (tour party,
+// vehicle passengers), distinct from an organizational Team/Corporation
+// (capability/authority, modeled via RoleBinding). Forms at the active
+// member's current location; every initial member's own currentLocation is
+// removed in favor of the group's. Exactly one initial member must be
+// active; the rest are forced inactive as part of joining.
+
+app.post('/group', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { groupIri, label, memberIris, activeMemberIri } = req.body ?? {}
+    if (!groupIri || typeof groupIri !== 'string')
+      return res.status(400).json({ error: '"groupIri" is required.' })
+    if (!label || typeof label !== 'string')
+      return res.status(400).json({ error: '"label" is required.' })
+    if (!Array.isArray(memberIris) || memberIris.length === 0)
+      return res.status(400).json({ error: '"memberIris" must be a non-empty array.' })
+    if (!activeMemberIri || typeof activeMemberIri !== 'string')
+      return res.status(400).json({ error: '"activeMemberIri" is required.' })
+    const doc = await formGroup(getLifecycleConn(), { groupIri, label, memberIris, activeMemberIri, actor })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /group/:iri/join -- joinGroup ------------------------------------------
+//
+// Body: { memberIri, actor: {iri, role?} }
+//
+// Adds a member to an existing group. The member's own currentLocation is
+// removed; they default to isActive false.
+
+app.post('/group/:iri/join', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { memberIri } = req.body ?? {}
+    if (!memberIri || typeof memberIri !== 'string')
+      return res.status(400).json({ error: '"memberIri" is required.' })
+    const doc = await joinGroup(getLifecycleConn(), req.params.iri, memberIri, { actor })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
+// -- POST /group/:iri/leave -- leaveGroup ----------------------------------------
+//
+// Body: { memberIri, actor: {iri, role?}, handoffTo?: string }
+//
+// Removes a member, restoring their own currentLocation (copied from the
+// group's). If the leaving member is active and others remain, handoffTo
+// is required. Auto-dissolves (tombstones) the group once membership drops
+// to one, restoring that sole member's independent currentLocation.
+
+app.post('/group/:iri/leave', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { memberIri, handoffTo } = req.body ?? {}
+    if (!memberIri || typeof memberIri !== 'string')
+      return res.status(400).json({ error: '"memberIri" is required.' })
+    const doc = await leaveGroup(getLifecycleConn(), req.params.iri, memberIri, { actor, handoffTo })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
 // -- end lifecycle verbs -----------------------------------------------------------
 
 // -- 404 fallback --------------------------------------------------------------
@@ -2773,6 +2843,7 @@ app.use((_req, res) => {
         'GET  /holon/:iri/contents', 'POST /holon/:iri/metadata',
         'DELETE /holon/:iri', 'POST /holon/:iri/purge',
         'POST /holon/:iri/agent', 'POST /holon/:iri/move', 'POST /holon/:iri/property', 'POST /agent',
+        'POST /group', 'POST /group/:iri/join', 'POST /group/:iri/leave',
         'GET  /registry', 'POST /registry/refresh'
     ]
   })
