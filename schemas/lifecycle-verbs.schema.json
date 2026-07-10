@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://w3id.org/holon/schemas/lifecycle-verbs.schema.json",
   "title": "Holon Lifecycle Verb Signatures",
-  "description": "Source-of-truth contract for the twelve holon lifecycle verbs. The JS library (lib/lifecycle.js) and any future Python bindings are both generated consumers of this schema, not independent implementations. Namespace: https://w3id.org/holon/ (intentionally ahead of the older https://ontologist.io/ns/holon# namespace used by the sce/HGA spec pending reconciliation).",
+  "description": "Source-of-truth contract for the seventeen holon lifecycle verbs. The JS library (lib/lifecycle.js) and any future Python bindings are both generated consumers of this schema, not independent implementations. Namespace: https://w3id.org/holon/ (intentionally ahead of the older https://ontologist.io/ns/holon# namespace used by the sce/HGA spec pending reconciliation). Verbs 1-12 operate on the per-holon schema/scene/events graph triad (graphsFor()); verbs 13-17 operate on the flat urn:{dataset}:holons/:events/:ontology graphs used by Adventure-Mode-style datasets, taking conn.dataset (plus optional holonsGraph/eventsGraph/ontologyGraph/shapesGraph overrides) instead of a holonIri-derived graph set.",
   "$defs": {
     "ActorRef": {
       "type": "object",
@@ -42,6 +42,19 @@
         "markdown": { "type": "string" }
       },
       "required": ["markdown"],
+      "additionalProperties": false
+    },
+    "TrackablePropertyInput": {
+      "type": "object",
+      "description": "One baseline value for a holon:trackableProperty at agent-creation time. property/capProperty/floor default from the property's own ontology metadata (holon:governedByShape, holon:capProperty, holon:floor) when omitted -- callers only need to override when a specific agent departs from the property's declared default governance.",
+      "properties": {
+        "property": { "type": "string", "format": "iri" },
+        "value": { "type": "number" },
+        "capProperty": { "type": "string", "format": "iri" },
+        "capValue": { "type": "number" },
+        "floor": { "type": "number" }
+      },
+      "required": ["property", "value"],
       "additionalProperties": false
     }
   },
@@ -286,6 +299,100 @@
       "returns": { "$ref": "#/$defs/DataBookRef" },
       "commandType": "holon:MoveHolonCommand",
       "requiresCapability": "Write"
+    },
+    "proposeAgentPropertyUpdate": {
+      "description": "Propose, validate, and (if valid) apply a delta to a numeric agent property governed by a SHACL shape (e.g. schema:healthPoints, schema:currentWealth) -- a bounded number that moves by discrete deltas (heal/damage, earn/spend). Validate-before-write: the proposed value (previous + delta, clamped to capProperty's current value if given, floored at floor, default 0) is checked against the governing shape using an isolated single-property payload BEFORE any triple is written; a violation throws CommandRejected and leaves no trace -- never an unapproved holon:ModelUpdateRequest, never a partial state change. On success writes a holon:ModelUpdateRequest (requestStatus already 'approved') paired with a holon:ModelUpdateApprove referencing it via holon:appliesRequest, then applies the property write. Operates on the flat urn:{dataset}:holons/:events graphs (conn.holonsGraph/eventsGraph override the urn:{dataset}: defaults); conn.shapesGraph defaults to urn:{dataset}:shacl. Unlike most other verbs in this file, this verb does not call authorise() -- no capability gate is currently enforced.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "agentIri": { "type": "string", "format": "iri" },
+          "property": { "type": "string", "format": "iri" },
+          "delta": { "type": "number" },
+          "rationale": { "type": "string" },
+          "actor": { "$ref": "#/$defs/ActorRef" },
+          "capProperty": { "type": "string", "format": "iri" },
+          "floor": { "type": "number", "default": 0 }
+        },
+        "required": ["agentIri", "property", "delta", "rationale", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:ModelUpdateRequest",
+      "requiresCapability": null
+    },
+    "createAgent": {
+      "description": "Mints a new holon:Agent with baseline values for its trackable properties, writing a holon:CreationEvent plus one holon:PropertyBaselineEvent per trackable property (linked via the instance-level holon:derivedFromEvent). Closes the provenance gap where earlier Adventure Mode agents had trackable properties asserted as bare triples with no event-graph record of their starting values. Each trackableProperties entry resolves its governing shape/capProperty/floor from the property's own holon:trackableProperty ontology metadata unless the caller overrides them; a capProperty's own value (capValue) must be supplied by the caller since there is no live agent yet to query a current cap from. Validate-before-write, no exceptions: every baseline is checked against its governing shape before anything is written -- a single violating baseline rejects the whole creation, never a partial agent. Operates on the flat urn:{dataset}:holons/:events/:ontology graphs (conn.holonsGraph/eventsGraph/ontologyGraph/shapesGraph override the urn:{dataset}: defaults). Does not call authorise() -- no capability gate is currently enforced.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "agentIri": { "type": "string", "format": "iri" },
+          "label": { "type": "string" },
+          "agentKind": { "type": "string" },
+          "description": { "type": "string" },
+          "extraTurtle": { "type": "string" },
+          "trackableProperties": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/TrackablePropertyInput" },
+            "default": []
+          },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["agentIri", "label", "agentKind", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:CreateAgentCommand",
+      "requiresCapability": null
+    },
+    "formGroup": {
+      "description": "Creates a holon:Group -- a purely spatial/co-location carrier (a tour party, a vehicle's passengers), deliberately distinct from an organizational Team or Corporation (capability/authority, modeled via holon:RoleBinding, not location). The group forms at activeMemberIri's current holon:currentLocation (required -- rejects if that member has none); every initial member has their own holon:currentLocation removed in favour of the group's location as single source of truth, and is written holon:isActive true/false per whether they are activeMemberIri. Exactly one initial member must be active; memberIris must be duplicate-free and must include activeMemberIri. Operates on the flat urn:{dataset}:holons/:events graphs. Does not call authorise() -- no capability gate is currently enforced.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "groupIri": { "type": "string", "format": "iri" },
+          "label": { "type": "string" },
+          "memberIris": {
+            "type": "array",
+            "items": { "type": "string", "format": "iri" },
+            "minItems": 1
+          },
+          "activeMemberIri": { "type": "string", "format": "iri" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["groupIri", "label", "memberIris", "activeMemberIri", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:GroupFormedEvent",
+      "requiresCapability": null
+    },
+    "joinGroup": {
+      "description": "Adds a member to an existing, non-tombstoned holon:Group. Rejects if memberIri already belongs to a group (leaveGroup first). The member's own holon:currentLocation is removed (the group's location is authoritative while grouped) and they are linked via holon:memberOfGroup with holon:isActive false -- joinGroup never displaces the incumbent active member. Operates on the flat urn:{dataset}:holons/:events graphs. Does not call authorise() -- no capability gate is currently enforced.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "groupIri": { "type": "string", "format": "iri" },
+          "memberIri": { "type": "string", "format": "iri" },
+          "actor": { "$ref": "#/$defs/ActorRef" }
+        },
+        "required": ["groupIri", "memberIri", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:GroupJoinEvent",
+      "requiresCapability": null
+    },
+    "leaveGroup": {
+      "description": "Removes a member from a holon:Group, restoring their own holon:currentLocation from the group's current location. If the leaving member is active and other members remain, handoffTo is REQUIRED naming another current member to become active -- leaveGroup never silently picks a successor. If exactly one member remains after removal, the group auto-dissolves (tombstoned, not purged): that sole member's holon:memberOfGroup link is removed and their independent holon:currentLocation restored, and a holon:GroupDissolvedEvent is written alongside the holon:GroupLeaveEvent. Operates on the flat urn:{dataset}:holons/:events graphs. Does not call authorise() -- no capability gate is currently enforced.",
+      "params": {
+        "type": "object",
+        "properties": {
+          "groupIri": { "type": "string", "format": "iri" },
+          "memberIri": { "type": "string", "format": "iri" },
+          "actor": { "$ref": "#/$defs/ActorRef" },
+          "handoffTo": { "type": "string", "format": "iri" }
+        },
+        "required": ["groupIri", "memberIri", "actor"]
+      },
+      "returns": { "$ref": "#/$defs/DataBookRef" },
+      "commandType": "holon:GroupLeaveEvent",
+      "requiresCapability": null
     }
   }
 }
