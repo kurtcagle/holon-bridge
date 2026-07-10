@@ -133,6 +133,21 @@ let SHACL_REQUIRED = process.env.SHACL_REQUIRED !== undefined
   ? process.env.SHACL_REQUIRED === 'true'
   : (sessionState.shaclRequired ?? false)
 
+// DATASET_HOLON_IRI -- the anchor holon lib/lifecycle.js's flat-graph verbs
+// (proposeAgentPropertyUpdate, createAgent, formGroup, joinGroup, leaveGroup)
+// gate their capability checks against, via datasetAnchor(conn) in
+// lib/lifecycle.js. Explicit override only: process.env.DATASET_HOLON_IRI,
+// falling back to whatever was persisted from a prior POST
+// /dataset-holon-iri call, else null. When null, getLifecycleConn() omits
+// datasetHolonIri from conn entirely and lib/lifecycle.js's own
+// datasetAnchor() falls back to the urn:{dataset}:root convention -- so
+// the convention default lives in exactly one place (lib/lifecycle.js),
+// not duplicated here. Set this when a dataset already has a real
+// registered holon (e.g. a geography dataset's Earth root, or a
+// holon:Home instance) that should carry the RoleBinding instead of the
+// bare convention IRI.
+let DATASET_HOLON_IRI = process.env.DATASET_HOLON_IRI ?? sessionState.datasetHolonIri ?? null
+
 /** IRI of the named-queries graph for the active dataset. */
 function namedQueriesGraphIri() { return `urn:${DATASET}:named-queries` }
 function namedRulesGraphIri()     { return `urn:${DATASET}:named-rules` }
@@ -1232,6 +1247,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/dataset',        description: 'Switch active dataset at runtime. Accepts optional "fusekiUrl" to change Fuseki host in the same call. Restarts context watcher. Body: { "dataset": "name", "fusekiUrl"?: "http://..." }.' },
       { method: 'POST', path: '/fuseki-url',     description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
       { method: 'POST', path: '/shacl-mode',     description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
+      { method: 'POST', path: '/dataset-holon-iri', description: 'Set or clear the anchor holon lib/lifecycle.js\'s flat-graph verbs (proposeAgentPropertyUpdate, createAgent, formGroup, joinGroup, leaveGroup) gate capability checks against. Body: { "iri": "<holon IRI>" | null }. null reverts to the urn:{dataset}:root convention. Persisted across restarts.' },
       { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query. Body: { id, label?, description?, sparql, targetGraph?, params?: [{name, description?, default?}] } or { id, delete: true }. Use {{paramName}} placeholders in sparql; callers supply values via POST /query { queryId, params }.' },
       { method: 'POST', path: '/pipeline',      description: '[NON-CANONICAL] Register, update, or delete a pipeline manifest. Body: { id, signalType, holdingGraph, promotionRule, contextGraph, ... } or { id, delete: true }.' },
       { method: 'POST', path: '/ingest',        description: '[NON-CANONICAL] Submit a signal through a named pipeline. Pattern A: JSON body. Pattern B: text/turtle hb:Message. Returns 202 with messageId. Add sync:true for synchronous execution.' },
@@ -1259,11 +1275,11 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/holon/:iri/purge',      description: '[LIFECYCLE] purgeHolon -- hard GC on an already-Tombstoned holon. Body: { actor, confirm: true }.' },
       { method: 'POST', path: '/holon/:iri/agent',      description: '[LIFECYCLE] designateAgent -- grants a RoleBinding. Body: { agent: {iri, name, kind, capability: [...]}, grantedBy: {iri, role?} }.' },
       { method: 'POST', path: '/holon/:iri/move',       description: '[LIFECYCLE] moveHolon -- reparents :iri to newParentIri. Containment-role-aware: detects and preserves whichever predicate (e.g. geo:administrativePartOf) the existing link uses, rather than overwriting it with a generic one. Body: { newParentIri, actor: {iri, role?}, force?: boolean }.' },
-      { method: 'POST', path: '/holon/:iri/property',   description: '[LIFECYCLE] proposeAgentPropertyUpdate -- propose->validate->apply a delta to a numeric agent property (e.g. schema:healthPoints, schema:currentWealth). Validated against the property\'s governing SHACL shape (e.g. AgentHealthShape, AgentWealthShape) BEFORE any write; a rejection (409) leaves no trace. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair to the events graph plus the new value on the agent. Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }.' },
-      { method: 'POST', path: '/agent',                 description: '[LIFECYCLE] createAgent -- mints an Agent holon with baseline values for its trackable properties, writing a holon:CreationEvent plus one holon:PropertyBaselineEvent per property. Each property\'s governing shape/capProperty/floor resolves from ontology metadata (holon:governedByShape/holon:capProperty/holon:floor) unless overridden. One violating baseline rejects the whole creation (409) -- no partial agent. Body: { agentIri, label, agentKind, description?, extraTurtle?, trackableProperties?: [{property, value, capProperty?, capValue?, floor?}], actor: {iri, role?} }.' },
-      { method: 'POST', path: '/group',                 description: '[LIFECYCLE] formGroup -- creates a holon:Group, a spatial/co-location carrier (tour party, vehicle passengers) distinct from an organizational Team/Corporation (capability/authority, modeled via RoleBinding). Forms at the active member\'s current location; every initial member\'s own currentLocation is removed in favor of the group\'s. Exactly one initial member must be active. Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }.' },
-      { method: 'POST', path: '/group/:iri/join',        description: '[LIFECYCLE] joinGroup -- adds a member to an existing group; their own currentLocation is removed, defaulting to isActive false. Body: { memberIri, actor: {iri, role?} }.' },
-      { method: 'POST', path: '/group/:iri/leave',       description: '[LIFECYCLE] leaveGroup -- removes a member, restoring their own currentLocation (copied from the group\'s). If the leaving member is active and others remain, handoffTo is required naming a successor. Auto-dissolves (tombstones) the group once membership drops to one, restoring that sole member\'s independent currentLocation. Body: { memberIri, actor: {iri, role?}, handoffTo?: string }.' },
+      { method: 'POST', path: '/holon/:iri/property',   description: '[LIFECYCLE] proposeAgentPropertyUpdate -- propose->validate->apply a delta to a numeric agent property (e.g. schema:healthPoints, schema:currentWealth). Validated against the property\'s governing SHACL shape (e.g. AgentHealthShape, AgentWealthShape) BEFORE any write; a rejection (409) leaves no trace. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair to the events graph plus the new value on the agent. Always requires Write on the dataset anchor (see /dataset-holon-iri) -- not self-authorisable even for one\'s own agent. Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }.' },
+      { method: 'POST', path: '/agent',                 description: '[LIFECYCLE] createAgent -- mints an Agent holon with baseline values for its trackable properties, writing a holon:CreationEvent plus one holon:PropertyBaselineEvent per property. Each property\'s governing shape/capProperty/floor resolves from ontology metadata (holon:governedByShape/holon:capProperty/holon:floor) unless overridden. One violating baseline rejects the whole creation (409) -- no partial agent. Always requires Write on the dataset anchor (see /dataset-holon-iri). Body: { agentIri, label, agentKind, description?, extraTurtle?, trackableProperties?: [{property, value, capProperty?, capValue?, floor?}], actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group',                 description: '[LIFECYCLE] formGroup -- creates a holon:Group, a spatial/co-location carrier (tour party, vehicle passengers) distinct from an organizational Team/Corporation (capability/authority, modeled via RoleBinding). Forms at the active member\'s current location; every initial member\'s own currentLocation is removed in favor of the group\'s. Exactly one initial member must be active. Self-service: no capability check when every member IRI is the actor themselves; Write on the dataset anchor is required when conscripting other agents. Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group/:iri/join',        description: '[LIFECYCLE] joinGroup -- adds a member to an existing group; their own currentLocation is removed, defaulting to isActive false. Self-service when actor.iri === memberIri; Write on the dataset anchor required otherwise. Body: { memberIri, actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group/:iri/leave',       description: '[LIFECYCLE] leaveGroup -- removes a member, restoring their own currentLocation (copied from the group\'s). If the leaving member is active and others remain, handoffTo is required naming a successor. Auto-dissolves (tombstones) the group once membership drops to one, restoring that sole member\'s independent currentLocation. Self-service when actor.iri === memberIri; Write on the dataset anchor required otherwise. Body: { memberIri, actor: {iri, role?}, handoffTo?: string }.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
       { method: 'GET',  path: '/health',         description: 'Liveness check.' }
     ],
@@ -1284,27 +1300,38 @@ app.get('/description', async (_req, res) => {
             ? 'SHACL triple count unavailable (Jena unreachable at description time).'
             : `${shaclTriples} shape triples loaded -- /update is armed.`
     },
+    lifecycle: {
+      datasetHolonIri: DATASET_HOLON_IRI ?? `urn:${DATASET}:root (convention default -- not explicitly set)`,
+      note: DATASET_HOLON_IRI
+        ? `Flat-graph lifecycle verbs (proposeAgentPropertyUpdate, createAgent, and non-self-service formGroup/joinGroup/leaveGroup calls) gate Write capability checks against <${DATASET_HOLON_IRI}>. A RoleBinding must be designated there (POST /holon/:iri/agent, using this IRI as :iri) for those calls to succeed.`
+        : `No explicit anchor set -- flat-graph lifecycle verbs fall back to the urn:${DATASET}:root convention IRI in lib/lifecycle.js. Set one via POST /dataset-holon-iri if this dataset already has a real registered root holon that should carry the RoleBinding instead.`
+    },
     sessionState: {
       restoredFromDisk: Object.keys(sessionState).length > 0,
       persistedDataset: sessionState.dataset ?? null,
       persistedJenaBase: sessionState.jenaBase ?? null,
       persistedShaclRequired: sessionState.shaclRequired ?? null,
+      persistedDatasetHolonIri: sessionState.datasetHolonIri ?? null,
       persistedUpdatedAt: sessionState.updatedAt ?? null,
       currentFocus: liveSessionState.focusByDataset?.[DATASET] ?? null,
-      note: 'persistedDataset/persistedJenaBase/persistedShaclRequired are what this bridge booted with, ' +
-            'read from .bridge-session-state.json. If they don\'t match the "dataset"/"jenaBase"/"shacl.required" ' +
-            'fields above, this process has switched since boot -- that\'s normal. If restoredFromDisk is false ' +
-            'and you expected persisted state (e.g. right after a restart), the state file is missing or was ' +
-            'never written. currentFocus, unlike the persisted* fields above, is read fresh on every call, not ' +
-            'cached from boot -- it is the IRI GET /holon (no :iri) will resolve to right now for this dataset, ' +
-            'updated by every successful GET /holon call.'
+      note: 'persistedDataset/persistedJenaBase/persistedShaclRequired/persistedDatasetHolonIri are what this ' +
+            'bridge booted with, read from .bridge-session-state.json. If they don\'t match the ' +
+            '"dataset"/"jenaBase"/"shacl.required"/"lifecycle.datasetHolonIri" fields above, this process has ' +
+            'switched since boot -- that\'s normal. If restoredFromDisk is false and you expected persisted ' +
+            'state (e.g. right after a restart), the state file is missing or was never written. currentFocus, ' +
+            'unlike the persisted* fields above, is read fresh on every call, not cached from boot -- it is the ' +
+            'IRI GET /holon (no :iri) will resolve to right now for this dataset, updated by every successful ' +
+            'GET /holon call.'
     },
     agentHints: [
       'Call GET /description at session start to orient yourself.',
       'Call GET /datasets to see available datasets, then POST /dataset to switch.',
       'Context is automatically reloaded when files change in the active context directory.',
       `Active context directory: context/${serverDirName(JENA_BASE)}/${DATASET}/`,
-      `The SHACL shapes graph IRI is <${SHACL_GRAPH}>.`
+      `The SHACL shapes graph IRI is <${SHACL_GRAPH}>.`,
+      DATASET_HOLON_IRI
+        ? `The dataset lifecycle anchor holon is <${DATASET_HOLON_IRI}>.`
+        : `No dataset lifecycle anchor holon is explicitly set -- flat-graph lifecycle verbs use the urn:${DATASET}:root convention. See POST /dataset-holon-iri.`
     ]
   })
 })
@@ -1344,6 +1371,38 @@ app.post('/shacl-mode', (req, res) => {
     : `SHACL gate disabled -- /update will push without validation.`
   console.log(`[Bridge] /shacl-mode: ${msg}`)
   return res.json({ shaclRequired: SHACL_REQUIRED, shaclGraph: SHACL_GRAPH, message: msg })
+})
+
+// -- POST /dataset-holon-iri ---------------------------------------------------
+//
+// Set or clear the anchor holon that lib/lifecycle.js's flat-graph verbs
+// (proposeAgentPropertyUpdate, createAgent, and non-self-service
+// formGroup/joinGroup/leaveGroup calls) gate their Write capability checks
+// against, via datasetAnchor(conn) in lib/lifecycle.js. Persists across
+// restarts, same pattern as /shacl-mode. Does NOT itself register a
+// RoleBinding -- pair this with POST /holon/:iri/agent (using the same IRI
+// as :iri) to actually grant an actor Write there, or with POST /holon
+// (createRootHolon) first if the anchor holon doesn't exist yet.
+//
+// Request:  { "iri": "<holon IRI>" | null }
+//   null clears the override, reverting to the urn:{dataset}:root
+//   convention lib/lifecycle.js's datasetAnchor() falls back to on its own.
+// Response: { "datasetHolonIri": "..." | null, "message": "..." }
+
+app.post('/dataset-holon-iri', (req, res) => {
+  const { iri } = req.body ?? {}
+
+  if (iri !== null && (typeof iri !== 'string' || !iri.trim()))
+    return res.status(400).json({ error: '"iri" must be a non-empty string, or null to clear the override.' })
+
+  DATASET_HOLON_IRI = iri === null ? null : iri.trim()
+  saveSessionState({ datasetHolonIri: DATASET_HOLON_IRI })
+
+  const msg = DATASET_HOLON_IRI
+    ? `Dataset lifecycle anchor set to <${DATASET_HOLON_IRI}>. Grant Write there via POST /holon/:iri/agent if no RoleBinding exists yet.`
+    : `Dataset lifecycle anchor cleared -- flat-graph verbs now fall back to the urn:${DATASET}:root convention.`
+  console.log(`[Bridge] /dataset-holon-iri: ${msg}`)
+  return res.json({ datasetHolonIri: DATASET_HOLON_IRI, message: msg })
 })
 
 // -- POST /named-query ---------------------------------------------------------
@@ -2443,13 +2502,13 @@ app.get('/holon/:iri', async (req, res) => {
 
 // -- Lifecycle verbs (P4) -------------------------------------------------------
 //
-// Thin REST wrappers around lib/lifecycle.js's twelve holon lifecycle verbs.
-// Wired 2026-07-09 -- previously lib/lifecycle.js existed but no route ever
-// called it. Every mutating verb requires an explicit actor in the request
-// body -- { actor: { iri, role? } } -- since this bridge has no per-request
-// user identity beyond the shared Bearer token. The actor IRI is what ends
-// up in prov:wasGeneratedBy and in RoleBinding capability checks; callers
-// are responsible for supplying the right one.
+// Thin REST wrappers around lib/lifecycle.js's seventeen holon lifecycle
+// verbs. Wired 2026-07-09 -- previously lib/lifecycle.js existed but no
+// route ever called it. Every mutating verb requires an explicit actor in
+// the request body -- { actor: { iri, role? } } -- since this bridge has
+// no per-request user identity beyond the shared Bearer token. The actor
+// IRI is what ends up in prov:wasGeneratedBy and in RoleBinding capability
+// checks; callers are responsible for supplying the right one.
 //
 // STATUS: createRootHolon through listHolonContents (the first eight verbs)
 // assume the per-holon schema/scene/events graph triad lib/lifecycle.js's
@@ -2464,10 +2523,21 @@ app.get('/holon/:iri', async (req, res) => {
 // the France/Europe/Earth/home RoleBinding walk that confirmed moveHolon's
 // authorisation path end-to-end.
 //
+// getLifecycleConn() now also threads DATASET_HOLON_IRI through as
+// datasetHolonIri -- the anchor lib/lifecycle.js's flat-graph verbs
+// (proposeAgentPropertyUpdate, createAgent, formGroup, joinGroup,
+// leaveGroup) gate Write capability checks against. When DATASET_HOLON_IRI
+// is null (nothing set via POST /dataset-holon-iri or DATASET_HOLON_IRI
+// env var), the key is simply omitted from conn so lib/lifecycle.js's own
+// datasetAnchor() fallback (urn:{dataset}:root) applies -- the convention
+// default is defined in exactly one place.
+//
 // Errors: CommandRejected -> 409, UnauthorisedError -> 403, else -> 500.
 
 function getLifecycleConn() {
-  return { sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP, jenaBase: JENA_BASE, dataset: DATASET }
+  const conn = { sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP, jenaBase: JENA_BASE, dataset: DATASET }
+  if (DATASET_HOLON_IRI) conn.datasetHolonIri = DATASET_HOLON_IRI
+  return conn
 }
 
 function requireActor(body, field = 'actor') {
@@ -2694,7 +2764,9 @@ app.post('/holon/:iri/move', async (req, res) => {
 // graph. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair
 // to urn:{dataset}:events and the new value to urn:{dataset}:holons.
 // Operates on the flat Adventure-Mode-style graphs, not the per-holon
-// schema/scene/events triad the rest of this verb family assumes.
+// schema/scene/events triad the rest of this verb family assumes. Always
+// requires Write on the dataset anchor (see getLifecycleConn() /
+// POST /dataset-holon-iri) -- not self-authorisable even for one's own agent.
 
 app.post('/holon/:iri/property', async (req, res) => {
   try {
@@ -2727,6 +2799,8 @@ app.post('/holon/:iri/property', async (req, res) => {
 // resolved from ontology metadata (holon:governedByShape/holon:capProperty/
 // holon:floor) unless overridden in the request. A single baseline that
 // violates its shape rejects the entire creation (409) -- no partial agent.
+// Always requires Write on the dataset anchor (see getLifecycleConn() /
+// POST /dataset-holon-iri).
 //
 // Separate from POST /holon (createRootHolon), which uses the older per-
 // holon schema/scene/events graph triad -- this operates on the flat
@@ -2763,7 +2837,10 @@ app.post('/agent', async (req, res) => {
 // (capability/authority, modeled via RoleBinding). Forms at the active
 // member's current location; every initial member's own currentLocation is
 // removed in favor of the group's. Exactly one initial member must be
-// active; the rest are forced inactive as part of joining.
+// active; the rest are forced inactive as part of joining. Self-service:
+// no capability check when every entry in memberIris is the actor
+// themselves; Write on the dataset anchor is required as soon as another
+// agent is included.
 
 app.post('/group', async (req, res) => {
   try {
@@ -2787,7 +2864,8 @@ app.post('/group', async (req, res) => {
 // Body: { memberIri, actor: {iri, role?} }
 //
 // Adds a member to an existing group. The member's own currentLocation is
-// removed; they default to isActive false.
+// removed; they default to isActive false. Self-service when
+// actor.iri === memberIri; Write on the dataset anchor required otherwise.
 
 app.post('/group/:iri/join', async (req, res) => {
   try {
@@ -2808,6 +2886,8 @@ app.post('/group/:iri/join', async (req, res) => {
 // group's). If the leaving member is active and others remain, handoffTo
 // is required. Auto-dissolves (tombstones) the group once membership drops
 // to one, restoring that sole member's independent currentLocation.
+// Self-service when actor.iri === memberIri; Write on the dataset anchor
+// required otherwise.
 
 app.post('/group/:iri/leave', async (req, res) => {
   try {
@@ -2829,7 +2909,7 @@ app.use((_req, res) => {
     error: 'Not found.',
     available: [
       'POST /query', 'POST /update', 'POST /sparql-update', 'POST /sparql-select', 'POST /sparql-construct', 'POST /describe',
-      'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode',
+      'POST /reload', 'POST /dataset', 'POST /fuseki-url', 'POST /shacl-mode', 'POST /dataset-holon-iri',
       'POST /named-query', 'POST /named-rule', 'POST /rule', 'POST /graph-op',
       'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
       'GET  /datasets', 'GET  /graphs', 'GET  /graph',
@@ -2861,6 +2941,7 @@ loadContext()
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
       console.log(`[Bridge] GSP:            ${JENA_GSP}`)
       console.log(`[Bridge] SHACL graph:    ${SHACL_GRAPH}`)
+      console.log(`[Bridge] Lifecycle anchor: ${DATASET_HOLON_IRI ?? `(unset -- urn:${DATASET}:root convention)`}`)
       console.log(`[Bridge] Model:          ${MODEL}  Max retries: ${MAX_RETRIES}`)
     })
 
