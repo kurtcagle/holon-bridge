@@ -275,6 +275,88 @@ the chain and treat the sequence numbers as stale.
 
 ---
 
+## Decision 5: is this a Place, or an occupant of one?
+
+A sharper, class-level generalization of Decision 1, for the recurring
+case of non-geographic entities (organizations, agents) that have a
+location but aren't themselves locations.
+
+> **`holon:isPartOf` (and every subproperty of it in the geographic
+> branch) only ever relates two `geo:GeographicRegion` instances.**
+
+`geo:GeographicRegion` is this holarchy's "Place" class — the class
+that answers *"Where?"* and has physical extent: Country, City,
+Continent, GeoFeature, Infrastructure. If either side of a candidate
+containment edge isn't `GeographicRegion`, the answer is connection,
+full stop — no case-by-case reasoning needed, it's a type check.
+
+**Organizations and Agents are occupants, never Places.** An
+organization doesn't sit *inside* a country the way a city does — it's
+*located in* one, a materially different relationship even though both
+might loosely be described as "in Germany." The tell: an org can be
+headquartered in one place but maintain facilities in several (multi-
+campus institutions, multi-site agencies) — the moment a relationship
+can legitimately point at more than one target, Decision 1 already
+rules out containment. Occupancy is a connection:
+
+```turtle
+bacm:Organization owl:disjointWith geo:GeographicRegion .
+holon:Agent        owl:disjointWith geo:GeographicRegion .
+
+ggsc:basedInRegion rdfs:subPropertyOf holon:isConnectedTo ;
+    rdfs:domain bacm:Organization ;
+    rdfs:comment "Connects a GGSC organisation to the country/region it is based in." .
+```
+
+The same shape covers `holon:Agent`'s `holon:currentLocation` — an
+agent occupies a place, is never contained by one. Worth naming the
+Group/Team split from the Adventure Mode context as the same move one
+level up: `holon:Group` is deliberately spatial-only (co-location) and
+deliberately *not* modeled via containment either, for the identical
+reason — an occupant relationship, not a scale-decomposition.
+
+**Applying this to a whole class of instances at once, not per-record.**
+When this question came up for 26 already-live GGSC organization
+holons, the right fix wasn't checking or migrating 26 individual
+records — it was verifying the class-level property declaration
+(`ggsc:basedInRegion rdfs:subPropertyOf holon:isConnectedTo`, already
+correct) and then asserting the disjointness once, on the classes. Every
+instance inherits the guarantee for free. Reach for per-instance
+migration (Decision 2's scoped `DELETE`/`INSERT`) only when the
+predicate itself was wrong on some instances, not when you're
+formalizing a rule the data already happens to satisfy.
+
+**A facility is not a new class.** The temptation when this question
+comes up is to invent `ggsc:Facility` as a hybrid entity-and-place
+class. Don't — a facility is just `geo:Infrastructure` (already a
+`GeographicRegion`, already containment-eligible) with an organization
+connected to it: `SomeOrg ggsc:hasFacility SomeBuildingHolon`. The
+organization stays a pure occupant; the building stays a pure Place;
+the connection between them carries the fact that would otherwise have
+tempted a conflated class.
+
+### Known related smell, not yet resolved: `geo:Infrastructure` is currently overloaded
+
+While applying Decision 5, a pre-existing Decision-2-shaped problem
+surfaced in `geo:Infrastructure` itself: its class comment describes it
+as "non-holonic... related via `geo:connects`, never containment" (true
+for bridges/tunnels/corridors — Ponte Sant'Angelo, Tower Bridge, the
+Channel Tunnel), but live instance data also uses `Infrastructure` for
+landmark buildings that genuinely are `administrativePartOf` a
+neighborhood (the Pantheon, the Colosseum, St. Peter's Basilica,
+Shakespeare's Globe) — the opposite containment behavior on the same
+class. This is the same "one predicate/class asked to mean two things"
+smell Decision 2 names for properties, just found at the class level
+instead. Likely fix, not yet applied: split into two classes (e.g.
+`geo:ConnectingInfrastructure` for point-to-point links,
+`geo:SiteInfrastructure` or reuse `geo:Facility`-as-Infrastructure-kind
+for landmarks/buildings) under a shared `geo:Infrastructure` parent, the
+same meta-class-per-axis move as Decision 3. Flagged here rather than
+fixed inline — it's a separate design decision from the one this
+session actually resolved.
+
+---
+
 ## Default focus: `holon:Home` and persisted "last focus"
 
 Two distinct, complementary concepts, easy to conflate:
@@ -332,3 +414,4 @@ read as an answer to that question.
 | Version | Changes |
 |---|---|
 | v1.0.0 | Initial capture from the solar-system + European-geography holarchy build session: role discovery, containment/connection decision test, predicate scale-splitting, meta-class facet pattern, multi-tree containment, ordered-path-via-connection pattern, holon:Home + persisted focus. |
+| v1.1.0 | Added Decision 5 (Place vs. occupant — organizations/agents are never GeographicRegion, always connect to one). Flagged the geo:Infrastructure connecting-vs-site conflation as a related, unresolved smell. |
