@@ -187,6 +187,19 @@ links can't call HolonBridge tools; every actionable item is a
 Claude then interprets and resolves with the appropriate tool call
 (`get_holon` for navigation, the relevant lifecycle verb for actions).
 
+**The navigation widget is mandatory, not conditional.** Every time a
+focus holon is narrated — arriving there, or simply being asked to
+show what's around — render the navigation widget showing its
+containing holon (Up), its child holons (Scene), and any related
+holons (Connections), even when all three are empty (render the
+section with an explicit "none yet" state rather than omitting it
+silently — an empty Scene is itself information, not absence of
+information). This holds independently of whether an action widget
+also applies: a scene full of NPCs and nothing else still gets its
+containing/child/connection context shown, not just the action panel.
+The action widget, when applicable, renders *alongside* this — it
+supplements the navigation context, it never substitutes for it.
+
 ### Shared conventions
 
 - **`sendPrompt` payload** is always a plain-language instruction
@@ -216,9 +229,13 @@ Claude then interprets and resolves with the appropriate tool call
   `rdfs:comment`.
 - **Up / Back row** — two buttons side by side.
 - **Scene section** — muted label "Scene — direct children", one
-  full-width button per child (label + type tag + trailing `↗`).
-- **Connections section** — same button style; omit the whole section
-  (heading included) if there are no connections.
+  full-width button per child (label + type tag + trailing `↗`). If
+  there are none, keep the heading and show a muted "None yet at this
+  scale" line instead of a button — the section itself is mandatory
+  per the rule above, only its contents are conditional.
+- **Connections section** — same button style; same empty-state
+  treatment ("None yet") rather than omitting the section when there
+  are no connections.
 - Keep it to one screenful. 6+ children is a signal the containment
   model may need an intermediate holon — flag it, don't paginate.
 
@@ -238,24 +255,33 @@ Claude then interprets and resolves with the appropriate tool call
     <button onclick="sendPrompt('Go to holon [previous IRI]')" style="flex:1;"><i class="ti ti-corner-up-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Back</button>
   </div>
   <div style="font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Scene — direct children</div>
-  <div style="display:flex; flex-direction:column; gap:8px;">
+  <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:1.25rem;">
     <button onclick="sendPrompt('Go to holon [child IRI]')" style="display:flex; align-items:center; justify-content:space-between; text-align:left; padding:0.75rem 1rem;">
       <span style="display:flex; align-items:center; gap:10px;"><i class="ti ti-[icon]" style="font-size:18px;" aria-hidden="true"></i>[Child label] <span style="font-size:12px; color:var(--text-muted);">[type]</span></span>
       <span aria-hidden="true">↗</span>
     </button>
-    <!-- one button per child -->
+    <!-- one button per child, OR if none: <p style="font-size:13px; color:var(--text-muted); margin:0;">None yet at this scale.</p> -->
   </div>
-  <!-- Connections section, same button pattern, omitted entirely if empty -->
+
+  <div style="font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Connections</div>
+  <div style="display:flex; flex-direction:column; gap:8px;">
+    <button onclick="sendPrompt('Go to holon [connected IRI]')" style="display:flex; align-items:center; justify-content:space-between; text-align:left; padding:0.75rem 1rem;">
+      <span style="display:flex; align-items:center; gap:10px;"><i class="ti ti-[icon]" style="font-size:18px;" aria-hidden="true"></i>[Connected holon label] <span style="font-size:12px; color:var(--text-muted);">[relation]</span></span>
+      <span aria-hidden="true">↗</span>
+    </button>
+    <!-- one button per connection, OR if none: <p style="font-size:13px; color:var(--text-muted); margin:0;">None yet.</p> -->
+  </div>
 </div>
 ```
 
 ### Action widget
 
-Render alongside (below) the navigation widget only when there's
-something actionable at the current focus — an agent present with
-trackable properties, a group that can be joined/left, or a scene
-where creating a new agent makes narrative sense. Skip it entirely on
-inert scenery holons (a plain waypoint with no agents).
+Render below the navigation widget — never in place of it — only when
+there's something actionable at the current focus: an agent present
+with trackable properties, a group that can be joined/left, or a scene
+where creating a new agent makes narrative sense. Skip the action
+widget entirely on inert scenery holons (a plain waypoint with no
+agents); the navigation widget still renders on its own in that case.
 
 - **Per-agent card** — agent label, icon `ti-user`, one row per
   trackable property showing current value (and cap if present, as
@@ -306,8 +332,9 @@ inert scenery holons (a plain waypoint with no agents).
    recovered from the most recent prior AM session (check recent
    chats for the last-known focus/Back-history/active-agent state if
    resuming cold).
-4. Render focus-holon narration in prose, then the navigation widget,
-   then the action widget if applicable.
+4. Render focus-holon narration in prose, then the navigation widget
+   (containing holon, child holons, connections — always, even if
+   some sections are empty), then the action widget if applicable.
 
 ---
 
