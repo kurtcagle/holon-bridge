@@ -14,15 +14,15 @@ description: >
   navigation/narrative sense), "portal", "navigation widget", "action
   widget", "currentLocation", "trackable property", "healthPoints",
   "currentWealth", "formGroup", "joinGroup", "leaveGroup",
-  "createAgent", "proposeAgentPropertyUpdate". This is a living
-  document — expect it to grow. See holonbridge for REST/MCP mechanics,
-  holon-schema-patterns for how containment/connection predicates are
-  modeled, and holon-lifecycle (kurtcagle/holon-bridge,
-  SKILL.holon-lifecycle.md) for the full 17-verb reference and
-  CommandEvent pipeline this skill's actions are built on. This skill
-  is the *experience layer*: which verbs apply in an AM context, how
-  they're invoked from narrative, and how both navigation and actions
-  are surfaced as widgets.
+  "createAgent", "proposeAgentPropertyUpdate", "narration path",
+  "nextHolon". This is a living document — expect it to grow. See
+  holonbridge for REST/MCP mechanics, holon-schema-patterns for how
+  containment/connection predicates are modeled, and holon-lifecycle
+  (kurtcagle/holon-bridge, SKILL.holon-lifecycle.md) for the full
+  17-verb reference and CommandEvent pipeline this skill's actions are
+  built on. This skill is the *experience layer*: which verbs apply in
+  an AM context, how they're invoked from narrative, and how both
+  navigation and actions are surfaced as widgets.
 ---
 
 # Adventure Mode
@@ -93,6 +93,37 @@ Two distinct things move in AM, and they're driven differently:
 - When an agent is grouped, `currentLocation` lives on the **group**,
   not the member — see Groups below. Moving a grouped agent means
   moving the group.
+
+### Narration path (Previous / Next)
+
+Separate from the four spatial directions above, AM tracks a **story
+sequence** — the order scenes actually occurred in the narrative, not
+the order they were clicked through. This is graph-persisted (not
+client-side like Back), using the existing generic `holon:nextHolon`
+sequence predicate — the same predicate already used for GGSC review
+chains and visit logs, reused here as a narrative-order pointer between
+scene holons.
+
+- **Previous** — the holon that has `holon:nextHolon` pointing at the
+  current focus (reverse lookup: `?prev holon:nextHolon <currentFocus>`).
+- **Next** — the object of `<currentFocus> holon:nextHolon ?next`, if
+  the story has already advanced past this point.
+- Write a new `holon:nextHolon` edge from the outgoing focus holon to
+  the incoming one whenever the narrative genuinely moves forward to a
+  new scene — not on every navigation click, and not when Kurt is just
+  browsing/backtracking through the holarchy for world-building. If
+  the person revisits an earlier scene and then the story proceeds
+  differently, don't overwrite the earlier edge — a holon can have at
+  most one `nextHolon` in practice, so branching narrative paths need a
+  new holon (or this convention needs revisiting; flag it if that
+  comes up).
+- Most holons won't have any `nextHolon` edges at all — this only
+  exists where the narrative has actually walked through. Absence is
+  normal, not an error.
+- Distinct from **Back**: Back is "the last holon *this viewer*
+  entered," ephemeral and per-session. Previous/Next is "what came
+  before/after in the story itself," persistent in the graph and
+  shared by anyone reading the world later.
 
 ---
 
@@ -190,15 +221,16 @@ Claude then interprets and resolves with the appropriate tool call
 **The navigation widget is mandatory, not conditional.** Every time a
 focus holon is narrated — arriving there, or simply being asked to
 show what's around — render the navigation widget showing its
-containing holon (Up), its child holons (Scene), and any related
-holons (Connections), even when all three are empty (render the
-section with an explicit "none yet" state rather than omitting it
-silently — an empty Scene is itself information, not absence of
-information). This holds independently of whether an action widget
-also applies: a scene full of NPCs and nothing else still gets its
-containing/child/connection context shown, not just the action panel.
-The action widget, when applicable, renders *alongside* this — it
-supplements the navigation context, it never substitutes for it.
+containing holon (Up), its child holons (Scene), any related holons
+(Connections), and its narration-path neighbors (Previous/Next), even
+when some or all of these are empty (render each section with an
+explicit "none yet" state rather than omitting it silently — an empty
+Scene is itself information, not absence of information). This holds
+independently of whether an action widget also applies: a scene full
+of NPCs and nothing else still gets its full navigation context shown,
+not just the action panel. The action widget, when applicable, renders
+*alongside* this — it supplements the navigation context, it never
+substitutes for it.
 
 ### Shared conventions
 
@@ -228,6 +260,12 @@ supplements the navigation context, it never substitutes for it.
 - **One-line description** — `holon:description` if present, else
   `rdfs:comment`.
 - **Up / Back row** — two buttons side by side.
+- **Previous / Next row** — a second row, directly below Up/Back,
+  visually distinguished (e.g. `ti-chevron-left`/`ti-chevron-right`
+  icons instead of `ti-arrow-up`/`ti-corner-up-left`) so it doesn't
+  read as a duplicate of Up/Back. Disable with "No previous scene" /
+  "Story continues here" style labels when absent, same disable-not-hide
+  rule as Up/Back.
 - **Scene section** — muted label "Scene — direct children", one
   full-width button per child (label + type tag + trailing `↗`). If
   there are none, keep the heading and show a muted "None yet at this
@@ -250,9 +288,13 @@ supplements the navigation context, it never substitutes for it.
     <span style="font-size:12px; color:var(--text-muted);">[type short name]</span>
   </div>
   <p style="font-size:14px; color:var(--text-secondary); margin:0 0 1.25rem;">[One-line description]</p>
-  <div style="display:flex; gap:8px; margin-bottom:1.25rem;">
+  <div style="display:flex; gap:8px; margin-bottom:0.5rem;">
     <button onclick="sendPrompt('Go to holon [parent IRI]')" style="flex:1;"><i class="ti ti-arrow-up" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Up</button>
-    <button onclick="sendPrompt('Go to holon [previous IRI]')" style="flex:1;"><i class="ti ti-corner-up-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Back</button>
+    <button onclick="sendPrompt('Go to holon [previous-visited IRI]')" style="flex:1;"><i class="ti ti-corner-up-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Back</button>
+  </div>
+  <div style="display:flex; gap:8px; margin-bottom:1.25rem;">
+    <button onclick="sendPrompt('Go to holon [narration-previous IRI]')" style="flex:1;"><i class="ti ti-chevron-left" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Previous</button>
+    <button onclick="sendPrompt('Go to holon [narration-next IRI]')" style="flex:1;"><i class="ti ti-chevron-right" style="font-size:16px; vertical-align:-3px; margin-right:6px;" aria-hidden="true"></i>Next</button>
   </div>
   <div style="font-size:13px; color:var(--text-secondary); margin-bottom:8px;">Scene — direct children</div>
   <div style="display:flex; flex-direction:column; gap:8px; margin-bottom:1.25rem;">
@@ -333,8 +375,9 @@ agents); the navigation widget still renders on its own in that case.
    chats for the last-known focus/Back-history/active-agent state if
    resuming cold).
 4. Render focus-holon narration in prose, then the navigation widget
-   (containing holon, child holons, connections — always, even if
-   some sections are empty), then the action widget if applicable.
+   (containing holon, child holons, connections, and narration-path
+   previous/next — always, even if some sections are empty), then the
+   action widget if applicable.
 
 ---
 
