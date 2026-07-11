@@ -21,9 +21,12 @@
  *   (no new dependency for OAuth/JWT -- see signJwt/verifyJwt below,
  *   hand-rolled HS256 using Node's built-in crypto module)
  *
- * GitHub OAuth App setup (one-time, in the org's GitHub settings):
+ * GitHub OAuth App setup (one-time, on your own GitHub account or org):
  *   Register an OAuth App (not a GitHub App -- no installation-level
- *   permissions needed, just identity + org membership).
+ *   permissions needed, just identity -- no scope is requested at all).
+ *   Note this does NOT require the account to be a GitHub Organization --
+ *   a personal account works identically, since access is gated by
+ *   GITHUB_ALLOWED_USERS below, not org membership.
  *   Authorization callback URL: {MCP_PUBLIC_URL}/oauth/github/callback
  *   Note the generated Client ID and Client Secret for the env vars below.
  *
@@ -34,7 +37,9 @@
  *                    HolonBridge, never seen by a browser or a person>
  *   GITHUB_CLIENT_ID=<from the GitHub OAuth App above>
  *   GITHUB_CLIENT_SECRET=<from the GitHub OAuth App above>
- *   GITHUB_ORG=<the org whose ACTIVE members may log in, e.g. "kurtcagle">
+ *   GITHUB_ALLOWED_USERS=kurtcagle,benwortley  # comma-separated GitHub
+ *               logins permitted to log in, case-insensitive. This is the
+ *               access gate -- not org membership (see v1.15.1 changelog).
  *   JWT_SECRET=<generate with: openssl rand -hex 32 -- signs per-user
  *               login tokens this process issues; distinct from
  *               HB_BEARER_TOKEN>
@@ -46,13 +51,20 @@
  *   FUSEKI_GSP=http://localhost:3030/ds/data        # retained for health reporting
  *                                                   # no longer used by push_turtle
  *
- * Token relationship (2026-07-11, v1.15.0):
+ * Token relationship (2026-07-11, v1.15.1):
  *   HB_BEARER_TOKEN      — protects HolonBridge from the MCP remote. Static
  *                          service-to-service secret, unchanged by this
  *                          version, never exposed to a browser or a person.
- *   GitHub OAuth          — a PERSON authenticates by logging into GitHub
- *                          and proving ACTIVE membership in GITHUB_ORG (see
- *                          /authorize, /oauth/github/callback below).
+ *   GitHub OAuth          — a PERSON authenticates by logging into GitHub;
+ *                          access is gated by GITHUB_ALLOWED_USERS, a
+ *                          static allowlist of GitHub logins (see
+ *                          /authorize, /oauth/github/callback below) --
+ *                          not GitHub Organization membership, which v1.15.0
+ *                          originally used and which requires the account
+ *                          in question to actually be an Organization (a
+ *                          personal account, which is what most solo/small-
+ *                          team setups actually are, always fails that
+ *                          check regardless of identity).
  *   Per-user JWT          — minted by /token after a successful GitHub
  *                          login, carrying sub=https://w3id.org/users/
  *                          {githubLogin}. This is what a browser/client
@@ -79,6 +91,25 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-11 v1.15.1 FIX: v1.15.0's access gate (GitHub Organization
+ *                      membership via GET /user/memberships/orgs/:org)
+ *                      404s unconditionally when the configured account is
+ *                      a personal GitHub profile rather than an actual
+ *                      Organization -- which is what most solo/small-team
+ *                      setups, including this one, actually run out of.
+ *                      Confirmed live: a real login attempt was rejected
+ *                      with "not a member" despite correct credentials,
+ *                      because kurtcagle is a personal account with no
+ *                      memberships to check. Replaced GITHUB_ORG with
+ *                      GITHUB_ALLOWED_USERS, a static comma-separated
+ *                      allowlist of GitHub logins checked locally in
+ *                      /oauth/github/callback -- no GitHub API call and no
+ *                      OAuth scope needed for the check at all (dropped
+ *                      'read:org' from the /authorize request). Works
+ *                      identically whether the account in question is
+ *                      personal or a real org, and matches what was
+ *                      actually asked for (a closed list of specific
+ *                      people) more directly than org membership did.
  *   2026-07-11 v1.15.0 Replace the single shared MCP_REMOTE_TOKEN with real
  *                      GitHub OAuth login. /authorize now redirects to
  *                      GitHub instead of minting a fake code; a new
@@ -264,14 +295,14 @@ import { timedProcess } from '../lib/timing.js';
 
 // ── Configuration ─────────────────────────────────────────────────────────────────
 //
-// Identity model (2026-07-11, v1.15.0): GitHub OAuth replaces the single
+// Identity model (2026-07-11, v1.15.1): GitHub OAuth replaces the single
 // shared MCP_REMOTE_TOKEN as the primary way a *person* authenticates.
-// GITHUB_CLIENT_ID/SECRET and GITHUB_ORG are required for the login flow
-// (see /authorize, /oauth/github/callback, /token below). JWT_SECRET signs
-// the per-user tokens this process issues after a successful GitHub login
-// and org-membership check -- distinct from HB_BEARER_TOKEN, which remains
-// a service-to-service secret between this process and HolonBridge REST
-// and is never seen by a browser or a person.
+// GITHUB_CLIENT_ID/SECRET and GITHUB_ALLOWED_USERS are required for the
+// login flow (see /authorize, /oauth/github/callback, /token below).
+// JWT_SECRET signs the per-user tokens this process issues after a
+// successful GitHub login and allowlist check -- distinct from
+// HB_BEARER_TOKEN, which remains a service-to-service secret between this
+// process and HolonBridge REST and is never seen by a browser or a person.
 //
 // MCP_REMOTE_TOKEN is now OPTIONAL and legacy: if set, it's still accepted
 // as a Bearer credential (for scripts/CI that can't do an interactive
@@ -289,7 +320,7 @@ const {
   FUSEKI_GSP = 'http://localhost:3030/ds/data',  // retained for health reporting; no longer used by push_turtle
   GITHUB_CLIENT_ID,
   GITHUB_CLIENT_SECRET,
-  GITHUB_ORG,
+  GITHUB_ALLOWED_USERS,
   JWT_SECRET,
   JWT_EXPIRES_IN_SEC = String(12 * 60 * 60),   // 12h default
   SERVICE_ACTOR_IRI = 'https://w3id.org/users/service-account',
@@ -298,10 +329,25 @@ const {
 if (!HB_BEARER_TOKEN)    throw new Error('HB_BEARER_TOKEN is required in .env');
 if (!GITHUB_CLIENT_ID)   throw new Error('GITHUB_CLIENT_ID is required in .env (GitHub OAuth App)');
 if (!GITHUB_CLIENT_SECRET) throw new Error('GITHUB_CLIENT_SECRET is required in .env (GitHub OAuth App)');
-if (!GITHUB_ORG)         throw new Error('GITHUB_ORG is required in .env -- the org whose active members may log in');
+if (!GITHUB_ALLOWED_USERS) throw new Error('GITHUB_ALLOWED_USERS is required in .env -- comma-separated GitHub logins permitted to log in');
 if (!JWT_SECRET)         throw new Error('JWT_SECRET is required in .env (generate with: openssl rand -hex 32) -- signs per-user login tokens');
 
 const JWT_EXPIRES_IN_SECONDS = parseInt(JWT_EXPIRES_IN_SEC, 10) || 12 * 60 * 60;
+
+// Case-insensitive allowlist of GitHub logins permitted to authenticate.
+// Replaces an earlier org-membership check (GET /user/memberships/orgs/:org)
+// that assumed GITHUB_ORG named an actual GitHub Organization -- it doesn't
+// have to be one. Most solo/small-team setups (this one included) run out
+// of a personal GitHub account, where that endpoint 404s for everyone
+// regardless of identity. An explicit allowlist works identically whether
+// the account in question is a personal profile or a real org, needs no
+// GitHub scope beyond default identity read (no more 'read:org'), and is a
+// one-line .env edit to add or remove someone -- which is what "a closed
+// network of people working within a shared GitHub environment" actually
+// asks for.
+const ALLOWED_GITHUB_LOGINS = new Set(
+  GITHUB_ALLOWED_USERS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
 
 // ── GSP dataset tracking (health reporting only) ───────────────────────────────────────────
 //
@@ -791,7 +837,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.15.0',
+    version: '1.15.1',
   });
 
   srv.tool(
@@ -1111,8 +1157,8 @@ app.options('*', cors());
 // client_credentials grant and handed back the same static MCP_REMOTE_TOKEN
 // regardless of who -- or whether anyone -- was actually asking. This is a
 // real login: /authorize now sends the browser to GitHub, /oauth/github/callback
-// verifies the person is an active member of GITHUB_ORG and mints a signed
-// per-user JWT (see signJwt/verifyJwt above), and /token exchanges the
+// verifies the person's GitHub login is on GITHUB_ALLOWED_USERS and mints a
+// signed per-user JWT (see signJwt/verifyJwt above), and /token exchanges the
 // one-time code from that callback for the JWT. requireAuth below verifies
 // that JWT (or, as a legacy fallback, the static MCP_REMOTE_TOKEN, mapped to
 // SERVICE_ACTOR_IRI) and resolves the caller's identity once per /sse
@@ -1120,12 +1166,23 @@ app.options('*', cors());
 // that identity then reaches every lifecycle-verb tool call without the
 // caller ever supplying it themselves.
 //
+// v1.15.1 note: v1.15.0 originally gated access on GitHub Organization
+// membership (GET /user/memberships/orgs/:org). That endpoint only exists
+// for actual Organizations -- a personal GitHub account (which is what most
+// solo/small-team setups, this one included, actually run out of) has no
+// memberships to check, so the org-membership call 404s unconditionally
+// regardless of who's logging in. Replaced with a static allowlist
+// (GITHUB_ALLOWED_USERS) checked locally against the authenticated login --
+// works identically whether the account is personal or a real org, needs no
+// GitHub scope at all (dropped 'read:org'), and matches what was actually
+// asked for: a closed list of specific people, not org-wide membership.
+//
 // PKCE note: the advertised token_endpoint_auth_methods_supported includes
 // 'none' (implying PKCE for public clients per spec), but code_verifier is
 // not currently checked against a stored code_challenge -- this carries
 // forward a gap that predates this change (the old shim didn't check it
 // either) rather than introducing a new one. Worth closing before this is
-// exposed beyond a small trusted org, but out of scope for the identity
+// exposed beyond a small trusted group, but out of scope for the identity
 // substitution this version is about.
 
 const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io';
@@ -1211,7 +1268,6 @@ app.get('/authorize', (req, res) => {
   const githubUrl = new URL('https://github.com/login/oauth/authorize');
   githubUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
   githubUrl.searchParams.set('redirect_uri', GITHUB_CALLBACK_URL);
-  githubUrl.searchParams.set('scope', 'read:org');
   githubUrl.searchParams.set('state', flowId);
 
   console.log(`[OAuth] Redirecting to GitHub for login (flowId=${flowId})`);
@@ -1220,11 +1276,11 @@ app.get('/authorize', (req, res) => {
 
 // GET /oauth/github/callback -- GitHub sends the person back here after they
 // approve (or deny) the login. Exchanges the GitHub code for a GitHub access
-// token, fetches identity + org membership with it, and -- only if the
-// person is an ACTIVE member of GITHUB_ORG -- mints our own one-time code
-// and hands them back to the ORIGINAL client's redirect_uri from the
-// pending flow. Anyone who isn't an active org member is rejected here,
-// before any code or token exists for them at all.
+// token, fetches identity with it, and -- only if their GitHub login is on
+// GITHUB_ALLOWED_USERS -- mints our own one-time code and hands them back
+// to the ORIGINAL client's redirect_uri from the pending flow. Anyone not
+// on the allowlist is rejected here, before any code or token exists for
+// them at all.
 app.get('/oauth/github/callback', async (req, res) => {
   const { code, state: flowId, error: githubError } = req.query;
 
@@ -1269,21 +1325,13 @@ app.get('/oauth/github/callback', async (req, res) => {
     const githubUser = await userRes.json();
     const githubLogin = githubUser.login;
 
-    // Are they an ACTIVE member of the required org? Using /user/memberships/orgs/:org
-    // (checks the caller's OWN membership) rather than the org-admin-only
-    // /orgs/:org/members/:username -- read:org is sufficient for this, no
-    // elevated org permissions required on the OAuth App itself.
-    const membershipRes = await fetch(`https://api.github.com/user/memberships/orgs/${encodeURIComponent(GITHUB_ORG)}`, {
-      headers: { Authorization: `Bearer ${githubAccessToken}`, Accept: 'application/vnd.github+json' },
-    });
-    if (!membershipRes.ok) {
-      console.warn(`[OAuth] ${githubLogin} is not a member of org ${GITHUB_ORG} (HTTP ${membershipRes.status})`);
-      return res.status(403).send(`Access denied -- your GitHub account is not a member of ${GITHUB_ORG}.`);
-    }
-    const membership = await membershipRes.json();
-    if (membership.state !== 'active') {
-      console.warn(`[OAuth] ${githubLogin}'s membership in ${GITHUB_ORG} is "${membership.state}", not active`);
-      return res.status(403).send(`Access denied -- your membership in ${GITHUB_ORG} is "${membership.state}", not active.`);
+    // Are they on the allowlist? Case-insensitive against GITHUB_ALLOWED_USERS.
+    // No GitHub API call needed here -- unlike org membership, this is a
+    // local check against config this process already has, so it can't
+    // fail due to the account in question not being an Organization.
+    if (!ALLOWED_GITHUB_LOGINS.has(githubLogin.toLowerCase())) {
+      console.warn(`[OAuth] ${githubLogin} authenticated with GitHub but is not on the allowlist`);
+      return res.status(403).send(`Access denied -- ${githubLogin} is not on the allowed users list.`);
     }
 
     // Identity confirmed. Mint our own one-time code and send the person
@@ -1414,7 +1462,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.15.0',
+    version: '1.15.1',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1427,7 +1475,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.15.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.15.1 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
