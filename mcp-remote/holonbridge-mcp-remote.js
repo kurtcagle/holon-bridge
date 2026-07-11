@@ -91,6 +91,20 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-11 v1.17.0 Per-dataset access control (Option 1). Loads a static
+ *                      .dataset-acl.json file mapping datasets to permitted
+ *                      actors and access levels ("r", "rw", or absent =
+ *                      defaultAccess). Enforcement at the MCP tool level:
+ *                      requireReadAccess() gates sparql_select, sparql_construct,
+ *                      get_holon, list_graphs, nl_query, validate_turtle;
+ *                      requireWriteAccess() gates sparql_update, push_turtle,
+ *                      propose_property_update, create_agent, navigate_agent;
+ *                      switch_dataset refuses switching to a dataset the actor
+ *                      can't access; list_datasets shows yourAccess per dataset.
+ *                      Actor keys are GitHub logins (case-insensitive); "*"
+ *                      means all authenticated users. No ACL file = no
+ *                      enforcement (permissive fallback). Denied requests never
+ *                      leave mcp-remote -- HolonBridge never sees them.
  *   2026-07-11 v1.16.0 Per-actor sticky dataset selection. switch_dataset
  *                      no longer calls HolonBridge's global POST /dataset
  *                      (which silently changed every other concurrent
@@ -420,6 +434,107 @@ function getActorDataset(actorIri) {
 function setActorDataset(actorIri, dataset) {
   actorDatasetState[actorIri] = dataset;
   saveActorDatasetState();
+}
+
+// ── Per-dataset access control (v1.17.0) ────────────────────────────────────────
+//
+// Static allowlist mapping datasets to permitted actors and access levels.
+// Loaded from .dataset-acl.json alongside this script at startup. Format:
+//
+//   {
+//     "defaultAccess": "none",        // "none", "r", or "rw" for unlisted datasets
+//     "datasets": {
+//       "data":  { "*": "rw" },       // "*" = all authenticated users
+//       "chloe": { "kurtcagle": "rw" },
+//       "ggsc":  { "kurtcagle": "rw", "benwortley": "rw" }
+//     }
+//   }
+//
+// Access values: "r" (read only), "rw" (read + write), absent = defaultAccess.
+// Actor keys are GitHub logins (matched case-insensitively against the login
+// resolved at authentication time, not the full actor IRI). "*" matches any
+// authenticated user. A specific login entry overrides "*" for that actor.
+//
+// Enforcement is at the MCP tool level in this process — a denied request
+// never leaves mcp-remote. This does not prevent someone with the raw
+// HB_BEARER_TOKEN from curling HolonBridge directly (see Option 2/3 in the
+// design notes for defense-in-depth if that matters).
+
+const DATASET_ACL_FILE = join(__hbDirname, '.dataset-acl.json');
+
+function loadDatasetAcl() {
+  try {
+    if (existsSync(DATASET_ACL_FILE)) {
+      const raw = JSON.parse(readFileSync(DATASET_ACL_FILE, 'utf8'));
+      console.log(`[dataset-acl] Loaded ACL for ${Object.keys(raw.datasets ?? {}).length} dataset(s) from ${DATASET_ACL_FILE}`);
+      return raw;
+    }
+  } catch (err) {
+    console.warn('[dataset-acl] Failed to load .dataset-acl.json (running without ACL — all access permitted):', err.message);
+  }
+  return null;  // null = no ACL file = no enforcement
+}
+
+const datasetAcl = loadDatasetAcl();
+
+/**
+ * Resolve the effective access level for a given actor on a given dataset.
+ * Returns "rw", "r", or "none".
+ *
+ * Resolution order (first match wins):
+ *   1. Specific login entry in the dataset's actor map
+ *   2. "*" wildcard entry in the dataset's actor map
+ *   3. defaultAccess from the ACL root
+ *   4. "rw" if no ACL file is loaded at all (permissive fallback)
+ */
+function resolveDatasetAccess(githubLogin, dataset) {
+  if (!datasetAcl) return 'rw';  // no ACL file = no enforcement
+  const dsEntry = datasetAcl.datasets?.[dataset];
+  if (!dsEntry) return datasetAcl.defaultAccess ?? 'none';
+  const login = (githubLogin ?? '').toLowerCase();
+  // Specific login entry takes priority over wildcard
+  if (login && dsEntry[login] !== undefined) return dsEntry[login];
+  if (login) {
+    // Case-insensitive search through keys
+    for (const [key, val] of Object.entries(dsEntry)) {
+      if (key !== '*' && key.toLowerCase() === login) return val;
+    }
+  }
+  // Wildcard
+  if (dsEntry['*'] !== undefined) return dsEntry['*'];
+  return datasetAcl.defaultAccess ?? 'none';
+}
+
+/**
+ * Check that the current actor has at least read access to the current dataset.
+ * Throws a descriptive error if denied. Call at the top of read-path tool handlers.
+ */
+function requireReadAccess() {
+  if (!datasetAcl) return;  // no ACL = no enforcement
+  const login = requestContext.getStore()?.githubLogin;
+  const dataset = currentDataset();
+  if (!dataset) return;  // no dataset in context = nothing to check
+  const access = resolveDatasetAccess(login, dataset);
+  if (access === 'none') {
+    throw new Error(`Access denied: you (${login ?? 'unknown'}) do not have read access to dataset "${dataset}".`);
+  }
+  // "r" and "rw" both satisfy a read check
+}
+
+/**
+ * Check that the current actor has write access to the current dataset.
+ * Throws a descriptive error if denied. Call at the top of write-path tool handlers.
+ */
+function requireWriteAccess() {
+  if (!datasetAcl) return;  // no ACL = no enforcement
+  const login = requestContext.getStore()?.githubLogin;
+  const dataset = currentDataset();
+  if (!dataset) return;
+  const access = resolveDatasetAccess(login, dataset);
+  if (access !== 'rw') {
+    const reason = access === 'r' ? 'you have read-only access' : 'you do not have access';
+    throw new Error(`Write denied: ${reason} to dataset "${dataset}" (actor: ${login ?? 'unknown'}).`);
+  }
 }
 
 // ── GSP dataset tracking (health reporting only) ───────────────────────────────────────────
@@ -916,7 +1031,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.16.0',
+    version: '1.17.0',
   });
 
   srv.tool(
@@ -980,6 +1095,7 @@ function createMcpServer(sessionId) {
       graph: z.string().optional().describe('Restrict to this named graph IRI'),
     },
     async ({ query, graph }) => {
+      requireReadAccess();
       const q = graph
         ? `SELECT * WHERE { GRAPH <${graph}> { ${query.replace(/^SELECT.*?WHERE\s*\{/is, '')}` // naive wrap
         : query;
@@ -993,6 +1109,7 @@ function createMcpServer(sessionId) {
     'Execute a SPARQL CONSTRUCT or DESCRIBE query. Returns Turtle.',
     { query: z.string().describe('SPARQL CONSTRUCT or DESCRIBE query string') },
     async ({ query }) => {
+      requireReadAccess();
       const turtle = await hbQuery(query, 'construct');
       return { content: [{ type: 'text', text: turtle }] };
     }
@@ -1003,6 +1120,7 @@ function createMcpServer(sessionId) {
     'Execute a SPARQL UPDATE (INSERT DATA, DELETE DATA, CLEAR, etc.).',
     { update: z.string().describe('SPARQL UPDATE statement') },
     async ({ update }) => {
+      requireWriteAccess();
       const result = await hbUpdate(update);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     }
@@ -1022,6 +1140,7 @@ function createMcpServer(sessionId) {
                      .describe('Write mode: append (default — merges) or replace (overwrites the entire graph)'),
     },
     async ({ turtle, graph_iri, shapes_graph, mode = 'append' }) => {
+      requireWriteAccess();
       const result = await hbPushTurtle(turtle, graph_iri, shapes_graph, mode);
       return { content: [{ type: 'text', text: result }] };
     }
@@ -1037,6 +1156,7 @@ function createMcpServer(sessionId) {
                         .describe('Projection mode (default: immersive)'),
     },
     async ({ holon_iri, projection_mode }) => {
+      requireReadAccess();
       const databook = await hbGetHolon(holon_iri, projection_mode);
       return { content: [{ type: 'text', text: databook }] };
     }
@@ -1063,6 +1183,7 @@ function createMcpServer(sessionId) {
       floor:        z.number().optional().describe('Optional floor for the result (default 0)'),
     },
     async ({ agent_iri, property, delta, rationale, cap_property, floor }) => {
+      requireWriteAccess();
       const result = await hbProposePropertyUpdate(agent_iri, property, delta, rationale, cap_property, floor);
       return { content: [{ type: 'text', text: result }] };
     }
@@ -1096,6 +1217,7 @@ function createMcpServer(sessionId) {
       })).optional().describe('Baseline values for trackable properties (e.g. healthPoints, currentWealth)'),
     },
     async ({ agent_iri, label, agent_kind, description, extra_turtle, trackable_properties }) => {
+      requireWriteAccess();
       const mapped = trackable_properties?.map(tp => ({
         property: tp.property,
         value: tp.value,
@@ -1125,6 +1247,7 @@ function createMcpServer(sessionId) {
       note:            z.string().optional().describe('Optional short note recorded on the VisitEvent'),
     },
     async ({ agent_iri, destination_iri, note }) => {
+      requireWriteAccess();
       const result = await hbNavigateAgent(agent_iri, destination_iri, note);
       return { content: [{ type: 'text', text: result }] };
     }
@@ -1135,6 +1258,7 @@ function createMcpServer(sessionId) {
     'List all named graphs in the Fuseki dataset with triple counts.',
     { filter: z.string().optional().describe('Substring filter on graph IRI') },
     async ({ filter }) => {
+      requireReadAccess();
       const graphs = await hbListGraphs(filter);
       const lines = graphs.map(g => `<${g.iri}>  (${g.triples} triples)`);
       return {
@@ -1154,6 +1278,7 @@ function createMcpServer(sessionId) {
       shapes_graph: z.string().describe('IRI of the SHACL shapes graph in Fuseki'),
     },
     async ({ turtle, shapes_graph }) => {
+      requireReadAccess();
       const report = await hbValidate(turtle, shapes_graph);
       return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }] };
     }
@@ -1167,6 +1292,7 @@ function createMcpServer(sessionId) {
       graph:    z.string().optional().describe('Restrict to this named graph IRI'),
     },
     async ({ question, graph }) => {
+      requireReadAccess();
       const result = await hbNlQuery(question, graph);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
@@ -1186,6 +1312,13 @@ function createMcpServer(sessionId) {
         throw new Error(`HolonBridge /datasets: HTTP ${res.status} — ${msg.slice(0, 200)}`);
       }
       const result = await res.json();
+      // Annotate each dataset with the current actor's access level
+      const login = requestContext.getStore()?.githubLogin;
+      if (datasetAcl && result.datasets) {
+        for (const ds of result.datasets) {
+          ds.yourAccess = resolveDatasetAccess(login, ds.name);
+        }
+      }
       return { content: [{ type: 'text', text: JSON.stringify({ ...result, yourActiveDataset: currentDataset() ?? DEFAULT_DATASET }, null, 2) }] };
     }
   );
@@ -1202,6 +1335,12 @@ function createMcpServer(sessionId) {
     async ({ dataset }) => {
       const actorIri = currentActorIri();
       if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
+      // ACL gate: refuse switching to a dataset the actor can't access at all
+      const login = requestContext.getStore()?.githubLogin;
+      const access = resolveDatasetAccess(login, dataset);
+      if (access === 'none') {
+        throw new Error(`Access denied: you (${login ?? 'unknown'}) do not have access to dataset "${dataset}". Ask the bridge operator to add you to .dataset-acl.json.`);
+      }
       setActorDataset(actorIri, dataset);
       // Also update the live session so subsequent calls in THIS connection
       // immediately reflect the switch without needing a reconnect.
@@ -1546,7 +1685,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.16.0',
+    version: '1.17.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1559,7 +1698,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.16.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.17.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
