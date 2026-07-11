@@ -9,7 +9,8 @@ description: >
   profile management. Also trigger on: "HolonBridge", "holonbridge-mcp-remote",
   "Fuseki bridge", "GSP push", "NL query", "nl_query", "sparql_select",
   "sparql_construct", "push_turtle", "get_holon", "list_graphs",
-  "validate_turtle", "holon endpoint", "Bearer token HGA", or "ngrok holon".
+  "validate_turtle", "holon endpoint", "Bearer token HGA", "ngrok holon", or
+  "trace this holon".
 ---
 
 # HolonBridge Skill
@@ -360,59 +361,50 @@ WHERE {
 }
 ```
 
-#### sparql_update
+#### "Trace this holon" — full inbound/outbound closure including reifications
 
-Execute a SPARQL UPDATE (INSERT DATA, DELETE DATA, CLEAR, etc.).
-
-```
-sparql_update(update)
-```
-
-Routes to Fuseki's `/update` endpoint — do not use SELECT syntax here.
-
-**Prefer `sparql_update` INSERT DATA over `push_turtle` for additive
-operations on existing named graphs.** `push_turtle` uses GSP PUT which
-replaces the entire named graph. `sparql_update` INSERT DATA is always
-additive and safe to use on graphs with existing content.
+When Kurt says **"trace this holon [IRI]"**, produce inline Turtle covering
+every triple where the holon is subject OR object, across all named graphs,
+PLUS every RDF 1.2 reification (`<<s p o>> ?ap ?ao`) whose base triple
+involves the holon — not just direct triples. This dataset reifies
+essentially every asserted triple by default (a full-provenance ingestion
+pattern, not an occasional annotation), so a plain `CONSTRUCT { ?s ?p ?o }`
+misses most of what's actually attached to a holon — the annotation layer
+(who asserted it, when, confidence, comments) lives in the reifications, not
+the base triples.
 
 ```sparql
-PREFIX dct:   <http://purl.org/dc/terms/>
-PREFIX chloe: <urn:chloe:ontology#>
-
-INSERT DATA {
-  GRAPH <urn:chloe:memory:publications> {
-    <urn:chloe:publications:ont:2026-06-28-example>
-        a chloe:Publication ;
-        dct:title "Example Article" ;
-        chloe:status "draft" .
-  }
-}
-```
-
-To update a single property without replacing the record:
-
-```sparql
-PREFIX chloe: <urn:chloe:ontology#>
-PREFIX schema: <https://schema.org/>
-
-DELETE {
-  GRAPH <urn:chloe:memory:publications> {
-    <urn:chloe:publications:ont:2026-06-28-example> chloe:status ?old .
-  }
-}
-INSERT {
-  GRAPH <urn:chloe:memory:publications> {
-    <urn:chloe:publications:ont:2026-06-28-example>
-        chloe:status "published" ;
-        schema:url <https://ontologist.substack.com/p/example> .
-  }
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+CONSTRUCT {
+  ?s ?p ?o .
+  <<?s ?p ?o>> ?ap ?ao .
 }
 WHERE {
-  GRAPH <urn:chloe:memory:publications> {
-    <urn:chloe:publications:ont:2026-06-28-example> chloe:status ?old .
+  {
+    GRAPH ?g {
+      ?s ?p ?o .
+      FILTER(?s = <TARGET_HOLON_IRI> || ?o = <TARGET_HOLON_IRI>)
+    }
+  }
+  UNION
+  {
+    GRAPH ?g2 {
+      <<?s ?p ?o>> ?ap ?ao .
+      FILTER(?s = <TARGET_HOLON_IRI> || ?o = <TARGET_HOLON_IRI>)
+    }
   }
 }
 ```
+
+Run via `sparql_construct` — it returns raw Turtle directly, which is the
+"inline Turtle" Kurt expects back, not a JSON binding set to reformat. The
+`GRAPH ?g` / `GRAPH ?g2` wrapping is deliberate: this searches every named
+graph in the active dataset (holons, events, ontology, shacl, ...) rather
+than assuming the holon only lives in one. If the dataset is large enough
+that a full trace is unwieldy, scope the `GRAPH` clause to a specific graph
+IRI instead of the open variable — but default to all graphs unless told
+otherwise, since provenance annotations often live in a different graph
+(`:events`) than the base assertion (`:holons`).
 
 ---
 
@@ -756,5 +748,5 @@ public ngrok URL: `https://kurtcagle.ngrok.io`.
 
 | Version | Key changes |
 |---|---|
-| v2.9.0 | Current. MCP remote SSE on :3032. Two-token model. Federated registry. |
+| v2.9.0 | Current. MCP remote SSE on :3032. Two-token model. Federated registry. Added "trace this holon" sparql_construct pattern for full inbound/outbound closure including RDF 1.2 reifications. |
 | v2.0.0 | HolonBridge REST API, Jena 6.0 integration, ngrok exposure |
