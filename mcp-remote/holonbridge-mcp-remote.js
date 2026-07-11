@@ -48,6 +48,20 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-11 v1.14.0 Add navigate_agent tool, wrapping HolonBridge's
+ *                      lifecycle verb navigateAgent (POST
+ *                      /holon/:iri/navigate, lib/lifecycle.js). Third
+ *                      lifecycle verb exposed through this MCP remote
+ *                      (after propose_property_update in v1.11.0 and
+ *                      create_agent in v1.12.0). Moves an agent to a new
+ *                      holon, writing a holon:VisitEvent chained via
+ *                      holon:nextVisit from the agent's current visit-chain
+ *                      tail, then updates holon:currentLocation to match --
+ *                      closes the gap where every prior currentLocation
+ *                      change in live Adventure Mode data (including Kim
+ *                      Meades' Bonn -> Germany -> Munich chain) was written
+ *                      by hand via raw sparql_update with no verb
+ *                      enforcing a VisitEvent alongside the change.
  *   2026-07-11 v1.13.0 Add Process Started/Ended timing instrumentation
  *                      (lib/timing.js's timedProcess, shared with HolonBridge
  *                      REST) around every outbound hb* HTTP call to
@@ -395,6 +409,35 @@ async function hbCreateAgent(agentIri, label, agentKind, actorIri, description, 
 }
 
 /**
+ * Move an agent to a new holon via HolonBridge's navigateAgent lifecycle
+ * verb (POST /holon/:iri/navigate, lib/lifecycle.js). Writes a
+ * holon:VisitEvent chained via holon:nextVisit from the agent's current
+ * visit-chain tail, then updates holon:currentLocation to match.
+ * destinationIri must already exist as a holon on the HolonBridge side --
+ * a dangling destination comes back as a non-2xx response (409
+ * CommandRejected), surfaced here as a thrown Error carrying the response
+ * body. Third lifecycle verb wired through this MCP remote (after
+ * propose_property_update in v1.11.0 and create_agent in v1.12.0).
+ */
+async function hbNavigateAgent(agentIri, destinationIri, actorIri, note) {
+  return timedProcess(`mcp-remote -> HolonBridge /holon/.../navigate [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const url = `${activeBaseUrl()}/holon/${encodeURIComponent(agentIri)}/navigate`;
+    const body = { destinationIri, actor: { iri: actorIri } };
+    if (note !== undefined) body.note = note;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HolonBridge /holon/.../navigate: HTTP ${res.status} — ${text.slice(0, 400)}`);
+    }
+    return text;
+  });
+}
+
+/**
  * Validate a Turtle payload against a SHACL shapes graph.
  *
  * The current /validate route (lib/validate.js, v2.9.1+) only validates a
@@ -580,7 +623,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.13.0',
+    version: '1.14.0',
   });
 
   srv.tool(
@@ -768,6 +811,28 @@ function createMcpServer() {
         ...(tp.floor !== undefined ? { floor: tp.floor } : {}),
       }));
       const result = await hbCreateAgent(agent_iri, label, agent_kind, actor_iri, description, extra_turtle, mapped);
+      return { content: [{ type: 'text', text: result }] };
+    }
+  );
+
+  srv.tool(
+    'navigate_agent',
+    "Move an agent to a new holon via HolonBridge's navigateAgent lifecycle verb " +
+    '(POST /holon/:iri/navigate). Writes a holon:VisitEvent chained via holon:nextVisit ' +
+    "from the agent's current visit-chain tail, then updates holon:currentLocation to " +
+    'match. destination_iri must already exist as a holon on the HolonBridge side -- a ' +
+    'dangling destination is refused rather than leaving the agent pointed at nothing. ' +
+    'Self-service when actor_iri equals agent_iri (an agent moving itself); Write on the ' +
+    "dataset anchor is required to move an agent other than the actor. Third lifecycle " +
+    'verb exposed through this MCP remote, after propose_property_update and create_agent.',
+    {
+      agent_iri:       z.string().describe('IRI of the agent being moved'),
+      destination_iri: z.string().describe('IRI of the holon the agent is moving to -- must already exist'),
+      actor_iri:       z.string().describe('IRI of the actor performing this move (holon:agent / prov:wasGeneratedBy)'),
+      note:            z.string().optional().describe('Optional short note recorded on the VisitEvent'),
+    },
+    async ({ agent_iri, destination_iri, actor_iri, note }) => {
+      const result = await hbNavigateAgent(agent_iri, destination_iri, actor_iri, note);
       return { content: [{ type: 'text', text: result }] };
     }
   );
@@ -1013,7 +1078,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.13.0',
+    version: '1.14.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1026,7 +1091,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.13.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.14.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
