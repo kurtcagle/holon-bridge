@@ -1,0 +1,16 @@
+{
+  "defaultAccess": "none",
+  "datasets": {
+    "data":        { "*": "rw" },
+    "ds":          { "*": "rw" },
+    "chloe":       { "kurtcagle": "rw" },
+    "ggsc":        { "kurtcagle": "rw", "benwortley": "rw" },
+    "causalspark": { "kurtcagle": "rw" },
+    "storme":      { "kurtcagle": "rw" },
+    "hcg":         { "*": "r", "kurtcagle": "rw" },
+    "crm":         { "kurtcagle": "rw" },
+    "context":     { "kurtcagle": "rw" },
+    "shapes":      { "kurtcagle": "rw" },
+    "chloe-scratchpad": { "kurtcagle": "rw" }
+  }
+}
