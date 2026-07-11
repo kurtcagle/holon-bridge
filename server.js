@@ -69,6 +69,7 @@ import { loadDataBookFromDir }                                      from './lib/
 import { runQuery, formatBindings, discoverGraphs,
          checkShaclGraph, pushToGraph, SparqlError }               from './lib/sparql.js'
 import { buildQuery, retryQuery, interpretResults }                 from './lib/llm.js'
+import { requestTimingMiddleware }                                  from './lib/timing.js'
 import { buildResponseDataBook }                                    from './lib/format.js'
 import { validateWithShacl }                                        from './lib/shacl.js'
 import { validateHandler }                                          from './lib/validate.js'
@@ -813,6 +814,17 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
 })
+
+// -- Request timing (Process Started/Ended, see lib/timing.js) ----------------
+//
+// Wraps every request end-to-end. Total duration here, minus the sum of any
+// Jena/LLM PROCESS blocks logged during the same request, is latency this
+// bridge doesn't control -- network round-trip, MCP remote SSE relay,
+// client-side bandwidth. Mounted this early (after CORS, before OAuth/auth)
+// so it covers as much of the request lifecycle as this process can see,
+// including auth rejections and the MCP compatibility rewrite below.
+
+app.use(requestTimingMiddleware())
 
 // -- OAuth2 shim (must be before requireAuth) ----------------------------------
 //
