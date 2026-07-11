@@ -18,24 +18,55 @@
  * Setup
  * ─────
  *   npm install @modelcontextprotocol/sdk express cors
+ *   (no new dependency for OAuth/JWT -- see signJwt/verifyJwt below,
+ *   hand-rolled HS256 using Node's built-in crypto module)
+ *
+ * GitHub OAuth App setup (one-time, in the org's GitHub settings):
+ *   Register an OAuth App (not a GitHub App -- no installation-level
+ *   permissions needed, just identity + org membership).
+ *   Authorization callback URL: {MCP_PUBLIC_URL}/oauth/github/callback
+ *   Note the generated Client ID and Client Secret for the env vars below.
  *
  * Environment (.env in the same directory as this file):
  *   HOLONBRIDGE_URL=http://localhost:3031
- *   HB_BEARER_TOKEN=<token for outbound HolonBridge REST calls>
- *   MCP_REMOTE_TOKEN=<token Claude sends as Bearer on /sse — must match the
- *                     credential entered in the Claude integration settings AND
- *                     the client_secret Claude sends to POST /token during the
- *                     OAuth flow; set all three to the same value for now>
+ *   HB_BEARER_TOKEN=<token for outbound HolonBridge REST calls -- service-
+ *                    to-service secret between this process and
+ *                    HolonBridge, never seen by a browser or a person>
+ *   GITHUB_CLIENT_ID=<from the GitHub OAuth App above>
+ *   GITHUB_CLIENT_SECRET=<from the GitHub OAuth App above>
+ *   GITHUB_ORG=<the org whose ACTIVE members may log in, e.g. "kurtcagle">
+ *   JWT_SECRET=<generate with: openssl rand -hex 32 -- signs per-user
+ *               login tokens this process issues; distinct from
+ *               HB_BEARER_TOKEN>
+ *   JWT_EXPIRES_IN_SEC=43200         # optional, default 12h
+ *   SERVICE_ACTOR_IRI=https://w3id.org/users/service-account  # optional
+ *   MCP_REMOTE_TOKEN=<optional legacy fallback -- see Token relationship>
  *   MCP_PORT=3032
  *   MCP_PUBLIC_URL=https://kurtcagle-mcp.ngrok.io  # your public ngrok/tunnel URL
  *   FUSEKI_GSP=http://localhost:3030/ds/data        # retained for health reporting
  *                                                   # no longer used by push_turtle
  *
- * Token relationship (TODO: split properly when per-user scoping is added):
- *   HB_BEARER_TOKEN      — protects HolonBridge from the MCP remote
- *   MCP_REMOTE_TOKEN     — protects the MCP remote from external clients
- *   OAuth client_secret  — Claude sends this during /token exchange; must equal
- *                          MCP_REMOTE_TOKEN for the Bearer check on /sse to pass
+ * Token relationship (2026-07-11, v1.15.0):
+ *   HB_BEARER_TOKEN      — protects HolonBridge from the MCP remote. Static
+ *                          service-to-service secret, unchanged by this
+ *                          version, never exposed to a browser or a person.
+ *   GitHub OAuth          — a PERSON authenticates by logging into GitHub
+ *                          and proving ACTIVE membership in GITHUB_ORG (see
+ *                          /authorize, /oauth/github/callback below).
+ *   Per-user JWT          — minted by /token after a successful GitHub
+ *                          login, carrying sub=https://w3id.org/users/
+ *                          {githubLogin}. This is what a browser/client
+ *                          actually holds and sends as Bearer on /sse and
+ *                          /message -- verified by requireAuth, resolved to
+ *                          req.actorIri once per session.
+ *   MCP_REMOTE_TOKEN      — OPTIONAL legacy fallback for non-interactive
+ *                          automation (scripts/CI) that can't do a browser
+ *                          login. If set, requireAuth still accepts an
+ *                          exact match, but resolves to the single shared
+ *                          SERVICE_ACTOR_IRI rather than a real identity --
+ *                          same ambiguity every call had before this
+ *                          version. New interactive use should always go
+ *                          through GitHub login instead.
  *
  * NOTE on registry-backed profiles (see below): querying GET /registry uses
  * this bridge's own HB_BEARER_TOKEN, which is sufficient to read federation
@@ -48,6 +79,33 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-11 v1.15.0 Replace the single shared MCP_REMOTE_TOKEN with real
+ *                      GitHub OAuth login. /authorize now redirects to
+ *                      GitHub instead of minting a fake code; a new
+ *                      /oauth/github/callback route exchanges the GitHub
+ *                      code, fetches identity, and checks ACTIVE membership
+ *                      in GITHUB_ORG (via /user/memberships/orgs/:org,
+ *                      read:org scope -- no elevated org permissions
+ *                      needed) before issuing anything; /token now signs a
+ *                      real per-user JWT (hand-rolled HS256, no new
+ *                      dependency -- see signJwt/verifyJwt) carrying
+ *                      sub=https://w3id.org/users/{githubLogin} instead of
+ *                      handing back the shared secret. requireAuth verifies
+ *                      that JWT (or, as a legacy fallback, an exact
+ *                      MCP_REMOTE_TOKEN match resolving to
+ *                      SERVICE_ACTOR_IRI) and resolves the caller's
+ *                      identity once at /sse connection time; every
+ *                      lifecycle-verb tool (propose_property_update,
+ *                      create_agent, navigate_agent) now reads that
+ *                      identity via currentActorIri() -- threaded through
+ *                      the same AsyncLocalStorage already used for
+ *                      request-correlation IDs -- instead of trusting a
+ *                      client-supplied actor_iri parameter, which is
+ *                      dropped from all three tool schemas. This is the
+ *                      substantive change: before this version, anyone
+ *                      holding the one shared token could claim to be any
+ *                      actor in the system; RoleBinding capability checks
+ *                      were only ever as trustworthy as that claim.
  *   2026-07-11 v1.14.0 Add navigate_agent tool, wrapping HolonBridge's
  *                      lifecycle verb navigateAgent (POST
  *                      /holon/:iri/navigate, lib/lifecycle.js). Third
@@ -197,7 +255,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHmac } from 'crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
@@ -205,6 +263,23 @@ import { z } from 'zod';
 import { timedProcess } from '../lib/timing.js';
 
 // ── Configuration ─────────────────────────────────────────────────────────────────
+//
+// Identity model (2026-07-11, v1.15.0): GitHub OAuth replaces the single
+// shared MCP_REMOTE_TOKEN as the primary way a *person* authenticates.
+// GITHUB_CLIENT_ID/SECRET and GITHUB_ORG are required for the login flow
+// (see /authorize, /oauth/github/callback, /token below). JWT_SECRET signs
+// the per-user tokens this process issues after a successful GitHub login
+// and org-membership check -- distinct from HB_BEARER_TOKEN, which remains
+// a service-to-service secret between this process and HolonBridge REST
+// and is never seen by a browser or a person.
+//
+// MCP_REMOTE_TOKEN is now OPTIONAL and legacy: if set, it's still accepted
+// as a Bearer credential (for scripts/CI that can't do an interactive
+// GitHub login), but it resolves to a single shared SERVICE_ACTOR_IRI
+// rather than a real person's identity -- every RoleBinding capability
+// check against that IRI applies to whatever holds the token, same
+// ambiguity as before this change. New interactive use should go through
+// GitHub login.
 
 const {
   HOLONBRIDGE_URL = 'http://localhost:3031',
@@ -212,10 +287,21 @@ const {
   MCP_REMOTE_TOKEN,
   MCP_PORT = '3032',
   FUSEKI_GSP = 'http://localhost:3030/ds/data',  // retained for health reporting; no longer used by push_turtle
+  GITHUB_CLIENT_ID,
+  GITHUB_CLIENT_SECRET,
+  GITHUB_ORG,
+  JWT_SECRET,
+  JWT_EXPIRES_IN_SEC = String(12 * 60 * 60),   // 12h default
+  SERVICE_ACTOR_IRI = 'https://w3id.org/users/service-account',
 } = process.env;
 
-if (!HB_BEARER_TOKEN)  throw new Error('HB_BEARER_TOKEN is required in .env');
-if (!MCP_REMOTE_TOKEN) throw new Error('MCP_REMOTE_TOKEN is required in .env');
+if (!HB_BEARER_TOKEN)    throw new Error('HB_BEARER_TOKEN is required in .env');
+if (!GITHUB_CLIENT_ID)   throw new Error('GITHUB_CLIENT_ID is required in .env (GitHub OAuth App)');
+if (!GITHUB_CLIENT_SECRET) throw new Error('GITHUB_CLIENT_SECRET is required in .env (GitHub OAuth App)');
+if (!GITHUB_ORG)         throw new Error('GITHUB_ORG is required in .env -- the org whose active members may log in');
+if (!JWT_SECRET)         throw new Error('JWT_SECRET is required in .env (generate with: openssl rand -hex 32) -- signs per-user login tokens');
+
+const JWT_EXPIRES_IN_SECONDS = parseInt(JWT_EXPIRES_IN_SEC, 10) || 12 * 60 * 60;
 
 // ── GSP dataset tracking (health reporting only) ───────────────────────────────────────────
 //
@@ -226,6 +312,58 @@ if (!MCP_REMOTE_TOKEN) throw new Error('MCP_REMOTE_TOKEN is required in .env');
 
 const jenaBase = FUSEKI_GSP.replace(/\/[^/]+\/data\/?$/, '');   // "http://localhost:3030"
 let activeFusekiDataset = FUSEKI_GSP.match(/\/([^/]+)\/data\/?$/)?.[1] ?? 'ds';
+
+// ── JWT helpers (minimal HS256, no external dependency) ─────────────────────────────
+//
+// Deliberately hand-rolled rather than pulling in `jsonwebtoken` -- the
+// surface this process needs is tiny (sign one claim set, verify signature
+// + expiry) and a dependency-free implementation means this file's identity
+// layer can be read start-to-finish without trusting a third-party library's
+// parsing of attacker-controlled input. Standard JWT wire format (base64url
+// header.payload.signature) so tokens remain inspectable with any JWT
+// debugger if needed.
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64urlDecode(input) {
+  const padded = input.replace(/-/g, '+').replace(/_/g, '/').padEnd(input.length + (4 - (input.length % 4 || 4)) % 4, '=');
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function signJwt(payload, secret, expiresInSeconds) {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const fullPayload = { ...payload, iat: now, exp: now + expiresInSeconds };
+  const headerB64  = base64url(JSON.stringify(header));
+  const payloadB64 = base64url(JSON.stringify(fullPayload));
+  const signature = createHmac('sha256', secret).update(`${headerB64}.${payloadB64}`).digest('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `${headerB64}.${payloadB64}.${signature}`;
+}
+
+/**
+ * Verify a JWT's signature and expiry. Returns the decoded payload on
+ * success, or null on any failure (bad format, bad signature, expired) --
+ * callers treat null as "not authenticated," never distinguishing failure
+ * reasons to the client, to avoid leaking which part of a forged token was
+ * wrong.
+ */
+function verifyJwt(token, secret) {
+  try {
+    const [headerB64, payloadB64, signatureB64] = token.split('.');
+    if (!headerB64 || !payloadB64 || !signatureB64) return null;
+    const expectedSig = createHmac('sha256', secret).update(`${headerB64}.${payloadB64}`).digest('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    if (expectedSig !== signatureB64) return null;
+    const payload = JSON.parse(base64urlDecode(payloadB64));
+    if (typeof payload.exp !== 'number' || Math.floor(Date.now() / 1000) >= payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
 
 // ── HolonBridge HTTP helpers (aligned to v2.9.0 routes) ────────────────────────────
 
@@ -246,11 +384,23 @@ let activeFusekiDataset = FUSEKI_GSP.match(/\/([^/]+)\/data\/?$/)?.[1] ?? 'ds';
 // tunnel. Isolating that leg specifically requires a manual client-side
 // wall-clock comparison against this process's own [PROCESS N] Started
 // timestamp for the same call.
+//
+// Extended 2026-07-11 (v1.15.0) to also carry actorIri/githubLogin -- the
+// identity resolved once at /sse connection time from the caller's Bearer
+// token (see requireAuth and the /sse handler below), threaded through the
+// same AsyncLocalStorage so every lifecycle-verb tool handler can read
+// currentActorIri() instead of trusting a client-supplied actor_iri
+// parameter. This is the actual security-relevant change in this version --
+// everything else here is plumbing to make that one substitution possible.
 
 const requestContext = new AsyncLocalStorage();
 
 function currentRequestId() {
   return requestContext.getStore()?.reqId;
+}
+
+function currentActorIri() {
+  return requestContext.getStore()?.actorIri;
 }
 
 const hbHeaders = (extra = {}) => {
@@ -358,8 +508,16 @@ async function hbGetHolon(holonIri, projectionMode = 'immersive') {
  * side -- a rejection comes back as a non-2xx HTTP response (409 for
  * CommandRejected, 403 for UnauthorisedError), surfaced here as a thrown
  * Error carrying the response body so the violation detail isn't lost.
+ *
+ * actorIri (2026-07-11, v1.15.0) is no longer a caller-supplied argument --
+ * it's read from currentActorIri(), resolved once at login from the
+ * caller's verified GitHub identity (see requireAuth / /sse below). A tool
+ * caller can no longer claim to be a different actor than the person who
+ * actually logged in.
  */
-async function hbProposePropertyUpdate(agentIri, property, delta, rationale, actorIri, capProperty, floor) {
+async function hbProposePropertyUpdate(agentIri, property, delta, rationale, capProperty, floor) {
+  const actorIri = currentActorIri();
+  if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
   return timedProcess(`mcp-remote -> HolonBridge /holon/.../property [reqId=${currentRequestId() ?? 'none'}]`, async () => {
     const url = `${activeBaseUrl()}/holon/${encodeURIComponent(agentIri)}/property`;
     const body = { property, delta, rationale, actor: { iri: actorIri } };
@@ -387,8 +545,13 @@ async function hbProposePropertyUpdate(agentIri, property, delta, rationale, act
  * shape rejects the whole creation -- surfaced here as a thrown Error
  * carrying the response body (409 with violation detail, not a silent
  * partial write).
+ *
+ * actorIri comes from currentActorIri() (see hbProposePropertyUpdate above
+ * for why), not a caller-supplied argument.
  */
-async function hbCreateAgent(agentIri, label, agentKind, actorIri, description, extraTurtle, trackableProperties) {
+async function hbCreateAgent(agentIri, label, agentKind, description, extraTurtle, trackableProperties) {
+  const actorIri = currentActorIri();
+  if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
   return timedProcess(`mcp-remote -> HolonBridge /agent [reqId=${currentRequestId() ?? 'none'}]`, async () => {
     const url = `${activeBaseUrl()}/agent`;
     const body = { agentIri, label, agentKind, actor: { iri: actorIri } };
@@ -418,8 +581,13 @@ async function hbCreateAgent(agentIri, label, agentKind, actorIri, description, 
  * CommandRejected), surfaced here as a thrown Error carrying the response
  * body. Third lifecycle verb wired through this MCP remote (after
  * propose_property_update in v1.11.0 and create_agent in v1.12.0).
+ *
+ * actorIri comes from currentActorIri() (see hbProposePropertyUpdate above
+ * for why), not a caller-supplied argument.
  */
-async function hbNavigateAgent(agentIri, destinationIri, actorIri, note) {
+async function hbNavigateAgent(agentIri, destinationIri, note) {
+  const actorIri = currentActorIri();
+  if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
   return timedProcess(`mcp-remote -> HolonBridge /holon/.../navigate [reqId=${currentRequestId() ?? 'none'}]`, async () => {
     const url = `${activeBaseUrl()}/holon/${encodeURIComponent(agentIri)}/navigate`;
     const body = { destinationIri, actor: { iri: actorIri } };
@@ -623,7 +791,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.14.0',
+    version: '1.15.0',
   });
 
   srv.tool(
@@ -759,18 +927,18 @@ function createMcpServer() {
     'trace left in either the holons or events graph. On success, writes a ' +
     'holon:ModelUpdateRequest + holon:ModelUpdateApprove event pair plus the new value ' +
     'on the agent. Pass cap_property (e.g. maxHealthPoints) to cap the result at another ' +
-    "property's current value, mirroring the existing healthPoints capping behaviour.",
+    "property's current value, mirroring the existing healthPoints capping behaviour. " +
+    'The acting actor is your own logged-in identity -- not a parameter you supply.',
     {
       agent_iri:    z.string().describe('IRI of the agent whose property is changing'),
       property:     z.string().describe('Full IRI of the numeric property, e.g. https://schema.org/currentWealth'),
       delta:        z.number().describe('Signed amount to add (negative to subtract/spend)'),
       rationale:    z.string().describe('Short human-readable reason for this change'),
-      actor_iri:    z.string().describe('IRI of the actor performing this change (holon:agent / prov:wasGeneratedBy)'),
       cap_property: z.string().optional().describe('Optional IRI of a property to cap the result at, e.g. https://schema.org/maxHealthPoints'),
       floor:        z.number().optional().describe('Optional floor for the result (default 0)'),
     },
-    async ({ agent_iri, property, delta, rationale, actor_iri, cap_property, floor }) => {
-      const result = await hbProposePropertyUpdate(agent_iri, property, delta, rationale, actor_iri, cap_property, floor);
+    async ({ agent_iri, property, delta, rationale, cap_property, floor }) => {
+      const result = await hbProposePropertyUpdate(agent_iri, property, delta, rationale, cap_property, floor);
       return { content: [{ type: 'text', text: result }] };
     }
   );
@@ -786,12 +954,12 @@ function createMcpServer() {
     'per-property. A single baseline that violates its shape rejects the ENTIRE creation ' +
     '(no partial agent). extra_turtle is for static, non-tracked properties (species, ' +
     'gender, currentLocation, etc.) that do not need baseline events -- append raw Turtle ' +
-    'triples with <agent_iri> as the implied subject.',
+    'triples with <agent_iri> as the implied subject. The acting actor is your own ' +
+    'logged-in identity -- not a parameter you supply.',
     {
       agent_iri:  z.string().describe('IRI for the new agent'),
       label:      z.string().describe('rdfs:label for the agent, e.g. "Lina"'),
       agent_kind: z.string().describe('holon:agentKind value, e.g. "npc" or "player"'),
-      actor_iri:  z.string().describe('IRI of the actor creating this agent (holon:agent / prov:wasGeneratedBy)'),
       description: z.string().optional().describe('Optional holon:description for the agent'),
       extra_turtle: z.string().optional().describe('Optional raw Turtle for static, non-tracked properties on the agent'),
       trackable_properties: z.array(z.object({
@@ -802,7 +970,7 @@ function createMcpServer() {
         floor:        z.number().optional().describe('Override the ontology-declared floor'),
       })).optional().describe('Baseline values for trackable properties (e.g. healthPoints, currentWealth)'),
     },
-    async ({ agent_iri, label, agent_kind, actor_iri, description, extra_turtle, trackable_properties }) => {
+    async ({ agent_iri, label, agent_kind, description, extra_turtle, trackable_properties }) => {
       const mapped = trackable_properties?.map(tp => ({
         property: tp.property,
         value: tp.value,
@@ -810,7 +978,7 @@ function createMcpServer() {
         ...(tp.cap_value !== undefined ? { capValue: tp.cap_value } : {}),
         ...(tp.floor !== undefined ? { floor: tp.floor } : {}),
       }));
-      const result = await hbCreateAgent(agent_iri, label, agent_kind, actor_iri, description, extra_turtle, mapped);
+      const result = await hbCreateAgent(agent_iri, label, agent_kind, description, extra_turtle, mapped);
       return { content: [{ type: 'text', text: result }] };
     }
   );
@@ -822,17 +990,17 @@ function createMcpServer() {
     "from the agent's current visit-chain tail, then updates holon:currentLocation to " +
     'match. destination_iri must already exist as a holon on the HolonBridge side -- a ' +
     'dangling destination is refused rather than leaving the agent pointed at nothing. ' +
-    'Self-service when actor_iri equals agent_iri (an agent moving itself); Write on the ' +
-    "dataset anchor is required to move an agent other than the actor. Third lifecycle " +
+    'Self-service when your logged-in identity equals agent_iri (moving yourself); Write ' +
+    "on the dataset anchor is required to move an agent other than yourself. The acting " +
+    'actor is your own logged-in identity -- not a parameter you supply. Third lifecycle ' +
     'verb exposed through this MCP remote, after propose_property_update and create_agent.',
     {
       agent_iri:       z.string().describe('IRI of the agent being moved'),
       destination_iri: z.string().describe('IRI of the holon the agent is moving to -- must already exist'),
-      actor_iri:       z.string().describe('IRI of the actor performing this move (holon:agent / prov:wasGeneratedBy)'),
       note:            z.string().optional().describe('Optional short note recorded on the VisitEvent'),
     },
-    async ({ agent_iri, destination_iri, actor_iri, note }) => {
-      const result = await hbNavigateAgent(agent_iri, destination_iri, actor_iri, note);
+    async ({ agent_iri, destination_iri, note }) => {
+      const result = await hbNavigateAgent(agent_iri, destination_iri, note);
       return { content: [{ type: 'text', text: result }] };
     }
   );
@@ -937,12 +1105,44 @@ app.options('*', cors());
 // via SSEServerTransport.handlePostMessage; parsing the body here would consume
 // the stream before the transport can read it, causing 400 errors.
 
-// ── Minimal OAuth 2.0 + PKCE implementation ──────────────────────────────────────────
+// ── GitHub OAuth + JWT identity implementation ───────────────────────────────────────
+//
+// Replaces the pre-v1.15.0 shim, which accepted any authorization code or
+// client_credentials grant and handed back the same static MCP_REMOTE_TOKEN
+// regardless of who -- or whether anyone -- was actually asking. This is a
+// real login: /authorize now sends the browser to GitHub, /oauth/github/callback
+// verifies the person is an active member of GITHUB_ORG and mints a signed
+// per-user JWT (see signJwt/verifyJwt above), and /token exchanges the
+// one-time code from that callback for the JWT. requireAuth below verifies
+// that JWT (or, as a legacy fallback, the static MCP_REMOTE_TOKEN, mapped to
+// SERVICE_ACTOR_IRI) and resolves the caller's identity once per /sse
+// connection -- see the /sse handler and currentActorIri() above for how
+// that identity then reaches every lifecycle-verb tool call without the
+// caller ever supplying it themselves.
+//
+// PKCE note: the advertised token_endpoint_auth_methods_supported includes
+// 'none' (implying PKCE for public clients per spec), but code_verifier is
+// not currently checked against a stored code_challenge -- this carries
+// forward a gap that predates this change (the old shim didn't check it
+// either) rather than introducing a new one. Worth closing before this is
+// exposed beyond a small trusted org, but out of scope for the identity
+// substitution this version is about.
 
 const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io';
+const GITHUB_CALLBACK_URL = `${MCP_PUBLIC_URL}/oauth/github/callback`;
 
-const authCodes = new Map();
 const registeredClients = new Map();
+
+// pendingAuthFlows: our own flowId -> the ORIGINAL client's redirect_uri/state/
+// client_id, captured at /authorize before we ever hand off to GitHub. GitHub's
+// own `state` query param carries this flowId through its redirect so we can
+// recover the original client's request once the person is back from GitHub.
+const pendingAuthFlows = new Map();
+
+// authCodes: our own one-time code (handed to the ORIGINAL client's
+// redirect_uri after a successful GitHub login) -> the resolved identity
+// (actorIri, githubLogin, name) that /token exchanges for a signed JWT.
+const authCodes = new Map();
 
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
   console.log('[OAuth] GET /.well-known/oauth-protected-resource');
@@ -969,7 +1169,7 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
     authorization_endpoint:                `${MCP_PUBLIC_URL}/authorize`,
     token_endpoint:                        `${MCP_PUBLIC_URL}/token`,
     registration_endpoint:                 `${MCP_PUBLIC_URL}/register`,
-    grant_types_supported:                 ['authorization_code', 'client_credentials'],
+    grant_types_supported:                 ['authorization_code'],
     response_types_supported:              ['code'],
     code_challenge_methods_supported:      ['S256', 'plain'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
@@ -990,21 +1190,122 @@ app.post('/register', express.json(), (req, res) => {
   });
 });
 
+// GET /authorize -- entry point for the OAuth dance. Stashes the ORIGINAL
+// client's redirect_uri/state/client_id under a fresh flowId, then sends the
+// browser to GitHub's own authorize endpoint with that flowId riding in
+// GitHub's `state` param (GitHub echoes state back verbatim on its own
+// redirect, which is how we recover the original request in the callback
+// below -- our flowId and the client's own `state` are different things
+// living in different places for exactly this reason).
 app.get('/authorize', (req, res) => {
   console.log('[OAuth] GET /authorize query:', JSON.stringify(req.query));
   const { redirect_uri, state, client_id } = req.query;
   if (!redirect_uri) {
     return res.status(400).json({ error: 'redirect_uri is required' });
   }
-  const code = randomUUID();
-  authCodes.set(code, { redirect_uri, state, client_id });
-  setTimeout(() => authCodes.delete(code), 5 * 60 * 1000);
 
-  const url = new URL(redirect_uri);
-  url.searchParams.set('code', code);
-  if (state) url.searchParams.set('state', state);
-  console.log(`[OAuth] Redirecting with code to ${redirect_uri}`);
-  return res.redirect(url.toString());
+  const flowId = randomUUID();
+  pendingAuthFlows.set(flowId, { redirect_uri, state, client_id, createdAt: Date.now() });
+  setTimeout(() => pendingAuthFlows.delete(flowId), 10 * 60 * 1000);
+
+  const githubUrl = new URL('https://github.com/login/oauth/authorize');
+  githubUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
+  githubUrl.searchParams.set('redirect_uri', GITHUB_CALLBACK_URL);
+  githubUrl.searchParams.set('scope', 'read:org');
+  githubUrl.searchParams.set('state', flowId);
+
+  console.log(`[OAuth] Redirecting to GitHub for login (flowId=${flowId})`);
+  return res.redirect(githubUrl.toString());
+});
+
+// GET /oauth/github/callback -- GitHub sends the person back here after they
+// approve (or deny) the login. Exchanges the GitHub code for a GitHub access
+// token, fetches identity + org membership with it, and -- only if the
+// person is an ACTIVE member of GITHUB_ORG -- mints our own one-time code
+// and hands them back to the ORIGINAL client's redirect_uri from the
+// pending flow. Anyone who isn't an active org member is rejected here,
+// before any code or token exists for them at all.
+app.get('/oauth/github/callback', async (req, res) => {
+  const { code, state: flowId, error: githubError } = req.query;
+
+  if (githubError) {
+    console.warn(`[OAuth] GitHub returned an error: ${githubError}`);
+    return res.status(400).send(`GitHub login failed: ${githubError}`);
+  }
+  if (!code || !flowId || !pendingAuthFlows.has(flowId)) {
+    return res.status(400).send('Invalid or expired login attempt -- please try logging in again.');
+  }
+
+  const flow = pendingAuthFlows.get(flowId);
+  pendingAuthFlows.delete(flowId);
+
+  try {
+    // Exchange the GitHub code for a GitHub access token.
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: GITHUB_CALLBACK_URL,
+      }),
+    });
+    const tokenJson = await tokenRes.json();
+    if (!tokenJson.access_token) {
+      console.warn('[OAuth] GitHub token exchange failed:', JSON.stringify(tokenJson));
+      return res.status(502).send('GitHub login failed during token exchange.');
+    }
+    const githubAccessToken = tokenJson.access_token;
+
+    // Who is this?
+    const userRes = await fetch('https://api.github.com/user', {
+      headers: { Authorization: `Bearer ${githubAccessToken}`, Accept: 'application/vnd.github+json' },
+    });
+    if (!userRes.ok) {
+      console.warn(`[OAuth] GitHub /user returned HTTP ${userRes.status}`);
+      return res.status(502).send('GitHub login failed while fetching identity.');
+    }
+    const githubUser = await userRes.json();
+    const githubLogin = githubUser.login;
+
+    // Are they an ACTIVE member of the required org? Using /user/memberships/orgs/:org
+    // (checks the caller's OWN membership) rather than the org-admin-only
+    // /orgs/:org/members/:username -- read:org is sufficient for this, no
+    // elevated org permissions required on the OAuth App itself.
+    const membershipRes = await fetch(`https://api.github.com/user/memberships/orgs/${encodeURIComponent(GITHUB_ORG)}`, {
+      headers: { Authorization: `Bearer ${githubAccessToken}`, Accept: 'application/vnd.github+json' },
+    });
+    if (!membershipRes.ok) {
+      console.warn(`[OAuth] ${githubLogin} is not a member of org ${GITHUB_ORG} (HTTP ${membershipRes.status})`);
+      return res.status(403).send(`Access denied -- your GitHub account is not a member of ${GITHUB_ORG}.`);
+    }
+    const membership = await membershipRes.json();
+    if (membership.state !== 'active') {
+      console.warn(`[OAuth] ${githubLogin}'s membership in ${GITHUB_ORG} is "${membership.state}", not active`);
+      return res.status(403).send(`Access denied -- your membership in ${GITHUB_ORG} is "${membership.state}", not active.`);
+    }
+
+    // Identity confirmed. Mint our own one-time code and send the person
+    // back to wherever they actually started (the original client's
+    // redirect_uri), carrying the client's OWN state -- not our flowId,
+    // which has already served its purpose and is discarded above.
+    const actorIri = `https://w3id.org/users/${githubLogin}`;
+    const ourCode = randomUUID();
+    authCodes.set(ourCode, { actorIri, githubLogin, name: githubUser.name ?? githubLogin });
+    setTimeout(() => authCodes.delete(ourCode), 5 * 60 * 1000);
+
+    console.log(`[OAuth] ${githubLogin} (${actorIri}) authenticated -- issuing code for ${flow.redirect_uri}`);
+
+    const redirectUrl = new URL(flow.redirect_uri);
+    redirectUrl.searchParams.set('code', ourCode);
+    if (flow.state) redirectUrl.searchParams.set('state', flow.state);
+    return res.redirect(redirectUrl.toString());
+
+  } catch (err) {
+    console.error('[OAuth] /oauth/github/callback error:', err.message);
+    return res.status(500).send('GitHub login failed unexpectedly. Please try again.');
+  }
 });
 
 app.post('/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
@@ -1015,28 +1316,59 @@ app.post('/token', express.urlencoded({ extended: false }), express.json(), (req
     if (!code || !authCodes.has(code)) {
       return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown or expired code.' });
     }
-    authCodes.delete(code);
-    return res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer', expires_in: 86400 });
+    const { actorIri, githubLogin, name } = authCodes.get(code);
+    authCodes.delete(code); // one-time use
+    const accessToken = signJwt({ sub: actorIri, githubLogin, name }, JWT_SECRET, JWT_EXPIRES_IN_SECONDS);
+    return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: JWT_EXPIRES_IN_SECONDS });
   }
 
-  if (grant_type === 'client_credentials') {
-    return res.json({ access_token: MCP_REMOTE_TOKEN, token_type: 'Bearer', expires_in: 86400 });
-  }
-
-  return res.status(400).json({ error: 'unsupported_grant_type' });
+  // client_credentials (no interactive user) is no longer supported as a
+  // primary path -- GitHub login requires a person in the loop by design.
+  // Legacy automation should use the static MCP_REMOTE_TOKEN directly as a
+  // Bearer header (see requireAuth below) rather than exchanging it here.
+  return res.status(400).json({
+    error: 'unsupported_grant_type',
+    error_description: 'Only authorization_code (GitHub login) is supported. ' +
+      'For non-interactive automation, use the static MCP_REMOTE_TOKEN as a Bearer header directly.',
+  });
 });
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 // ── Bearer auth middleware (applied to all remaining routes) ────────────────────────────
+//
+// Accepts either a valid signed JWT (the normal path, from a completed
+// GitHub login -- see /token above) or, as a legacy fallback, an exact
+// match against the static MCP_REMOTE_TOKEN if one is configured. The JWT
+// path resolves req.actorIri to the real person who logged in; the legacy
+// path resolves it to the single shared SERVICE_ACTOR_IRI, same ambiguity
+// as every call before this version. New interactive callers should always
+// end up on the JWT path via the GitHub flow above.
 
-app.use((req, res, next) => {
+function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
-  if (!auth.startsWith('Bearer ') || auth.slice(7) !== MCP_REMOTE_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized — bad or missing MCP_REMOTE_TOKEN' });
+  if (!auth.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized — missing Bearer token' });
   }
-  next();
-});
+  const token = auth.slice(7);
+
+  const jwtPayload = verifyJwt(token, JWT_SECRET);
+  if (jwtPayload) {
+    req.actorIri = jwtPayload.sub;
+    req.githubLogin = jwtPayload.githubLogin;
+    return next();
+  }
+
+  if (MCP_REMOTE_TOKEN && token === MCP_REMOTE_TOKEN) {
+    req.actorIri = SERVICE_ACTOR_IRI;
+    req.githubLogin = null;
+    return next();
+  }
+
+  return res.status(401).json({ error: 'Unauthorized — invalid or expired token' });
+}
+
+app.use(requireAuth);
 
 const sessions = new Map();
 
@@ -1047,7 +1379,11 @@ app.get('/sse', async (req, res) => {
   const transport = new SSEServerTransport('/message', res);
   const srv = createMcpServer();
 
-  sessions.set(transport.sessionId, { server: srv, transport });
+  // actorIri is resolved once here, at connection time, from the Bearer
+  // token requireAuth already verified -- everything this session's tool
+  // calls do downstream reads it back via currentActorIri(), never from a
+  // client-supplied parameter.
+  sessions.set(transport.sessionId, { server: srv, transport, actorIri: req.actorIri, githubLogin: req.githubLogin });
 
   res.on('close', () => {
     sessions.delete(transport.sessionId);
@@ -1066,8 +1402,8 @@ app.post('/message', async (req, res) => {
   }
 
   const reqId = randomUUID();
-  await requestContext.run({ reqId }, () =>
-    timedProcess(`MCP tool call (session=${sessionId}) [reqId=${reqId}]`, () =>
+  await requestContext.run({ reqId, actorIri: session.actorIri, githubLogin: session.githubLogin }, () =>
+    timedProcess(`MCP tool call (session=${sessionId}, actor=${session.githubLogin ?? 'service'}) [reqId=${reqId}]`, () =>
       session.transport.handlePostMessage(req, res, req.body)
     )
   );
@@ -1078,7 +1414,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.14.0',
+    version: '1.15.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1091,7 +1427,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.14.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.15.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
