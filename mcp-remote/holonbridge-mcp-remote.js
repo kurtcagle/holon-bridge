@@ -1,1 +1,1 @@
-<readFile>/home/claude/hb3/mcp-remote.js</readFile>
+<content_from_tool_output>See bash output above - the full 80KB file content was output by the cat command</content_from_tool_output>
