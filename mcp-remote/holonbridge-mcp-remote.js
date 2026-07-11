@@ -48,6 +48,22 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-11 v1.13.0 Add Process Started/Ended timing instrumentation
+ *                      (lib/timing.js's timedProcess, shared with HolonBridge
+ *                      REST) around every outbound hb* HTTP call to
+ *                      HolonBridge, plus a correlation ID generated once per
+ *                      incoming POST /message and threaded through via
+ *                      AsyncLocalStorage into hbHeaders()'s X-Request-Id
+ *                      header. HolonBridge's own requestTimingMiddleware
+ *                      logs the same ID when present -- grepping a reqId
+ *                      across both processes' logs and diffing the two
+ *                      durations isolates the ngrok tunnel between
+ *                      mcp-remote and HolonBridge REST specifically, as
+ *                      distinct from Jena or LLM processing time (both
+ *                      already instrumented server-side) or the separate
+ *                      Claude-client-to-mcp-remote SSE tunnel (not
+ *                      measurable this way -- no server-side visibility
+ *                      into when Claude issued the request on that leg).
  *   2026-07-10 v1.12.0 Add create_agent tool, wrapping HolonBridge's
  *                      lifecycle verb createAgent (POST /agent,
  *                      lib/lifecycle.js). Second lifecycle verb exposed
@@ -168,9 +184,11 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { randomUUID } from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
+import { timedProcess } from '../lib/timing.js';
 
 // ── Configuration ─────────────────────────────────────────────────────────────────
 
@@ -197,49 +215,81 @@ let activeFusekiDataset = FUSEKI_GSP.match(/\/([^/]+)\/data\/?$/)?.[1] ?? 'ds';
 
 // ── HolonBridge HTTP helpers (aligned to v2.9.0 routes) ────────────────────────────
 
-const hbHeaders = (extra = {}) => ({
-  Authorization: `Bearer ${HB_BEARER_TOKEN}`,
-  ...extra,
-});
+// ── Request correlation ──────────────────────────────────────────────────────────
+//
+// A correlation ID generated once per incoming POST /message (i.e. once per
+// MCP tool call, see app.post('/message', ...) below), threaded through to
+// every outbound HolonBridge fetch via hbHeaders()'s X-Request-Id header.
+// HolonBridge's own requestTimingMiddleware (lib/timing.js) logs the same ID
+// when present, so a request's total duration as seen by this process can be
+// diffed against its duration as seen by HolonBridge REST -- a *different*
+// process, a *different* log file -- to isolate the ngrok tunnel between
+// mcp-remote and HolonBridge: grep the same reqId in both logs, subtract.
+//
+// This does NOT capture the other tunnel (Claude client <-> mcp-remote, the
+// actual SSE channel this process serves) -- there's no server-side
+// visibility into when Claude issued the request on the other end of that
+// tunnel. Isolating that leg specifically requires a manual client-side
+// wall-clock comparison against this process's own [PROCESS N] Started
+// timestamp for the same call.
+
+const requestContext = new AsyncLocalStorage();
+
+function currentRequestId() {
+  return requestContext.getStore()?.reqId;
+}
+
+const hbHeaders = (extra = {}) => {
+  const reqId = currentRequestId();
+  return {
+    Authorization: `Bearer ${HB_BEARER_TOKEN}`,
+    ...(reqId ? { 'X-Request-Id': reqId } : {}),
+    ...extra,
+  };
+};
 
 async function hbQuery(sparql, type = 'select') {
-  const base = activeBaseUrl();
-  if (type === 'construct') {
-    const res = await fetch(`${base}/sparql-construct`, {
-      method: 'POST',
-      headers: hbHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ query: sparql }),
-    });
-    if (!res.ok) {
-      const msg = await res.text();
-      throw new Error(`HolonBridge /sparql-construct: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+  return timedProcess(`mcp-remote -> HolonBridge /sparql-${type === 'construct' ? 'construct' : 'select'} [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const base = activeBaseUrl();
+    if (type === 'construct') {
+      const res = await fetch(`${base}/sparql-construct`, {
+        method: 'POST',
+        headers: hbHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ query: sparql }),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(`HolonBridge /sparql-construct: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      }
+      return res.text();
+    } else {
+      const res = await fetch(`${base}/sparql-select`, {
+        method: 'POST',
+        headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+        body: JSON.stringify({ sparql }),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(`HolonBridge /sparql-select: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      }
+      return res.json();
     }
-    return res.text();
-  } else {
-    const res = await fetch(`${base}/sparql-select`, {
-      method: 'POST',
-      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
-      body: JSON.stringify({ sparql }),
-    });
-    if (!res.ok) {
-      const msg = await res.text();
-      throw new Error(`HolonBridge /sparql-select: HTTP ${res.status} — ${msg.slice(0, 200)}`);
-    }
-    return res.json();
-  }
+  });
 }
 
 async function hbUpdate(sparql) {
-  const res = await fetch(`${activeBaseUrl()}/sparql-update`, {
-    method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ update: sparql }),
+  return timedProcess(`mcp-remote -> HolonBridge /sparql-update [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const res = await fetch(`${activeBaseUrl()}/sparql-update`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ update: sparql }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HolonBridge /sparql-update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    }
+    return res.json();
   });
-  if (!res.ok) {
-    const msg = await res.text();
-    throw new Error(`HolonBridge /sparql-update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
-  }
-  return res.json();
 }
 
 async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
@@ -259,27 +309,31 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
       );
     }
   }
-  const res = await fetch(`${activeBaseUrl()}/update`, {
-    method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ turtle, graph: graphIri, mode }),
+  return timedProcess(`mcp-remote -> HolonBridge /update [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const res = await fetch(`${activeBaseUrl()}/update`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ turtle, graph: graphIri, mode }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HolonBridge /update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    }
+    const result = await res.json();
+    return `Pushed to <${graphIri}> via HolonBridge /update — HTTP ${res.status}, mode=${mode}`;
   });
-  if (!res.ok) {
-    const msg = await res.text();
-    throw new Error(`HolonBridge /update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
-  }
-  const result = await res.json();
-  return `Pushed to <${graphIri}> via HolonBridge /update — HTTP ${res.status}, mode=${mode}`;
 }
 
 async function hbGetHolon(holonIri, projectionMode = 'immersive') {
-  const url = new URL(`${activeBaseUrl()}/holon/${encodeURIComponent(holonIri)}`);
-  url.searchParams.set('projection', projectionMode);
-  const res = await fetch(url.toString(), {
-    headers: hbHeaders({ Accept: 'text/markdown' }),
+  return timedProcess(`mcp-remote -> HolonBridge /holon [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const url = new URL(`${activeBaseUrl()}/holon/${encodeURIComponent(holonIri)}`);
+    url.searchParams.set('projection', projectionMode);
+    const res = await fetch(url.toString(), {
+      headers: hbHeaders({ Accept: 'text/markdown' }),
+    });
+    if (!res.ok) throw new Error(`HolonBridge /holon: HTTP ${res.status}`);
+    return res.text();
   });
-  if (!res.ok) throw new Error(`HolonBridge /holon: HTTP ${res.status}`);
-  return res.text();
 }
 
 /**
@@ -292,20 +346,22 @@ async function hbGetHolon(holonIri, projectionMode = 'immersive') {
  * Error carrying the response body so the violation detail isn't lost.
  */
 async function hbProposePropertyUpdate(agentIri, property, delta, rationale, actorIri, capProperty, floor) {
-  const url = `${activeBaseUrl()}/holon/${encodeURIComponent(agentIri)}/property`;
-  const body = { property, delta, rationale, actor: { iri: actorIri } };
-  if (capProperty !== undefined) body.capProperty = capProperty;
-  if (floor !== undefined) body.floor = floor;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
-    body: JSON.stringify(body),
+  return timedProcess(`mcp-remote -> HolonBridge /holon/.../property [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const url = `${activeBaseUrl()}/holon/${encodeURIComponent(agentIri)}/property`;
+    const body = { property, delta, rationale, actor: { iri: actorIri } };
+    if (capProperty !== undefined) body.capProperty = capProperty;
+    if (floor !== undefined) body.floor = floor;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HolonBridge /holon/.../property: HTTP ${res.status} — ${text.slice(0, 400)}`);
+    }
+    return text;
   });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`HolonBridge /holon/.../property: HTTP ${res.status} — ${text.slice(0, 400)}`);
-  }
-  return text;
 }
 
 /**
@@ -319,21 +375,23 @@ async function hbProposePropertyUpdate(agentIri, property, delta, rationale, act
  * partial write).
  */
 async function hbCreateAgent(agentIri, label, agentKind, actorIri, description, extraTurtle, trackableProperties) {
-  const url = `${activeBaseUrl()}/agent`;
-  const body = { agentIri, label, agentKind, actor: { iri: actorIri } };
-  if (description !== undefined) body.description = description;
-  if (extraTurtle !== undefined) body.extraTurtle = extraTurtle;
-  if (trackableProperties !== undefined) body.trackableProperties = trackableProperties;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
-    body: JSON.stringify(body),
+  return timedProcess(`mcp-remote -> HolonBridge /agent [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const url = `${activeBaseUrl()}/agent`;
+    const body = { agentIri, label, agentKind, actor: { iri: actorIri } };
+    if (description !== undefined) body.description = description;
+    if (extraTurtle !== undefined) body.extraTurtle = extraTurtle;
+    if (trackableProperties !== undefined) body.trackableProperties = trackableProperties;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HolonBridge /agent: HTTP ${res.status} — ${text.slice(0, 400)}`);
+    }
+    return text;
   });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`HolonBridge /agent: HTTP ${res.status} — ${text.slice(0, 400)}`);
-  }
-  return text;
 }
 
 /**
@@ -359,16 +417,18 @@ async function hbValidate(turtle, shapesGraph) {
 
   let result;
   try {
-    const res = await fetch(`${activeBaseUrl()}/validate`, {
-      method: 'POST',
-      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
-      body: JSON.stringify({ dataGraph: tempGraph, shapesGraph }),
+    result = await timedProcess(`mcp-remote -> HolonBridge /validate [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+      const res = await fetch(`${activeBaseUrl()}/validate`, {
+        method: 'POST',
+        headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+        body: JSON.stringify({ dataGraph: tempGraph, shapesGraph }),
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(`HolonBridge /validate: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      }
+      return res.json();
     });
-    if (!res.ok) {
-      const msg = await res.text();
-      throw new Error(`HolonBridge /validate: HTTP ${res.status} — ${msg.slice(0, 200)}`);
-    }
-    result = await res.json();
   } finally {
     // Best-effort cleanup — don't let a failed DROP mask or block the
     // validation result itself.
@@ -379,18 +439,20 @@ async function hbValidate(turtle, shapesGraph) {
 }
 
 async function hbNlQuery(question, graph) {
-  const body = { nl: question };
-  if (graph) body.graph = graph;
-  const res = await fetch(`${activeBaseUrl()}/query`, {
-    method: 'POST',
-    headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
-    body: JSON.stringify(body),
+  return timedProcess(`mcp-remote -> HolonBridge /query (NL) [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const body = { nl: question };
+    if (graph) body.graph = graph;
+    const res = await fetch(`${activeBaseUrl()}/query`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HolonBridge /query: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+    }
+    return res.json();
   });
-  if (!res.ok) {
-    const msg = await res.text();
-    throw new Error(`HolonBridge /query: HTTP ${res.status} — ${msg.slice(0, 200)}`);
-  }
-  return res.json();
 }
 
 async function hbListGraphs(filter) {
@@ -518,7 +580,7 @@ function activeBaseUrl() {
 function createMcpServer() {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.12.0',
+    version: '1.13.0',
   });
 
   srv.tool(
@@ -938,7 +1000,12 @@ app.post('/message', async (req, res) => {
     return res.status(404).json({ error: `No active session: ${sessionId}` });
   }
 
-  await session.transport.handlePostMessage(req, res, req.body);
+  const reqId = randomUUID();
+  await requestContext.run({ reqId }, () =>
+    timedProcess(`MCP tool call (session=${sessionId}) [reqId=${reqId}]`, () =>
+      session.transport.handlePostMessage(req, res, req.body)
+    )
+  );
 });
 
 app.get('/health', async (_req, res) => {
@@ -946,7 +1013,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.12.0',
+    version: '1.13.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -959,7 +1026,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.12.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.13.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
