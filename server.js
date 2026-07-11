@@ -78,7 +78,7 @@ import { createRootHolon, addSchema, addEntity, promoteEntity, addProjection,
          modifyEntity, annotateProperty, listHolonContents, editMetadata,
          deleteHolon, purgeHolon, designateAgent, moveHolon,
          proposeAgentPropertyUpdate, createAgent,
-         formGroup, joinGroup, leaveGroup,
+         formGroup, joinGroup, leaveGroup, navigateAgent,
          CommandRejected, UnauthorisedError }                        from './lib/lifecycle.js'
 import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
 import { initSession, loadRegistryCache,
@@ -1289,6 +1289,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/holon/:iri/move',       description: '[LIFECYCLE] moveHolon -- reparents :iri to newParentIri. Containment-role-aware: detects and preserves whichever predicate (e.g. geo:administrativePartOf) the existing link uses, rather than overwriting it with a generic one. Body: { newParentIri, actor: {iri, role?}, force?: boolean }.' },
       { method: 'POST', path: '/holon/:iri/property',   description: '[LIFECYCLE] proposeAgentPropertyUpdate -- propose->validate->apply a delta to a numeric agent property (e.g. schema:healthPoints, schema:currentWealth). Validated against the property\'s governing SHACL shape (e.g. AgentHealthShape, AgentWealthShape) BEFORE any write; a rejection (409) leaves no trace. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair to the events graph plus the new value on the agent. Always requires Write on the dataset anchor (see /dataset-holon-iri) -- not self-authorisable even for one\'s own agent. Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }.' },
       { method: 'POST', path: '/agent',                 description: '[LIFECYCLE] createAgent -- mints an Agent holon with baseline values for its trackable properties, writing a holon:CreationEvent plus one holon:PropertyBaselineEvent per property. Each property\'s governing shape/capProperty/floor resolves from ontology metadata (holon:governedByShape/holon:capProperty/holon:floor) unless overridden. One violating baseline rejects the whole creation (409) -- no partial agent. Always requires Write on the dataset anchor (see /dataset-holon-iri). Body: { agentIri, label, agentKind, description?, extraTurtle?, trackableProperties?: [{property, value, capProperty?, capValue?, floor?}], actor: {iri, role?} }.' },
+      { method: 'POST', path: '/holon/:iri/navigate',   description: '[LIFECYCLE] navigateAgent -- moves an agent (:iri) to destinationIri, writing a holon:VisitEvent chained via holon:nextVisit from the agent\'s current visit-chain tail, then updates holon:currentLocation to match. Destination must already exist as a holon -- rejects a dangling move. Self-service when actor.iri === :iri; Write on the dataset anchor required to move another agent. Body: { destinationIri, actor: {iri, role?}, note? }.' },
       { method: 'POST', path: '/group',                 description: '[LIFECYCLE] formGroup -- creates a holon:Group, a spatial/co-location carrier (tour party, vehicle passengers) distinct from an organizational Team/Corporation (capability/authority, modeled via RoleBinding). Forms at the active member\'s current location; every initial member\'s own currentLocation is removed in favor of the group\'s. Exactly one initial member must be active. Self-service: no capability check when every member IRI is the actor themselves; Write on the dataset anchor is required when conscripting other agents. Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }.' },
       { method: 'POST', path: '/group/:iri/join',        description: '[LIFECYCLE] joinGroup -- adds a member to an existing group; their own currentLocation is removed, defaulting to isActive false. Self-service when actor.iri === memberIri; Write on the dataset anchor required otherwise. Body: { memberIri, actor: {iri, role?} }.' },
       { method: 'POST', path: '/group/:iri/leave',       description: '[LIFECYCLE] leaveGroup -- removes a member, restoring their own currentLocation (copied from the group\'s). If the leaving member is active and others remain, handoffTo is required naming a successor. Auto-dissolves (tombstones) the group once membership drops to one, restoring that sole member\'s independent currentLocation. Self-service when actor.iri === memberIri; Write on the dataset anchor required otherwise. Body: { memberIri, actor: {iri, role?}, handoffTo?: string }.' },
@@ -2514,7 +2515,7 @@ app.get('/holon/:iri', async (req, res) => {
 
 // -- Lifecycle verbs (P4) -------------------------------------------------------
 //
-// Thin REST wrappers around lib/lifecycle.js's seventeen holon lifecycle
+// Thin REST wrappers around lib/lifecycle.js's eighteen holon lifecycle
 // verbs. Wired 2026-07-09 -- previously lib/lifecycle.js existed but no
 // route ever called it. Every mutating verb requires an explicit actor in
 // the request body -- { actor: { iri, role? } } -- since this bridge has
@@ -2534,6 +2535,16 @@ app.get('/holon/:iri', async (req, res) => {
 // live Adventure Mode data so far -- see this session's chat history for
 // the France/Europe/Earth/home RoleBinding walk that confirmed moveHolon's
 // authorisation path end-to-end.
+//
+// navigateAgent (2026-07-11) is the newest addition -- targets the same
+// flat urn:{dataset}:holons/:events graphs as proposeAgentPropertyUpdate/
+// createAgent, not the schema/scene/events triad. Written specifically to
+// close the gap surfaced this session: Kim Meades' Bonn -> Germany chain
+// (urn:event:kim-visit-001/002) and her subsequent Germany -> Munich move
+// were both written as bare currentLocation triples via raw SPARQL UPDATE,
+// with no verb enforcing a VisitEvent alongside the change. Not yet
+// exercised against live Adventure Mode data end-to-end -- verify the
+// visit-chain-tail lookup and destination-existence check on next use.
 //
 // getLifecycleConn() now also threads DATASET_HOLON_IRI through as
 // datasetHolonIri -- the anchor lib/lifecycle.js's flat-graph verbs
@@ -2797,6 +2808,30 @@ app.post('/holon/:iri/property', async (req, res) => {
   } catch (err) { return handleLifecycleError(err, res) }
 })
 
+// -- POST /holon/:iri/navigate -- navigateAgent -----------------------------------
+//
+// Body: { destinationIri, actor: {iri, role?}, note? }
+//
+// Moves an agent to a new holon, writing a holon:VisitEvent chained via
+// holon:nextVisit from whatever VisitEvent is currently that agent's chain
+// tail, then updates holon:currentLocation to match. :iri is the agentIri
+// being moved (same convention as /holon/:iri/property, where :iri also
+// names an agent rather than a generic containment-tree holon). Destination
+// must already exist as a holon in holonsGraph -- rejects a dangling move.
+// Self-service when actor.iri === :iri; Write on the dataset anchor
+// required to move an agent other than the actor.
+
+app.post('/holon/:iri/navigate', async (req, res) => {
+  try {
+    const actor = requireActor(req.body)
+    const { destinationIri, note } = req.body ?? {}
+    if (!destinationIri || typeof destinationIri !== 'string')
+      return res.status(400).json({ error: '"destinationIri" is required.' })
+    const doc = await navigateAgent(getLifecycleConn(), req.params.iri, { destinationIri, actor, note })
+    return res.type('text/markdown').send(doc)
+  } catch (err) { return handleLifecycleError(err, res) }
+})
+
 // -- POST /agent -- createAgent ---------------------------------------------------
 //
 // Body: {
@@ -2935,6 +2970,7 @@ app.use((_req, res) => {
         'GET  /holon/:iri/contents', 'POST /holon/:iri/metadata',
         'DELETE /holon/:iri', 'POST /holon/:iri/purge',
         'POST /holon/:iri/agent', 'POST /holon/:iri/move', 'POST /holon/:iri/property', 'POST /agent',
+        'POST /holon/:iri/navigate',
         'POST /group', 'POST /group/:iri/join', 'POST /group/:iri/leave',
         'GET  /registry', 'POST /registry/refresh'
     ]
