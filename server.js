@@ -1,5 +1,5 @@
 /**
- * server.js -- HolonBridge v2.9.0
+ * server.js -- HolonBridge v2.10.0
  *
  * HTTP bridge between an LLM client and a Jena 6.0 Fuseki triplestore.
  *
@@ -18,8 +18,25 @@
  * ------------------------------------------------
  *   1. JENA_DATASET env var          (dataset name only, e.g. "ds")
  *   2. -d / --dataset CLI flag       (dataset name only)
- *   3. POST /dataset at runtime      (overrides all of the above)
+ *   3. POST /dataset at runtime      (overrides all of the above -- sets the
+ *                                     shared GLOBAL fallback; see note below)
  *   4. JENA_ENDPOINT env var         (overrides SPARQL URL entirely -- legacy)
+ *   5. X-Dataset-Override header     (v2.10.0+, HIGHEST precedence -- a
+ *                                     single request's dataset choice,
+ *                                     independent of every other concurrent
+ *                                     caller and of the global set by #3)
+ *
+ * v2.10.0 note on #5: before this version, POST /dataset (tier 3) was the
+ * ONLY way to pick a dataset, and it set a single process-wide global --
+ * meaning one connected user's dataset switch silently changed what every
+ * OTHER concurrently connected user was querying too, since nothing about
+ * it was per-caller. holonbridge-mcp-remote (v1.16.0+) now sends
+ * X-Dataset-Override on every request, tracking a sticky per-actor
+ * preference itself rather than relying on this bridge's shared global --
+ * see the dataset-override middleware (search this file for that string)
+ * for which routes honor it. Routes not reachable as MCP tools still only
+ * see tiers 1-4 -- a bounded, deliberate gap; see the middleware's own
+ * comment for the exact route list.
  *
  * Context directory layout
  * ------------------------
@@ -139,7 +156,7 @@ let SHACL_REQUIRED = process.env.SHACL_REQUIRED !== undefined
 // gate their capability checks against, via datasetAnchor(conn) in
 // lib/lifecycle.js. Explicit override only: process.env.DATASET_HOLON_IRI,
 // falling back to whatever was persisted from a prior POST
-// /dataset-holon-iri call, else null. When null, getLifecycleConn() omits
+// /dataset-holon-iri call, else null. When null, getLifecycleConn(req) omits
 // datasetHolonIri from conn entirely and lib/lifecycle.js's own
 // datasetAnchor() falls back to the urn:{dataset}:root convention -- so
 // the convention default lives in exactly one place (lib/lifecycle.js),
@@ -701,7 +718,23 @@ function startWatcher() {
 
 // --- Query pipeline -----------------------------------------------------------
 
-async function runPipeline(nlQuery) {
+/**
+ * sparqlEndpoint (added v2.10.0) lets a caller execute the resulting SPARQL
+ * against a per-request dataset override (see the dataset-override
+ * middleware above) instead of the module-level global. KNOWN LIMITATION:
+ * schemaContext/namedGraphs -- used by buildQuery()/retryQuery() to translate
+ * the NL question into SPARQL in the first place -- are NOT re-derived per
+ * request; they remain whatever was loaded for the globally active dataset
+ * (see loadContext()). A per-request dataset override therefore executes
+ * correctly against the right data, but the NL→SPARQL translation step
+ * itself is still reasoning from the globally active dataset's schema/class/
+ * property index, which may not match if the caller's dataset differs from
+ * the global one. Fully solving that needs per-dataset context caching --
+ * out of scope for the dataset-isolation fix this version is about; the
+ * SPARQL-only tools (sparql_select, sparql_construct, sparql_update, etc.)
+ * do not have this limitation.
+ */
+async function runPipeline(nlQuery, sparqlEndpoint = JENA_SPARQL) {
   let query            = ''
   let retries          = 0
   let vars             = []
@@ -720,7 +753,7 @@ async function runPipeline(nlQuery) {
   let lastError = null
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      ;({ vars, bindings } = await runQuery(JENA_SPARQL, query, LOG_SPARQL))
+      ;({ vars, bindings } = await runQuery(sparqlEndpoint, query, LOG_SPARQL))
       lastError = null
       break
     } catch (err) {
@@ -750,7 +783,13 @@ async function runPipeline(nlQuery) {
 
 // --- Update pipeline ----------------------------------------------------------
 
-async function runUpdate(turtle, graphIri, mode) {
+/**
+ * sparqlEndpoint/gspEndpoint/shaclGraph/datasetName (added v2.10.0) default
+ * to the module-level globals so every existing caller (including the
+ * startup path, if any) keeps working unchanged; POST /update below passes
+ * the current request's per-dataset-override values explicitly.
+ */
+async function runUpdate(turtle, graphIri, mode, sparqlEndpoint = JENA_SPARQL, gspEndpoint = JENA_GSP, shaclGraph = SHACL_GRAPH, datasetName = DATASET) {
   // -- SHACL gate (skipped when SHACL_REQUIRED=false) ------------------------
   let validation = { conforms: true, violations: [] }
 
@@ -759,7 +798,7 @@ async function runUpdate(turtle, graphIri, mode) {
   } else {
     let shaclCount
     try {
-      shaclCount = await checkShaclGraph(JENA_SPARQL, SHACL_GRAPH)
+      shaclCount = await checkShaclGraph(sparqlEndpoint, shaclGraph)
     } catch (err) {
       return { updated: false, error: `Could not reach Jena to check SHACL graph: ${err.message}`,
                validation: { conforms: false, violations: [] } }
@@ -767,15 +806,15 @@ async function runUpdate(turtle, graphIri, mode) {
 
     if (shaclCount === 0) {
       return { updated: false,
-               error: `SHACL shapes graph <${SHACL_GRAPH}> is absent or empty -- update rejected. ` +
+               error: `SHACL shapes graph <${shaclGraph}> is absent or empty -- update rejected. ` +
                       `Set SHACL_REQUIRED=false in .env to bypass, or load shapes first.`,
                validation: { conforms: false, violations: [] } }
     }
 
-    console.log(`[Update] SHACL graph <${SHACL_GRAPH}> has ${shaclCount} triples -- proceeding`)
+    console.log(`[Update] SHACL graph <${shaclGraph}> has ${shaclCount} triples -- proceeding`)
 
     try {
-      validation = await validateWithShacl(JENA_BASE, DATASET, SHACL_GRAPH, turtle)
+      validation = await validateWithShacl(JENA_BASE, datasetName, shaclGraph, turtle)
     } catch (err) {
       return { updated: false, error: `SHACL validation error: ${err.message}`,
                validation: { conforms: false, violations: [] } }
@@ -792,7 +831,7 @@ async function runUpdate(turtle, graphIri, mode) {
   }
 
   try {
-    const result = await pushToGraph(JENA_GSP, graphIri, turtle, mode)
+    const result = await pushToGraph(gspEndpoint, graphIri, turtle, mode)
     console.log(`[Update] Push succeeded -- HTTP ${result.status}, graph=${graphIri ?? 'default'}, mode=${mode}`)
     return { updated: true, conforms: true, results: [], graph: graphIri, mode, validation, jenaStatus: result.status }
   } catch (err) {
@@ -917,6 +956,57 @@ app.use((req, res, next) => {
 
 // ── end MCP compatibility middleware ──────────────────────────────────────────
 
+// ── Per-request dataset-override middleware ───────────────────────────────────
+//
+// Added 2026-07-11 (v2.10.0) to fix a real cross-user bug: every route below
+// used to read the module-level JENA_SPARQL/JENA_GSP/JENA_UPDATE/SHACL_GRAPH/
+// DATASET constants directly, meaning "which dataset am I querying" was a
+// single value shared by every concurrently connected caller. One person's
+// POST /dataset (or, worse, an MCP client's switch_dataset tool call) changed
+// it for everyone -- silently, since a dataset switch isn't an error, just
+// wrong data on someone else's next query.
+//
+// This middleware reads an X-Dataset-Override header -- sent per-request by
+// holonbridge-mcp-remote (v1.16.0+), which now tracks a sticky per-actor
+// dataset preference itself rather than relying on this bridge's shared
+// global -- and computes request-scoped endpoint values on req.* for route
+// handlers to prefer over the module-level globals. Absent the header
+// (curl, older clients, the MCP_REMOTE_TOKEN service-account fallback path),
+// req.* simply falls through to whatever the current global values are, so
+// nothing that doesn't send the header changes behavior.
+//
+// Scope note: only the routes actually reachable as MCP tools through
+// holonbridge-mcp-remote were converted to read req.* here (see that file's
+// hbHeaders() for where the header comes from) -- /sparql-select,
+// /sparql-construct, /sparql-update, /update, /query, /holon[/:iri],
+// /graphs, /validate, and every lifecycle verb via getLifecycleConn(req).
+// Routes not exposed as MCP tools (/describe, /named-query, /named-rule,
+// /rule, /graph-op, /pipeline*, /ingest, /registry*, /graph) still read the
+// module-level globals unconditionally -- a known, bounded gap: calling any
+// of those directly (e.g. via curl) still operates against whichever
+// dataset POST /dataset last set globally, same as before this change.
+
+app.use((req, res, next) => {
+  const override = req.headers['x-dataset-override']
+  if (override && String(override).trim()) {
+    const ds = String(override).trim()
+    req.datasetOverride = ds
+    req.sparqlEndpoint   = `${JENA_BASE}/${ds}/sparql`
+    req.gspEndpoint      = `${JENA_BASE}/${ds}/data`
+    req.updateEndpoint   = `${JENA_BASE}/${ds}/update`
+    req.shaclGraph       = process.env.SHACL_GRAPH ?? `urn:${ds}:shacl`
+  } else {
+    req.datasetOverride = null
+    req.sparqlEndpoint   = JENA_SPARQL
+    req.gspEndpoint      = JENA_GSP
+    req.updateEndpoint   = JENA_UPDATE
+    req.shaclGraph       = SHACL_GRAPH
+  }
+  next()
+})
+
+// ── end per-request dataset-override middleware ────────────────────────────────
+
 // -- POST /query ---------------------------------------------------------------
 
 app.post('/query', async (req, res) => {
@@ -945,7 +1035,7 @@ app.post('/query', async (req, res) => {
 
     console.log(`[Bridge] Named query '${queryId}' (source: ${nq.source ?? 'unknown'}, params: ${JSON.stringify(params ?? {})})`)
     try {
-      const { vars, bindings }  = await runQuery(JENA_SPARQL, sparqlToRun, LOG_SPARQL)
+      const { vars, bindings }  = await runQuery(req.sparqlEndpoint, sparqlToRun, LOG_SPARQL)
       const formattedResults    = formatBindings(vars, bindings)
       const answer              = `Named query '${nq.label ?? queryId}' returned ${bindings.length} result(s).`
       const result              = { answer, sparql: sparqlToRun, bindings, vars, formattedResults, retries: 0, queryId,
@@ -978,7 +1068,7 @@ app.post('/query', async (req, res) => {
   console.log(`[Bridge] Query (format=${format ?? 'json'}): ${nlQuery}`)
 
   try {
-    const result = await runPipeline(nlQuery)
+    const result = await runPipeline(nlQuery, req.sparqlEndpoint)
     console.log(`[Bridge] Done -- retries: ${result.retries}, bindings: ${result.bindings.length}`)
 
     if (asDataBook) {
@@ -1017,7 +1107,7 @@ app.post('/update', async (req, res) => {
   console.log(`[Bridge] Update -- graph=${graphIri ?? 'default'}, mode=${mode}, ${turtle.length} chars`)
 
   try {
-    const result = await runUpdate(turtle, graphIri, mode)
+    const result = await runUpdate(turtle, graphIri, mode, req.sparqlEndpoint, req.gspEndpoint, req.shaclGraph, req.datasetOverride || DATASET)
     if (!result.updated) {
       const status = result.validation?.conforms === false && result.validation?.violations?.length > 0 ? 422 : 409
       return res.status(status).json(result)
@@ -1045,7 +1135,7 @@ app.post('/sparql-update', async (req, res) => {
     const timer      = setTimeout(() => controller.abort(), 30_000)
     let response
     try {
-      response = await fetch(JENA_UPDATE, {
+      response = await fetch(req.updateEndpoint, {
         method: 'POST', headers: { 'Content-Type': 'application/sparql-update' },
         body: update, signal: controller.signal
       })
@@ -1243,7 +1333,7 @@ app.get('/description', async (_req, res) => {
   const liveSessionState = loadSessionState()
 
   res.json({
-    service: 'holon-bridge', version: '2.9.0',
+    service: 'holon-bridge', version: '2.10.0',
     dataset: DATASET, contextDir: getContextDir(),
     jenaBase: JENA_BASE, sparqlEndpoint: JENA_SPARQL,
     gspEndpoint: JENA_GSP, shaclGraph: SHACL_GRAPH,
@@ -1353,7 +1443,7 @@ app.get('/description', async (_req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok', service: 'holon-bridge', version: '2.9.0',
+    status: 'ok', service: 'holon-bridge', version: '2.10.0',
     dataset: DATASET, contextDir: getContextDir(),
     sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP,
     shaclGraph: SHACL_GRAPH, model: MODEL,
@@ -1563,7 +1653,7 @@ app.post('/sparql-select', async (req, res) => {
       const timer      = setTimeout(() => controller.abort(), 30_000)
       let response
       try {
-        response = await fetch(JENA_SPARQL, {
+        response = await fetch(req.sparqlEndpoint, {
           method:  'POST',
           headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
           body:    query,
@@ -1578,7 +1668,7 @@ app.post('/sparql-select', async (req, res) => {
     }
 
     // SELECT / ASK
-    const { vars, bindings } = await runQuery(JENA_SPARQL, query, LOG_SPARQL)
+    const { vars, bindings } = await runQuery(req.sparqlEndpoint, query, LOG_SPARQL)
     const formattedResults   = formatBindings(vars, bindings)
 
     if (asDataBook) {
@@ -1659,7 +1749,7 @@ app.post('/sparql-construct', async (req, res) => {
     const timer      = setTimeout(() => controller.abort(), 30_000)
     let response
     try {
-      response = await fetch(JENA_SPARQL, {
+      response = await fetch(req.sparqlEndpoint, {
         method:  'POST',
         headers: { 'Content-Type': 'application/sparql-query', 'Accept': responseType },
         body:    query.trim(),
@@ -1862,7 +1952,7 @@ WHERE {
 //
 // Response: { dataset, graphs: [{ iri, triples }], total }
 
-app.get('/graphs', async (_req, res) => {
+app.get('/graphs', async (req, res) => {
   const sparql = `
 SELECT ?g (COUNT(*) AS ?triples)
 WHERE { GRAPH ?g { ?s ?p ?o } }
@@ -1870,12 +1960,12 @@ GROUP BY ?g
 ORDER BY ?g`
 
   try {
-    const { bindings } = await runQuery(JENA_SPARQL, sparql, LOG_SPARQL)
+    const { bindings } = await runQuery(req.sparqlEndpoint, sparql, LOG_SPARQL)
     const graphs = bindings.map(b => ({
       iri:     b.g?.value      ?? '(unknown)',
       triples: parseInt(b.triples?.value ?? '0', 10)
     }))
-    return res.json({ dataset: DATASET, graphs, total: graphs.length })
+    return res.json({ dataset: req.datasetOverride || DATASET, graphs, total: graphs.length })
   } catch (err) {
     console.error('[Bridge] /graphs error:', err)
     return res.status(500).json({ error: `Could not query named graphs: ${err.message}` })
@@ -2484,7 +2574,7 @@ app.post('/registry/refresh', async (_req, res) => {
 // Body: { dataGraph: "<IRI>", shapesGraph?: "<IRI>" }
 
 app.post('/validate', async (req, res) => {
-  await validateHandler(req, res, { JENA_BASE, DATASET, SHACL_GRAPH })
+  await validateHandler(req, res, { JENA_BASE, DATASET: req.datasetOverride || DATASET, SHACL_GRAPH: req.shaclGraph })
 })
 
 // -- GET /holon and GET /holon/:iri ----------------------------------------------
@@ -2506,11 +2596,11 @@ app.post('/validate', async (req, res) => {
 // its resolved IRI as the new focus for DATASET.
 
 app.get('/holon', async (req, res) => {
-  await getHolonHandler(req, res, { JENA_SPARQL, DATASET })
+  await getHolonHandler(req, res, { JENA_SPARQL: req.sparqlEndpoint, DATASET: req.datasetOverride || DATASET })
 })
 
 app.get('/holon/:iri', async (req, res) => {
-  await getHolonHandler(req, res, { JENA_SPARQL, DATASET })
+  await getHolonHandler(req, res, { JENA_SPARQL: req.sparqlEndpoint, DATASET: req.datasetOverride || DATASET })
 })
 
 // -- Lifecycle verbs (P4) -------------------------------------------------------
@@ -2546,7 +2636,7 @@ app.get('/holon/:iri', async (req, res) => {
 // exercised against live Adventure Mode data end-to-end -- verify the
 // visit-chain-tail lookup and destination-existence check on next use.
 //
-// getLifecycleConn() now also threads DATASET_HOLON_IRI through as
+// getLifecycleConn(req) now also threads DATASET_HOLON_IRI through as
 // datasetHolonIri -- the anchor lib/lifecycle.js's flat-graph verbs
 // (proposeAgentPropertyUpdate, createAgent, formGroup, joinGroup,
 // leaveGroup) gate Write capability checks against. When DATASET_HOLON_IRI
@@ -2555,10 +2645,31 @@ app.get('/holon/:iri', async (req, res) => {
 // datasetAnchor() fallback (urn:{dataset}:root) applies -- the convention
 // default is defined in exactly one place.
 //
+// req (added v2.10.0): every lifecycle route now passes its own req into
+// getLifecycleConn(req), so a caller with a per-request X-Dataset-Override
+// header (see the dataset-override middleware above) gets a conn scoped to
+// THEIR dataset rather than whatever the module-level DATASET global
+// currently is -- this is what makes lifecycle verbs (create_agent,
+// propose_property_update, navigate_agent, and all others) respect the
+// same per-actor sticky dataset selection as the SPARQL-only tools. req is
+// optional and defaults every field to the global, so any call site that
+// still passes nothing (there shouldn't be any left, but belt-and-braces)
+// behaves exactly as before this change. NOTE: DATASET_HOLON_IRI itself
+// remains a single global regardless of dataset -- a dataset-specific
+// anchor holon isn't represented here yet; a caller working in a dataset
+// other than the global one may find lifecycle capability checks anchored
+// somewhere that doesn't make sense for their dataset. Known follow-on gap,
+// not solved by this change.
+//
 // Errors: CommandRejected -> 409, UnauthorisedError -> 403, else -> 500.
 
-function getLifecycleConn() {
-  const conn = { sparqlEndpoint: JENA_SPARQL, gspEndpoint: JENA_GSP, jenaBase: JENA_BASE, dataset: DATASET }
+function getLifecycleConn(req) {
+  const conn = {
+    sparqlEndpoint: req?.sparqlEndpoint || JENA_SPARQL,
+    gspEndpoint:    req?.gspEndpoint    || JENA_GSP,
+    jenaBase:       JENA_BASE,
+    dataset:        req?.datasetOverride || DATASET,
+  }
   if (DATASET_HOLON_IRI) conn.datasetHolonIri = DATASET_HOLON_IRI
   return conn
 }
@@ -2590,7 +2701,7 @@ app.post('/holon', async (req, res) => {
     const { baseIri, label, rootLocked } = req.body ?? {}
     if (!baseIri || typeof baseIri !== 'string' || !label || typeof label !== 'string')
       return res.status(400).json({ error: '"baseIri" and "label" are required strings.' })
-    const doc = await createRootHolon(getLifecycleConn(), { baseIri, label, actor, rootLocked })
+    const doc = await createRootHolon(getLifecycleConn(req), { baseIri, label, actor, rootLocked })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2605,7 +2716,7 @@ app.post('/holon/:iri/schema', async (req, res) => {
     const { schemaDataBook } = req.body ?? {}
     if (!schemaDataBook?.markdown || typeof schemaDataBook.markdown !== 'string')
       return res.status(400).json({ error: '"schemaDataBook.markdown" is required.' })
-    const doc = await addSchema(getLifecycleConn(), req.params.iri, schemaDataBook, actor)
+    const doc = await addSchema(getLifecycleConn(req), req.params.iri, schemaDataBook, actor)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2620,7 +2731,7 @@ app.post('/holon/:iri/entity', async (req, res) => {
     const { entityDataBook } = req.body ?? {}
     if (!entityDataBook?.markdown || typeof entityDataBook.markdown !== 'string')
       return res.status(400).json({ error: '"entityDataBook.markdown" is required.' })
-    const doc = await addEntity(getLifecycleConn(), req.params.iri, entityDataBook, actor)
+    const doc = await addEntity(getLifecycleConn(req), req.params.iri, entityDataBook, actor)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2634,7 +2745,7 @@ app.post('/entity/:iri/promote', async (req, res) => {
   try {
     const actor = requireActor(req.body)
     const { childBaseIri } = req.body ?? {}
-    const result = await promoteEntity(getLifecycleConn(), req.params.iri, { childBaseIri, actor })
+    const result = await promoteEntity(getLifecycleConn(req), req.params.iri, { childBaseIri, actor })
     return res.json({ parent: result.parent, child: result.child })
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2649,7 +2760,7 @@ app.post('/holon/:iri/projection', async (req, res) => {
     const { spec } = req.body ?? {}
     if (!spec?.queryIri || !spec?.mode || !spec?.clientMode)
       return res.status(400).json({ error: '"spec.queryIri", "spec.mode", and "spec.clientMode" are required.' })
-    const doc = await addProjection(getLifecycleConn(), req.params.iri, spec, actor)
+    const doc = await addProjection(getLifecycleConn(req), req.params.iri, spec, actor)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2664,7 +2775,7 @@ app.post('/entity/:iri/modify', async (req, res) => {
     const { patchDataBook } = req.body ?? {}
     if (!patchDataBook?.markdown || typeof patchDataBook.markdown !== 'string')
       return res.status(400).json({ error: '"patchDataBook.markdown" is required.' })
-    const doc = await modifyEntity(getLifecycleConn(), req.params.iri, patchDataBook, actor)
+    const doc = await modifyEntity(getLifecycleConn(req), req.params.iri, patchDataBook, actor)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2679,7 +2790,7 @@ app.post('/entity/:iri/annotate', async (req, res) => {
     const { property, annotation } = req.body ?? {}
     if (!property || typeof property !== 'string' || !annotation || annotation.value === undefined || !annotation.eventType)
       return res.status(400).json({ error: '"property" (string) and "annotation.{value,eventType}" are required.' })
-    const doc = await annotateProperty(getLifecycleConn(), req.params.iri, property, annotation, actor)
+    const doc = await annotateProperty(getLifecycleConn(req), req.params.iri, property, annotation, actor)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2693,7 +2804,7 @@ app.get('/holon/:iri/contents', async (req, res) => {
     const { actorIri, typeFilter, includeChildren } = req.query
     if (!actorIri || typeof actorIri !== 'string')
       return res.status(400).json({ error: 'Query param "actorIri" is required.' })
-    const doc = await listHolonContents(getLifecycleConn(), req.params.iri, {
+    const doc = await listHolonContents(getLifecycleConn(req), req.params.iri, {
       typeFilter: typeFilter || undefined,
       includeChildren: includeChildren === 'true',
       actor: { iri: actorIri }
@@ -2712,7 +2823,7 @@ app.post('/holon/:iri/metadata', async (req, res) => {
     const { patch } = req.body ?? {}
     if (!patch || typeof patch !== 'object')
       return res.status(400).json({ error: '"patch" is required.' })
-    const doc = await editMetadata(getLifecycleConn(), req.params.iri, patch, actor)
+    const doc = await editMetadata(getLifecycleConn(req), req.params.iri, patch, actor)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2724,7 +2835,7 @@ app.post('/holon/:iri/metadata', async (req, res) => {
 app.delete('/holon/:iri', async (req, res) => {
   try {
     const actor = requireActor(req.body)
-    const doc = await deleteHolon(getLifecycleConn(), req.params.iri, { actor })
+    const doc = await deleteHolon(getLifecycleConn(req), req.params.iri, { actor })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2737,7 +2848,7 @@ app.post('/holon/:iri/purge', async (req, res) => {
   try {
     const actor = requireActor(req.body)
     const { confirm } = req.body ?? {}
-    await purgeHolon(getLifecycleConn(), req.params.iri, { actor, confirm })
+    await purgeHolon(getLifecycleConn(req), req.params.iri, { actor, confirm })
     return res.json({ purged: true, iri: req.params.iri })
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2752,7 +2863,7 @@ app.post('/holon/:iri/agent', async (req, res) => {
     const { agent } = req.body ?? {}
     if (!agent?.iri || !agent?.name || !agent?.kind || !Array.isArray(agent?.capability))
       return res.status(400).json({ error: '"agent.{iri,name,kind,capability[]}" are required.' })
-    const doc = await designateAgent(getLifecycleConn(), req.params.iri, agent, grantedBy)
+    const doc = await designateAgent(getLifecycleConn(req), req.params.iri, agent, grantedBy)
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2771,7 +2882,7 @@ app.post('/holon/:iri/move', async (req, res) => {
     const { newParentIri, force } = req.body ?? {}
     if (!newParentIri || typeof newParentIri !== 'string')
       return res.status(400).json({ error: '"newParentIri" is required.' })
-    const doc = await moveHolon(getLifecycleConn(), req.params.iri, { newParentIri, actor, force })
+    const doc = await moveHolon(getLifecycleConn(req), req.params.iri, { newParentIri, actor, force })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2788,7 +2899,7 @@ app.post('/holon/:iri/move', async (req, res) => {
 // to urn:{dataset}:events and the new value to urn:{dataset}:holons.
 // Operates on the flat Adventure-Mode-style graphs, not the per-holon
 // schema/scene/events triad the rest of this verb family assumes. Always
-// requires Write on the dataset anchor (see getLifecycleConn() /
+// requires Write on the dataset anchor (see getLifecycleConn(req) /
 // POST /dataset-holon-iri) -- not self-authorisable even for one's own agent.
 
 app.post('/holon/:iri/property', async (req, res) => {
@@ -2801,7 +2912,7 @@ app.post('/holon/:iri/property', async (req, res) => {
       return res.status(400).json({ error: '"delta" must be a finite number.' })
     if (!rationale || typeof rationale !== 'string')
       return res.status(400).json({ error: '"rationale" is required.' })
-    const doc = await proposeAgentPropertyUpdate(getLifecycleConn(), req.params.iri, {
+    const doc = await proposeAgentPropertyUpdate(getLifecycleConn(req), req.params.iri, {
       property, delta, rationale, actor, capProperty, floor
     })
     return res.type('text/markdown').send(doc)
@@ -2827,7 +2938,7 @@ app.post('/holon/:iri/navigate', async (req, res) => {
     const { destinationIri, note } = req.body ?? {}
     if (!destinationIri || typeof destinationIri !== 'string')
       return res.status(400).json({ error: '"destinationIri" is required.' })
-    const doc = await navigateAgent(getLifecycleConn(), req.params.iri, { destinationIri, actor, note })
+    const doc = await navigateAgent(getLifecycleConn(req), req.params.iri, { destinationIri, actor, note })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2846,7 +2957,7 @@ app.post('/holon/:iri/navigate', async (req, res) => {
 // resolved from ontology metadata (holon:governedByShape/holon:capProperty/
 // holon:floor) unless overridden in the request. A single baseline that
 // violates its shape rejects the entire creation (409) -- no partial agent.
-// Always requires Write on the dataset anchor (see getLifecycleConn() /
+// Always requires Write on the dataset anchor (see getLifecycleConn(req) /
 // POST /dataset-holon-iri).
 //
 // Separate from POST /holon (createRootHolon), which uses the older per-
@@ -2866,7 +2977,7 @@ app.post('/agent', async (req, res) => {
       return res.status(400).json({ error: '"agentKind" is required.' })
     if (trackableProperties !== undefined && !Array.isArray(trackableProperties))
       return res.status(400).json({ error: '"trackableProperties" must be an array if provided.' })
-    const doc = await createAgent(getLifecycleConn(), {
+    const doc = await createAgent(getLifecycleConn(req), {
       agentIri, label, agentKind, description, extraTurtle,
       trackableProperties: trackableProperties ?? [],
       actor
@@ -2901,7 +3012,7 @@ app.post('/group', async (req, res) => {
       return res.status(400).json({ error: '"memberIris" must be a non-empty array.' })
     if (!activeMemberIri || typeof activeMemberIri !== 'string')
       return res.status(400).json({ error: '"activeMemberIri" is required.' })
-    const doc = await formGroup(getLifecycleConn(), { groupIri, label, memberIris, activeMemberIri, actor })
+    const doc = await formGroup(getLifecycleConn(req), { groupIri, label, memberIris, activeMemberIri, actor })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2920,7 +3031,7 @@ app.post('/group/:iri/join', async (req, res) => {
     const { memberIri } = req.body ?? {}
     if (!memberIri || typeof memberIri !== 'string')
       return res.status(400).json({ error: '"memberIri" is required.' })
-    const doc = await joinGroup(getLifecycleConn(), req.params.iri, memberIri, { actor })
+    const doc = await joinGroup(getLifecycleConn(req), req.params.iri, memberIri, { actor })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2942,7 +3053,7 @@ app.post('/group/:iri/leave', async (req, res) => {
     const { memberIri, handoffTo } = req.body ?? {}
     if (!memberIri || typeof memberIri !== 'string')
       return res.status(400).json({ error: '"memberIri" is required.' })
-    const doc = await leaveGroup(getLifecycleConn(), req.params.iri, memberIri, { actor, handoffTo })
+    const doc = await leaveGroup(getLifecycleConn(req), req.params.iri, memberIri, { actor, handoffTo })
     return res.type('text/markdown').send(doc)
   } catch (err) { return handleLifecycleError(err, res) }
 })
@@ -2983,7 +3094,7 @@ loadContext()
   .then(() => {
     startWatcher()
     app.listen(PORT, () => {
-      console.log(`[Bridge] HolonBridge v2.9.0 running on port ${PORT}`)
+      console.log(`[Bridge] HolonBridge v2.10.0 running on port ${PORT}`)
       console.log(`[Bridge] Dataset:        ${DATASET}`)
       console.log(`[Bridge] Context dir:    ${getContextDir()}`)
       console.log(`[Bridge] SPARQL:         ${JENA_SPARQL}`)
