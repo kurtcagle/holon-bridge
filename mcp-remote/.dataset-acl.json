@@ -1,7 +1,7 @@
 {
   "defaultAccess": "none",
   "datasets": {
-    "data":        { "*": "rw" },
+    "worldtest":        { "*": "rw" },
     "ds":          { "*": "rw" },
     "chloe":       { "kurtcagle": "rw" },
     "ggsc":        { "kurtcagle": "rw", "benwortley": "rw" },
@@ -11,6 +11,8 @@
     "crm":         { "kurtcagle": "rw" },
     "context":     { "kurtcagle": "rw" },
     "shapes":      { "kurtcagle": "rw" },
-    "chloe-scratchpad": { "kurtcagle": "rw" }
+    "chloe-scratchpad": { "kurtcagle": "rw" },
+    "datavid":      { "kurtcagle": "rw"},
+    "westbridge":   { "kurtcagle": "rw", "ctownley-cs": "rw", "kaplan196833": "rw", "schmarion": "rw", "Manal-CausalSpark": "rw", "ThomasMollier": "rw" }
   }
 }
