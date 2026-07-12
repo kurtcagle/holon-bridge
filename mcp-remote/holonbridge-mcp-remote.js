@@ -91,6 +91,17 @@
  *
  * Changelog
  * ─────────
+ *   2026-07-12 v1.18.0 Add list_dataset_acls tool: the full multi-user
+ *                      per-dataset ACL table (who has what access to which
+ *                      dataset), merged against the live /datasets list so
+ *                      datasets with no explicit .dataset-acl.json entry
+ *                      (falling back to defaultAccess) are also visible --
+ *                      previously the only way to see this was reading
+ *                      .dataset-acl.json directly on the server. Restricted
+ *                      to the bridge operator (actor login "kurtcagle"),
+ *                      since unlike list_datasets (which only ever reports
+ *                      the calling actor's own access), this exposes every
+ *                      other actor's grants too.
  *   2026-07-11 v1.17.0 Per-dataset access control (Option 1). Loads a static
  *                      .dataset-acl.json file mapping datasets to permitted
  *                      actors and access levels ("r", "rw", or absent =
@@ -1320,6 +1331,65 @@ function createMcpServer(sessionId) {
         }
       }
       return { content: [{ type: 'text', text: JSON.stringify({ ...result, yourActiveDataset: currentDataset() ?? DEFAULT_DATASET }, null, 2) }] };
+    }
+  );
+
+  srv.tool(
+    'list_dataset_acls',
+    'List the full multi-user per-dataset access-control table -- which actors ' +
+    '(GitHub logins) have read or read-write access to which Fuseki dataset, ' +
+    'straight from .dataset-acl.json, merged against the live dataset list so ' +
+    'datasets with no explicit ACL entry (falling back to defaultAccess) are ' +
+    "also visible. Unlike list_datasets (which only ever reports the calling " +
+    "actor's own access), this exposes every other actor's grants too -- " +
+    'restricted to the bridge operator.',
+    {},
+    async () => {
+      const login = requestContext.getStore()?.githubLogin;
+      if ((login ?? '').toLowerCase() !== 'kurtcagle') {
+        throw new Error(`Access denied: the dataset ACL table is only visible to the bridge operator (actor: ${login ?? 'unknown'}).`);
+      }
+      if (!datasetAcl) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'No .dataset-acl.json is loaded on this bridge -- access is currently unrestricted for every dataset (permissive fallback).',
+          }],
+        };
+      }
+      // Merge against the live dataset list so datasets with no explicit
+      // ACL entry (falling back to defaultAccess) are visible too, not just
+      // the ones named in the ACL file -- the file can drift out of sync
+      // with what Fuseki actually has.
+      let liveDatasets = [];
+      try {
+        const res = await fetch(`${activeBaseUrl()}/datasets`, {
+          headers: hbHeaders({ Accept: 'application/json' }),
+        });
+        if (res.ok) {
+          const j = await res.json();
+          liveDatasets = (j.datasets ?? []).map(d => d.name);
+        }
+      } catch {
+        // Best-effort; fall back to the ACL-file-only view below.
+      }
+
+      const allNames = new Set([...Object.keys(datasetAcl.datasets ?? {}), ...liveDatasets]);
+      const table = [...allNames].sort().map(name => {
+        const entry = datasetAcl.datasets?.[name];
+        return {
+          dataset: name,
+          inAclFile: !!entry,
+          grants: entry ?? { '(no explicit entry -- falls back to defaultAccess)': datasetAcl.defaultAccess ?? 'none' },
+        };
+      });
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ defaultAccess: datasetAcl.defaultAccess ?? 'none', datasets: table }, null, 2),
+        }],
+      };
     }
   );
 
