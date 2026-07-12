@@ -1042,11 +1042,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.17.0',
-  });
-
-  srv.tool(
-    'list_endpoints',
+    version: '1.18.0',
     'List all known HolonBridge profiles — static .env profiles plus live results ' +
     'from the federated bridge registry (GET /registry), including reachability.',
     {},
@@ -1755,7 +1751,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.17.0',
+    version: '1.18.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1768,7 +1764,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.17.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.18.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
