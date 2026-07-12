@@ -6,13 +6,13 @@
  * Endpoints
  * ---------
  *   POST /query          NL -> SPARQL -> interpreted answer
- *   POST /update         Turtle -> SHACL-validate -> push to named graph
+ *   POST /update          Turtle -> SHACL-validate -> push to named graph
  *   POST /sparql-update  Raw SPARQL UPDATE (no SHACL gate)
- *   POST /reload         Reload schema context + rediscover named graphs
- *   POST /dataset        Switch active dataset at runtime
- *   GET  /datasets       List all datasets on the Fuseki server
- *   GET  /description    Full capability manifest for LLM consumption
- *   GET  /health         Operational health check
+ *   POST /reload          Reload schema context + rediscover named graphs
+ *   POST /dataset          Switch active dataset at runtime
+ *   GET  /datasets        List all datasets on the Fuseki server
+ *   GET  /description      Full capability manifest for LLM consumption
+ *   GET  /health           Operational health check
  *
  * Dataset selection (lowest to highest precedence)
  * ------------------------------------------------
@@ -814,7 +814,7 @@ async function runUpdate(turtle, graphIri, mode, sparqlEndpoint = JENA_SPARQL, g
     console.log(`[Update] SHACL graph <${shaclGraph}> has ${shaclCount} triples -- proceeding`)
 
     try {
-      validation = await validateWithShacl(JENA_BASE, datasetName, shaclGraph, turtle)
+      validation = await validateWithShacl(JENA_BASE, datasetName, shaclGraph, turtle, graphIri)
     } catch (err) {
       return { updated: false, error: `SHACL validation error: ${err.message}`,
                validation: { conforms: false, violations: [] } }
