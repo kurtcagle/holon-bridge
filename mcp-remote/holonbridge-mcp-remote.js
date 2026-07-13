@@ -6,17 +6,17 @@
  * Claude web client (claude.ai) can connect to them as a custom connector.
  *
  * Architecture
- * ────────────
- *   claude.ai  ──HTTPS/SSE──►  holonbridge-mcp-remote (:3032, ngrok)
- *                                       │
+ * ------------
+ *   claude.ai  --HTTPS/SSE-->  holonbridge-mcp-remote (:3032, ngrok)
+ *                                       |
  *                                  HTTP REST + Bearer
- *                                       │
+ *                                       |
  *                              HolonBridge REST (:3031)
- *                                       │
+ *                                       |
  *                                  Fuseki (:3030)
  *
  * Setup
- * ─────
+ * -----
  *   npm install @modelcontextprotocol/sdk express cors
  *   (no new dependency for OAuth/JWT -- see signJwt/verifyJwt below,
  *   hand-rolled HS256 using Node's built-in crypto module)
@@ -52,10 +52,10 @@
  *                                                   # no longer used by push_turtle
  *
  * Token relationship (2026-07-11, v1.15.1):
- *   HB_BEARER_TOKEN      — protects HolonBridge from the MCP remote. Static
+ *   HB_BEARER_TOKEN      -- protects HolonBridge from the MCP remote. Static
  *                          service-to-service secret, unchanged by this
  *                          version, never exposed to a browser or a person.
- *   GitHub OAuth          — a PERSON authenticates by logging into GitHub;
+ *   GitHub OAuth          -- a PERSON authenticates by logging into GitHub;
  *                          access is gated by GITHUB_ALLOWED_USERS, a
  *                          static allowlist of GitHub logins (see
  *                          /authorize, /oauth/github/callback below) --
@@ -65,13 +65,13 @@
  *                          personal account, which is what most solo/small-
  *                          team setups actually are, always fails that
  *                          check regardless of identity).
- *   Per-user JWT          — minted by /token after a successful GitHub
+ *   Per-user JWT          -- minted by /token after a successful GitHub
  *                          login, carrying sub=https://w3id.org/users/
  *                          {githubLogin}. This is what a browser/client
  *                          actually holds and sends as Bearer on /sse and
  *                          /message -- verified by requireAuth, resolved to
  *                          req.actorIri once per session.
- *   MCP_REMOTE_TOKEN      — OPTIONAL legacy fallback for non-interactive
+ *   MCP_REMOTE_TOKEN      -- OPTIONAL legacy fallback for non-interactive
  *                          automation (scripts/CI) that can't do a browser
  *                          login. If set, requireAuth still accepts an
  *                          exact match, but resolves to the single shared
@@ -84,13 +84,13 @@
  * this bridge's own HB_BEARER_TOKEN, which is sufficient to read federation
  * metadata (which bridges exist, their URL, their health). It is NOT
  * sufficient to authenticate SPARQL/push calls against a *different* bridge
- * once switched via set_endpoint — that still depends on whatever auth the
+ * once switched via set_endpoint -- that still depends on whatever auth the
  * target bridge (e.g. Ben's GGSC instance) itself requires. The interbridge
  * token model (shared vs. per-bridge credentials) is a separate open question
  * from registry discovery and is not resolved by this change.
  *
  * Changelog
- * ─────────
+ * ---------
  *   2026-07-12 v1.18.0 Add list_dataset_acls tool: the full multi-user
  *                      per-dataset ACL table (who has what access to which
  *                      dataset), merged against the live /datasets list so
@@ -236,13 +236,13 @@
  *                      treatment.
  *   2026-07-07 v1.10.3 FIX: hbPushTurtle()'s shapes_graph parameter was
  *                      non-blocking. It called hbValidate() and awaited the
- *                      result, but never inspected report.conforms — a
+ *                      result, but never inspected report.conforms -- a
  *                      validation report with conforms:false is a normal
  *                      successful HTTP response, not a thrown error, so
  *                      nothing stopped the subsequent /update push. Before
  *                      v1.10.2 this was accidentally masked: hbValidate()
  *                      always threw (the v1.10.1 /validate contract bug),
- *                      so shapes_graph always blocked the push — for the
+ *                      so shapes_graph always blocked the push -- for the
  *                      wrong reason (broken endpoint, not real violations).
  *                      Fixed in v1.10.2, the accidental gate disappeared:
  *                      confirmed live that a sol:Planet instance missing
@@ -250,8 +250,8 @@
  *                      orbitalPeriod, distanceFromSun, moonCount, orbits)
  *                      still pushed successfully with shapes_graph set.
  *                      Fix: hbPushTurtle() now checks report.conforms and
- *                      throws — listing focusNode/path/message per
- *                      violation — before the /update call, so a
+ *                      throws -- listing focusNode/path/message per
+ *                      violation -- before the /update call, so a
  *                      non-conforming payload never reaches the target
  *                      graph. Conforming payloads and calls without
  *                      shapes_graph are unaffected.
@@ -261,11 +261,11 @@
  *                      handler (lib/validate.js, v2.9.1+) was refactored to
  *                      require a JSON body of { dataGraph, shapesGraph } where
  *                      dataGraph is the IRI of an *already-loaded* named graph
- *                      — it fetches that graph via GSP and delegates to
+ *                      -- it fetches that graph via GSP and delegates to
  *                      validateWithShacl(). Since hbValidate() never sent
  *                      dataGraph, every call hit the route's own 400 guard
  *                      ('"dataGraph" is required...'), regardless of dataset,
- *                      shapes graph content, or payload — including trivial
+ *                      shapes graph content, or payload -- including trivial
  *                      two-triple payloads. This also broke push_turtle
  *                      whenever a shapes_graph was supplied, since
  *                      hbPushTurtle() calls hbValidate() first in that case.
@@ -280,7 +280,7 @@
  *                      hbValidate, hbNlQuery, hbListGraphs) plus the inline
  *                      list_datasets/switch_dataset fetches called the
  *                      module-level HOLONBRIDGE_URL constant directly,
- *                      ignoring activeProfile entirely — so switching
+ *                      ignoring activeProfile entirely -- so switching
  *                      profiles never redirected any actual query, push, or
  *                      dataset call; only get_endpoint/list_endpoints ever
  *                      read activeProfile. Introduced activeBaseUrl(), the
@@ -299,8 +299,8 @@
  *                      .env PROFILE_<n>_URL entries with live results
  *                      from GET /registry on HolonBridge (federated bridge
  *                      registry, GitHub-backed, health-checked server-side).
- *                      Any bridge registered in the federation — e.g. Ben's
- *                      GGSC bridge — becomes switchable via set_endpoint
+ *                      Any bridge registered in the federation -- e.g. Ben's
+ *                      GGSC bridge -- becomes switchable via set_endpoint
  *                      without manual config edits or a restart. Registry
  *                      results are cached 30s; set_endpoint forces a fresh
  *                      pull so newly-registered bridges are available
@@ -319,7 +319,7 @@
  *                      switch_dataset syncs it on success; hbPushTurtle builds
  *                      the GSP URL dynamically as jenaBase/activeFusekiDataset/data.
  *                      Also synced mcp-remote/ with root canonical file.
- *   2026-06-26 v1.7.1  (previous — see git log)
+ *   2026-06-26 v1.7.1  (previous -- see git log)
  *   2026-06-26 v1.2    Fix POST /message 400: remove express.json() middleware;
  *                      pass req.body explicitly to handlePostMessage.
  *   2026-06-26 v1.1    Fix "Already connected" crash: create McpServer per
@@ -339,7 +339,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import { timedProcess } from '../lib/timing.js';
 
-// ── Configuration ─────────────────────────────────────────────────────────────────
+// -- Configuration -----------------------------------------------------------------
 //
 // Identity model (2026-07-11, v1.15.1): GitHub OAuth replaces the single
 // shared MCP_REMOTE_TOKEN as the primary way a *person* authenticates.
@@ -396,7 +396,7 @@ const ALLOWED_GITHUB_LOGINS = new Set(
   GITHUB_ALLOWED_USERS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
 );
 
-// ── Per-actor sticky dataset preference (v1.16.0) ──────────────────────────────
+// -- Per-actor sticky dataset preference (v1.16.0) ------------------------------
 //
 // Tracks which Fuseki dataset each logged-in actor last selected via
 // switch_dataset, persisted to a small JSON file so the preference survives
@@ -447,7 +447,7 @@ function setActorDataset(actorIri, dataset) {
   saveActorDatasetState();
 }
 
-// ── Per-dataset access control (v1.17.0) ────────────────────────────────────────
+// -- Per-dataset access control (v1.17.0) ----------------------------------------
 //
 // Static allowlist mapping datasets to permitted actors and access levels.
 // Loaded from .dataset-acl.json alongside this script at startup. Format:
@@ -466,7 +466,7 @@ function setActorDataset(actorIri, dataset) {
 // resolved at authentication time, not the full actor IRI). "*" matches any
 // authenticated user. A specific login entry overrides "*" for that actor.
 //
-// Enforcement is at the MCP tool level in this process — a denied request
+// Enforcement is at the MCP tool level in this process -- a denied request
 // never leaves mcp-remote. This does not prevent someone with the raw
 // HB_BEARER_TOKEN from curling HolonBridge directly (see Option 2/3 in the
 // design notes for defense-in-depth if that matters).
@@ -481,7 +481,7 @@ function loadDatasetAcl() {
       return raw;
     }
   } catch (err) {
-    console.warn('[dataset-acl] Failed to load .dataset-acl.json (running without ACL — all access permitted):', err.message);
+    console.warn('[dataset-acl] Failed to load .dataset-acl.json (running without ACL -- all access permitted):', err.message);
   }
   return null;  // null = no ACL file = no enforcement
 }
@@ -548,7 +548,7 @@ function requireWriteAccess() {
   }
 }
 
-// ── GSP dataset tracking (health reporting only) ───────────────────────────────────────────
+// -- GSP dataset tracking (health reporting only) -------------------------------------------
 //
 // jenaBase and activeFusekiDataset are derived from FUSEKI_GSP and updated
 // by switch_dataset. They are surfaced in /health for observability.
@@ -558,7 +558,7 @@ function requireWriteAccess() {
 const jenaBase = FUSEKI_GSP.replace(/\/[^/]+\/data\/?$/, '');   // "http://localhost:3030"
 let activeFusekiDataset = FUSEKI_GSP.match(/\/([^/]+)\/data\/?$/)?.[1] ?? 'ds';
 
-// ── JWT helpers (minimal HS256, no external dependency) ─────────────────────────────
+// -- JWT helpers (minimal HS256, no external dependency) -----------------------------
 //
 // Deliberately hand-rolled rather than pulling in `jsonwebtoken` -- the
 // surface this process needs is tiny (sign one claim set, verify signature
@@ -610,9 +610,9 @@ function verifyJwt(token, secret) {
   }
 }
 
-// ── HolonBridge HTTP helpers (aligned to v2.9.0 routes) ────────────────────────────
+// -- HolonBridge HTTP helpers (aligned to v2.9.0 routes) ----------------------------
 
-// ── Request correlation ──────────────────────────────────────────────────────────
+// -- Request correlation ----------------------------------------------------------
 //
 // A correlation ID generated once per incoming POST /message (i.e. once per
 // MCP tool call, see app.post('/message', ...) below), threaded through to
@@ -674,7 +674,7 @@ async function hbQuery(sparql, type = 'select') {
       });
       if (!res.ok) {
         const msg = await res.text();
-        throw new Error(`HolonBridge /sparql-construct: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+        throw new Error(`HolonBridge /sparql-construct: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
       }
       return res.text();
     } else {
@@ -685,7 +685,7 @@ async function hbQuery(sparql, type = 'select') {
       });
       if (!res.ok) {
         const msg = await res.text();
-        throw new Error(`HolonBridge /sparql-select: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+        throw new Error(`HolonBridge /sparql-select: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
       }
       return res.json();
     }
@@ -701,7 +701,7 @@ async function hbUpdate(sparql) {
     });
     if (!res.ok) {
       const msg = await res.text();
-      throw new Error(`HolonBridge /sparql-update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      throw new Error(`HolonBridge /sparql-update: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
     }
     return res.json();
   });
@@ -714,11 +714,11 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
       const violationLines = (report.violations ?? []).map((v, i) => {
         const focus = v.focusNode ? ` on <${v.focusNode}>` : '';
         const path  = v.path ? ` at ${v.path}` : '';
-        const msg   = v.message ? ` — ${v.message}` : '';
+        const msg   = v.message ? ` -- ${v.message}` : '';
         return `  ${i + 1}.${focus}${path}${msg}`;
       });
       throw new Error(
-        `SHACL validation failed against <${shapesGraph}> — push aborted. ` +
+        `SHACL validation failed against <${shapesGraph}> -- push aborted. ` +
         `${report.violationCount ?? report.violations?.length ?? 0} violation(s):\n` +
         (violationLines.length ? violationLines.join('\n') : '  (see rawReport for details)')
       );
@@ -732,10 +732,10 @@ async function hbPushTurtle(turtle, graphIri, shapesGraph, mode = 'append') {
     });
     if (!res.ok) {
       const msg = await res.text();
-      throw new Error(`HolonBridge /update: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      throw new Error(`HolonBridge /update: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
     }
     const result = await res.json();
-    return `Pushed to <${graphIri}> via HolonBridge /update — HTTP ${res.status}, mode=${mode}`;
+    return `Pushed to <${graphIri}> via HolonBridge /update -- HTTP ${res.status}, mode=${mode}`;
   });
 }
 
@@ -781,7 +781,7 @@ async function hbProposePropertyUpdate(agentIri, property, delta, rationale, cap
     });
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`HolonBridge /holon/.../property: HTTP ${res.status} — ${text.slice(0, 400)}`);
+      throw new Error(`HolonBridge /holon/.../property: HTTP ${res.status} -- ${text.slice(0, 400)}`);
     }
     return text;
   });
@@ -816,7 +816,7 @@ async function hbCreateAgent(agentIri, label, agentKind, description, extraTurtl
     });
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`HolonBridge /agent: HTTP ${res.status} — ${text.slice(0, 400)}`);
+      throw new Error(`HolonBridge /agent: HTTP ${res.status} -- ${text.slice(0, 400)}`);
     }
     return text;
   });
@@ -850,7 +850,7 @@ async function hbNavigateAgent(agentIri, destinationIri, note) {
     });
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`HolonBridge /holon/.../navigate: HTTP ${res.status} — ${text.slice(0, 400)}`);
+      throw new Error(`HolonBridge /holon/.../navigate: HTTP ${res.status} -- ${text.slice(0, 400)}`);
     }
     return text;
   });
@@ -860,7 +860,7 @@ async function hbNavigateAgent(agentIri, destinationIri, note) {
  * Validate a Turtle payload against a SHACL shapes graph.
  *
  * The current /validate route (lib/validate.js, v2.9.1+) only validates a
- * named graph that already exists in the dataset — it takes JSON
+ * named graph that already exists in the dataset -- it takes JSON
  * { dataGraph, shapesGraph } and fetches dataGraph via GSP internally. It
  * does not accept raw Turtle in the request body.
  *
@@ -869,7 +869,7 @@ async function hbNavigateAgent(agentIri, destinationIri, note) {
  * we push the submitted Turtle into a short-lived temp graph first, run
  * /validate against that graph's IRI, then drop the temp graph. Mirrors the
  * temp-graph pattern lib/shacl.js already uses server-side against Fuseki
- * directly — this does the equivalent through the public REST surface.
+ * directly -- this does the equivalent through the public REST surface.
  */
 async function hbValidate(turtle, shapesGraph) {
   const tempGraph = `urn:holonbridge-mcp:validate-temp:${Date.now()}`;
@@ -887,12 +887,12 @@ async function hbValidate(turtle, shapesGraph) {
       });
       if (!res.ok) {
         const msg = await res.text();
-        throw new Error(`HolonBridge /validate: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+        throw new Error(`HolonBridge /validate: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
       }
       return res.json();
     });
   } finally {
-    // Best-effort cleanup — don't let a failed DROP mask or block the
+    // Best-effort cleanup -- don't let a failed DROP mask or block the
     // validation result itself.
     await hbUpdate(`DROP SILENT GRAPH <${tempGraph}>`).catch(() => {});
   }
@@ -911,7 +911,7 @@ async function hbNlQuery(question, graph) {
     });
     if (!res.ok) {
       const msg = await res.text();
-      throw new Error(`HolonBridge /query: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+      throw new Error(`HolonBridge /query: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
     }
     return res.json();
   });
@@ -928,7 +928,7 @@ async function hbListGraphs(filter) {
     .filter(g => !filter || g.iri.includes(filter));
 }
 
-// ── Static (.env) profile state ─────────────────────────────────────────────────
+// -- Static (.env) profile state -------------------------------------------------
 
 const profiles = {
   default: { url: HOLONBRIDGE_URL, label: 'default (from .env)', source: 'static' },
@@ -946,21 +946,21 @@ Object.keys(process.env)
 
 let activeProfile = 'default';
 
-// ── Registry-backed profiles ────────────────────────────────────────────────────
+// -- Registry-backed profiles ----------------------------------------------------
 //
 // In addition to the static .env profiles above, profiles are pulled live
 // from HolonBridge's federated bridge registry (GET /registry), which is
 // sourced from a GitHub-backed RDF registry graph and health-checked
 // server-side (see registry/session-init.js and registry/server-integration.md
-// in this repo). This lets any bridge registered in the federation — e.g.
-// Ben Wortley's GGSC bridge — become switchable via set_endpoint without
+// in this repo). This lets any bridge registered in the federation -- e.g.
+// Ben Wortley's GGSC bridge -- become switchable via set_endpoint without
 // manual profile edits or a restart, and stays current as the registry grows
 // past two nodes.
 //
 // Cached for REGISTRY_CACHE_MAX_AGE_MS to avoid hitting /registry on every
 // tool call; set_endpoint forces a fresh pull so a bridge registered moments
 // ago is immediately available. On fetch failure, falls back to the last
-// good cache (or empty, pre-first-fetch) rather than throwing — registry
+// good cache (or empty, pre-first-fetch) rather than throwing -- registry
 // unavailability should never break the static profiles.
 
 const REGISTRY_CACHE_MAX_AGE_MS = 30_000;
@@ -981,7 +981,7 @@ async function fetchRegistryProfiles({ force = false } = {}) {
       headers: hbHeaders({ Accept: 'application/json' }),
     });
     if (!res.ok) {
-      console.warn(`[registry] GET /registry: HTTP ${res.status} — keeping previous cache`);
+      console.warn(`[registry] GET /registry: HTTP ${res.status} -- keeping previous cache`);
       return registryCache.profiles;
     }
     const { bridges = [] } = await res.json();
@@ -1013,12 +1013,12 @@ async function getMergedProfiles({ force = false } = {}) {
   return { ...profiles, ...registryProfiles };
 }
 
-// ── Active base URL resolution ──────────────────────────────────────────────────
+// -- Active base URL resolution --------------------------------------------------
 //
 // PRIOR BUG (present through v1.10.0): every hb* HTTP helper below called the
 // module-level HOLONBRIDGE_URL constant directly, ignoring activeProfile
 // entirely. set_endpoint updated activeProfile, which only get_endpoint and
-// list_endpoints ever read — so switching profiles never actually redirected
+// list_endpoints ever read -- so switching profiles never actually redirected
 // any query, push, or dataset call. This function is the single source of
 // truth for "which bridge do we talk to right now," and every HTTP call
 // below must go through it rather than referencing HOLONBRIDGE_URL directly.
@@ -1034,7 +1034,7 @@ function activeBaseUrl() {
   return merged[activeProfile]?.url ?? HOLONBRIDGE_URL;
 }
 
-// ── MCP server factory ──────────────────────────────────────────────────────────────
+// -- MCP server factory --------------------------------------------------------------
 //
 // A fresh McpServer is created per /sse connection to avoid the SDK's
 // single-transport restriction ("Already connected to a transport").
@@ -1043,15 +1043,15 @@ function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
     version: '1.18.0',
-    'List all known HolonBridge profiles — static .env profiles plus live results ' +
+    'List all known HolonBridge profiles -- static .env profiles plus live results ' +
     'from the federated bridge registry (GET /registry), including reachability.',
     {},
     async () => {
       const merged = await getMergedProfiles();
       const lines = Object.entries(merged).map(([name, p]) => {
         const marker  = name === activeProfile ? '* ' : '  ';
-        const health  = p.reachable === true ? ' ✓ reachable'
-                       : p.reachable === false ? ' ✗ unreachable'
+        const health  = p.reachable === true ? ' OK reachable'
+                       : p.reachable === false ? ' X unreachable'
                        : '';
         const latency = p.latencyMs != null ? ` (${p.latencyMs}ms)` : '';
         const src     = p.source === 'registry' ? ' [registry]' : ' [static]';
@@ -1067,14 +1067,14 @@ function createMcpServer(sessionId) {
     return {
       content: [{
         type: 'text',
-        text: `Active profile: ${activeProfile} → ${p?.url ?? 'unknown (profile no longer present)'}`,
+        text: `Active profile: ${activeProfile} -> ${p?.url ?? 'unknown (profile no longer present)'}`,
       }],
     };
   });
 
   srv.tool(
     'set_endpoint',
-    'Switch the active HolonBridge profile by name — static config or any bridge ' +
+    'Switch the active HolonBridge profile by name -- static config or any bridge ' +
     'currently in the live federation registry.',
     { name: z.string().describe('Profile name from list_endpoints') },
     async ({ name }) => {
@@ -1090,7 +1090,7 @@ function createMcpServer(sessionId) {
         };
       }
       activeProfile = name;
-      return { content: [{ type: 'text', text: `Switched to profile "${name}" → ${merged[name].url}` }] };
+      return { content: [{ type: 'text', text: `Switched to profile "${name}" -> ${merged[name].url}` }] };
     }
   );
 
@@ -1144,7 +1144,7 @@ function createMcpServer(sessionId) {
       graph_iri:    z.string().describe('Target named graph IRI'),
       shapes_graph: z.string().optional().describe('SHACL shapes graph IRI for pre-push validation'),
       mode:         z.enum(['append', 'replace']).optional()
-                     .describe('Write mode: append (default — merges) or replace (overwrites the entire graph)'),
+                     .describe('Write mode: append (default -- merges) or replace (overwrites the entire graph)'),
     },
     async ({ turtle, graph_iri, shapes_graph, mode = 'append' }) => {
       requireWriteAccess();
@@ -1316,7 +1316,7 @@ function createMcpServer(sessionId) {
       });
       if (!res.ok) {
         const msg = await res.text();
-        throw new Error(`HolonBridge /datasets: HTTP ${res.status} — ${msg.slice(0, 200)}`);
+        throw new Error(`HolonBridge /datasets: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
       }
       const result = await res.json();
       // Annotate each dataset with the current actor's access level
@@ -1420,7 +1420,7 @@ function createMcpServer(sessionId) {
   return srv;
 }
 
-// ── Express app ───────────────────────────────────────────────────────────────────
+// -- Express app -------------------------------------------------------------------
 
 const app = express();
 
@@ -1432,11 +1432,11 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// express.json() intentionally omitted — /message uses the raw request stream
+// express.json() intentionally omitted -- /message uses the raw request stream
 // via SSEServerTransport.handlePostMessage; parsing the body here would consume
 // the stream before the transport can read it, causing 400 errors.
 
-// ── GitHub OAuth + JWT identity implementation ───────────────────────────────────────
+// -- GitHub OAuth + JWT identity implementation ---------------------------------------
 //
 // Replaces the pre-v1.15.0 shim, which accepted any authorization code or
 // client_credentials grant and handed back the same static MCP_REMOTE_TOKEN
@@ -1668,7 +1668,7 @@ app.post('/token', express.urlencoded({ extended: false }), express.json(), (req
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-// ── Bearer auth middleware (applied to all remaining routes) ────────────────────────────
+// -- Bearer auth middleware (applied to all remaining routes) ----------------------------
 //
 // Accepts either a valid signed JWT (the normal path, from a completed
 // GitHub login -- see /token above) or, as a legacy fallback, an exact
@@ -1681,7 +1681,7 @@ app.get('/favicon.ico', (_req, res) => res.status(204).end());
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized — missing Bearer token' });
+    return res.status(401).json({ error: 'Unauthorized -- missing Bearer token' });
   }
   const token = auth.slice(7);
 
@@ -1698,7 +1698,7 @@ function requireAuth(req, res, next) {
     return next();
   }
 
-  return res.status(401).json({ error: 'Unauthorized — invalid or expired token' });
+  return res.status(401).json({ error: 'Unauthorized -- invalid or expired token' });
 }
 
 app.use(requireAuth);
