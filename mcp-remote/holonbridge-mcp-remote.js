@@ -1043,6 +1043,10 @@ function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
     version: '1.18.0',
+  });
+
+  srv.tool(
+    'list_endpoints',
     'List all known HolonBridge profiles -- static .env profiles plus live results ' +
     'from the federated bridge registry (GET /registry), including reachability.',
     {},
