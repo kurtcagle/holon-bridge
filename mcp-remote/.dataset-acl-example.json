@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy this to .dataset-acl.json (gitignored) and edit with real GitHub logins. Access values: \"r\" (read-only), \"rw\" (read+write), or omit the actor entirely for no access. \"*\" matches any GitHub login on GITHUB_ALLOWED_USERS. defaultAccess applies to any dataset with no explicit entry below.",
+  "defaultAccess": "none",
+  "datasets": {
+    "playground":       { "*": "r" },
+    "team-shared":      { "*": "rw" },
+    "alice-private":    { "alice-githubuser": "rw" },
+    "client-project":   { "alice-githubuser": "rw", "bob-githubuser": "rw" },
+    "read-only-catalog": { "*": "r", "alice-githubuser": "rw" }
+  }
+}
