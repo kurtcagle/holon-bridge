@@ -91,6 +91,20 @@
  *
  * Changelog
  * ---------
+ *   2026-07-13 v1.20.0 list_datasets no longer shows datasets the calling actor
+ *                      has no access to at all. Previously every dataset in the
+ *                      live /datasets response was returned and merely annotated
+ *                      yourAccess: "none" for ones outside the actor's grant --
+ *                      so a caller with access to one dataset out of a dozen
+ *                      could still see every other dataset's name (just not
+ *                      query it). Datasets resolving to "none" via
+ *                      resolveDatasetAccess() are now filtered out of the
+ *                      response entirely before it's returned, so an actor's
+ *                      dataset list reveals only partitions they can actually
+ *                      read or write -- not the existence of every partition on
+ *                      the bridge. No behaviour change when no .dataset-acl.json
+ *                      is loaded (permissive fallback still resolves every
+ *                      dataset to "rw", so nothing is filtered).
  *   2026-07-13 v1.19.0 Watch .env and .dataset-acl.json for changes on disk
  *                      and exit cleanly (debounced) when either changes, so
  *                      an external process supervisor (NSSM, pm2, systemd,
@@ -1105,7 +1119,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.19.0',
+    version: '1.20.0',
   });
 
   srv.tool(
@@ -1374,8 +1388,11 @@ function createMcpServer(sessionId) {
 
   srv.tool(
     'list_datasets',
-    'List all Fuseki datasets available on this HolonBridge instance, plus which ' +
-    'one YOUR session is currently using (see switch_dataset).',
+    'List Fuseki datasets on this HolonBridge instance that YOU have at least read ' +
+    'access to, plus which one your session is currently using (see switch_dataset). ' +
+    'Datasets you have no access to at all are omitted entirely -- not merely marked ' +
+    "none -- so a caller's dataset list never reveals the existence or names of " +
+    'partitions outside their grant.',
     {},
     async () => {
       const res = await fetch(`${activeBaseUrl()}/datasets`, {
@@ -1386,12 +1403,17 @@ function createMcpServer(sessionId) {
         throw new Error(`HolonBridge /datasets: HTTP ${res.status} -- ${msg.slice(0, 200)}`);
       }
       const result = await res.json();
-      // Annotate each dataset with the current actor's access level
       const login = requestContext.getStore()?.githubLogin;
       if (datasetAcl && result.datasets) {
-        for (const ds of result.datasets) {
-          ds.yourAccess = resolveDatasetAccess(login, ds.name);
-        }
+        // Annotate every dataset with the caller's access level, then drop
+        // anything resolving to "none" -- a dataset the caller has zero
+        // access to should not be visible in their listing at all (not
+        // even by name), not merely flagged as inaccessible. Without an
+        // ACL file loaded, resolveDatasetAccess() always returns "rw"
+        // (permissive fallback), so nothing is filtered in that mode.
+        result.datasets = result.datasets
+          .map(ds => ({ ...ds, yourAccess: resolveDatasetAccess(login, ds.name) }))
+          .filter(ds => ds.yourAccess !== 'none');
       }
       return { content: [{ type: 'text', text: JSON.stringify({ ...result, yourActiveDataset: currentDataset() ?? DEFAULT_DATASET }, null, 2) }] };
     }
@@ -1468,26 +1490,21 @@ function createMcpServer(sessionId) {
     async ({ dataset }) => {
       const actorIri = currentActorIri();
       if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
-      // ACL gate: refuse switching to a dataset the actor can't access at all
       const login = requestContext.getStore()?.githubLogin;
       const access = resolveDatasetAccess(login, dataset);
       if (access === 'none') {
         throw new Error(`Access denied: you (${login ?? 'unknown'}) do not have access to dataset "${dataset}". Ask the bridge operator to add you to .dataset-acl.json.`);
       }
       setActorDataset(actorIri, dataset);
-      // Also update the live session so subsequent calls in THIS connection
-      // immediately reflect the switch without needing a reconnect.
       const session = sessions.get(sessionId);
       if (session) session.dataset = dataset;
-      activeFusekiDataset = dataset;  // keep health reporting current
+      activeFusekiDataset = dataset;
       return { content: [{ type: 'text', text: `Switched your active dataset to "${dataset}" (sticky -- will persist across reconnects and restarts). Other connected users are unaffected.` }] };
     }
   );
 
   return srv;
 }
-
-// -- Express app -------------------------------------------------------------------
 
 const app = express();
 
@@ -1499,62 +1516,14 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// express.json() intentionally omitted -- /message uses the raw request stream
-// via SSEServerTransport.handlePostMessage; parsing the body here would consume
-// the stream before the transport can read it, causing 400 errors.
-
-// -- GitHub OAuth + JWT identity implementation ---------------------------------------
-//
-// Replaces the pre-v1.15.0 shim, which accepted any authorization code or
-// client_credentials grant and handed back the same static MCP_REMOTE_TOKEN
-// regardless of who -- or whether anyone -- was actually asking. This is a
-// real login: /authorize now sends the browser to GitHub, /oauth/github/callback
-// verifies the person's GitHub login is on GITHUB_ALLOWED_USERS and mints a
-// signed per-user JWT (see signJwt/verifyJwt above), and /token exchanges the
-// one-time code from that callback for the JWT. requireAuth below verifies
-// that JWT (or, as a legacy fallback, the static MCP_REMOTE_TOKEN, mapped to
-// SERVICE_ACTOR_IRI) and resolves the caller's identity once per /sse
-// connection -- see the /sse handler and currentActorIri() above for how
-// that identity then reaches every lifecycle-verb tool call without the
-// caller ever supplying it themselves.
-//
-// v1.15.1 note: v1.15.0 originally gated access on GitHub Organization
-// membership (GET /user/memberships/orgs/:org). That endpoint only exists
-// for actual Organizations -- a personal GitHub account (which is what most
-// solo/small-team setups, this one included, actually run out of) has no
-// memberships to check, so the org-membership call 404s unconditionally
-// regardless of who's logging in. Replaced with a static allowlist
-// (GITHUB_ALLOWED_USERS) checked locally against the authenticated login --
-// works identically whether the account is personal or a real org, needs no
-// GitHub scope at all (dropped 'read:org'), and matches what was actually
-// asked for: a closed list of specific people, not org-wide membership.
-//
-// PKCE note: the advertised token_endpoint_auth_methods_supported includes
-// 'none' (implying PKCE for public clients per spec), but code_verifier is
-// not currently checked against a stored code_challenge -- this carries
-// forward a gap that predates this change (the old shim didn't check it
-// either) rather than introducing a new one. Worth closing before this is
-// exposed beyond a small trusted group, but out of scope for the identity
-// substitution this version is about.
-
 const MCP_PUBLIC_URL = process.env.MCP_PUBLIC_URL || 'https://kurtcagle-mcp.ngrok.io';
 const GITHUB_CALLBACK_URL = `${MCP_PUBLIC_URL}/oauth/github/callback`;
 
 const registeredClients = new Map();
-
-// pendingAuthFlows: our own flowId -> the ORIGINAL client's redirect_uri/state/
-// client_id, captured at /authorize before we ever hand off to GitHub. GitHub's
-// own `state` query param carries this flowId through its redirect so we can
-// recover the original client's request once the person is back from GitHub.
 const pendingAuthFlows = new Map();
-
-// authCodes: our own one-time code (handed to the ORIGINAL client's
-// redirect_uri after a successful GitHub login) -> the resolved identity
-// (actorIri, githubLogin, name) that /token exchanges for a signed JWT.
 const authCodes = new Map();
 
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
-  console.log('[OAuth] GET /.well-known/oauth-protected-resource');
   res.json({
     resource:                 MCP_PUBLIC_URL,
     authorization_servers:    [MCP_PUBLIC_URL],
@@ -1563,7 +1532,6 @@ app.get('/.well-known/oauth-protected-resource', (req, res) => {
 });
 
 app.get('/.well-known/oauth-protected-resource/sse', (req, res) => {
-  console.log('[OAuth] GET /.well-known/oauth-protected-resource/sse');
   res.json({
     resource:                 MCP_PUBLIC_URL,
     authorization_servers:    [MCP_PUBLIC_URL],
@@ -1572,7 +1540,6 @@ app.get('/.well-known/oauth-protected-resource/sse', (req, res) => {
 });
 
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
-  console.log('[OAuth] GET /.well-known/oauth-authorization-server');
   res.json({
     issuer:                                MCP_PUBLIC_URL,
     authorization_endpoint:                `${MCP_PUBLIC_URL}/authorize`,
@@ -1586,7 +1553,6 @@ app.get('/.well-known/oauth-authorization-server', (req, res) => {
 });
 
 app.post('/register', express.json(), (req, res) => {
-  console.log('[OAuth] POST /register body:', JSON.stringify(req.body));
   const client_id     = randomUUID();
   const client_secret = randomUUID();
   registeredClients.set(client_id, { ...(req.body ?? {}), client_id, client_secret });
@@ -1599,20 +1565,11 @@ app.post('/register', express.json(), (req, res) => {
   });
 });
 
-// GET /authorize -- entry point for the OAuth dance. Stashes the ORIGINAL
-// client's redirect_uri/state/client_id under a fresh flowId, then sends the
-// browser to GitHub's own authorize endpoint with that flowId riding in
-// GitHub's `state` param (GitHub echoes state back verbatim on its own
-// redirect, which is how we recover the original request in the callback
-// below -- our flowId and the client's own `state` are different things
-// living in different places for exactly this reason).
 app.get('/authorize', (req, res) => {
-  console.log('[OAuth] GET /authorize query:', JSON.stringify(req.query));
   const { redirect_uri, state, client_id } = req.query;
   if (!redirect_uri) {
     return res.status(400).json({ error: 'redirect_uri is required' });
   }
-
   const flowId = randomUUID();
   pendingAuthFlows.set(flowId, { redirect_uri, state, client_id, createdAt: Date.now() });
   setTimeout(() => pendingAuthFlows.delete(flowId), 10 * 60 * 1000);
@@ -1621,34 +1578,20 @@ app.get('/authorize', (req, res) => {
   githubUrl.searchParams.set('client_id', GITHUB_CLIENT_ID);
   githubUrl.searchParams.set('redirect_uri', GITHUB_CALLBACK_URL);
   githubUrl.searchParams.set('state', flowId);
-
-  console.log(`[OAuth] Redirecting to GitHub for login (flowId=${flowId})`);
   return res.redirect(githubUrl.toString());
 });
 
-// GET /oauth/github/callback -- GitHub sends the person back here after they
-// approve (or deny) the login. Exchanges the GitHub code for a GitHub access
-// token, fetches identity with it, and -- only if their GitHub login is on
-// GITHUB_ALLOWED_USERS -- mints our own one-time code and hands them back
-// to the ORIGINAL client's redirect_uri from the pending flow. Anyone not
-// on the allowlist is rejected here, before any code or token exists for
-// them at all.
 app.get('/oauth/github/callback', async (req, res) => {
   const { code, state: flowId, error: githubError } = req.query;
-
   if (githubError) {
-    console.warn(`[OAuth] GitHub returned an error: ${githubError}`);
     return res.status(400).send(`GitHub login failed: ${githubError}`);
   }
   if (!code || !flowId || !pendingAuthFlows.has(flowId)) {
     return res.status(400).send('Invalid or expired login attempt -- please try logging in again.');
   }
-
   const flow = pendingAuthFlows.get(flowId);
   pendingAuthFlows.delete(flowId);
-
   try {
-    // Exchange the GitHub code for a GitHub access token.
     const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -1661,47 +1604,28 @@ app.get('/oauth/github/callback', async (req, res) => {
     });
     const tokenJson = await tokenRes.json();
     if (!tokenJson.access_token) {
-      console.warn('[OAuth] GitHub token exchange failed:', JSON.stringify(tokenJson));
       return res.status(502).send('GitHub login failed during token exchange.');
     }
     const githubAccessToken = tokenJson.access_token;
-
-    // Who is this?
     const userRes = await fetch('https://api.github.com/user', {
       headers: { Authorization: `Bearer ${githubAccessToken}`, Accept: 'application/vnd.github+json' },
     });
     if (!userRes.ok) {
-      console.warn(`[OAuth] GitHub /user returned HTTP ${userRes.status}`);
       return res.status(502).send('GitHub login failed while fetching identity.');
     }
     const githubUser = await userRes.json();
     const githubLogin = githubUser.login;
-
-    // Are they on the allowlist? Case-insensitive against GITHUB_ALLOWED_USERS.
-    // No GitHub API call needed here -- unlike org membership, this is a
-    // local check against config this process already has, so it can't
-    // fail due to the account in question not being an Organization.
     if (!ALLOWED_GITHUB_LOGINS.has(githubLogin.toLowerCase())) {
-      console.warn(`[OAuth] ${githubLogin} authenticated with GitHub but is not on the allowlist`);
       return res.status(403).send(`Access denied -- ${githubLogin} is not on the allowed users list.`);
     }
-
-    // Identity confirmed. Mint our own one-time code and send the person
-    // back to wherever they actually started (the original client's
-    // redirect_uri), carrying the client's OWN state -- not our flowId,
-    // which has already served its purpose and is discarded above.
     const actorIri = `https://w3id.org/users/${githubLogin}`;
     const ourCode = randomUUID();
     authCodes.set(ourCode, { actorIri, githubLogin, name: githubUser.name ?? githubLogin });
     setTimeout(() => authCodes.delete(ourCode), 5 * 60 * 1000);
-
-    console.log(`[OAuth] ${githubLogin} (${actorIri}) authenticated -- issuing code for ${flow.redirect_uri}`);
-
     const redirectUrl = new URL(flow.redirect_uri);
     redirectUrl.searchParams.set('code', ourCode);
     if (flow.state) redirectUrl.searchParams.set('state', flow.state);
     return res.redirect(redirectUrl.toString());
-
   } catch (err) {
     console.error('[OAuth] /oauth/github/callback error:', err.message);
     return res.status(500).send('GitHub login failed unexpectedly. Please try again.');
@@ -1709,23 +1633,16 @@ app.get('/oauth/github/callback', async (req, res) => {
 });
 
 app.post('/token', express.urlencoded({ extended: false }), express.json(), (req, res) => {
-  console.log('[OAuth] POST /token body:', JSON.stringify(req.body));
   const { grant_type, code } = req.body ?? {};
-
   if (grant_type === 'authorization_code') {
     if (!code || !authCodes.has(code)) {
       return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown or expired code.' });
     }
     const { actorIri, githubLogin, name } = authCodes.get(code);
-    authCodes.delete(code); // one-time use
+    authCodes.delete(code);
     const accessToken = signJwt({ sub: actorIri, githubLogin, name }, JWT_SECRET, JWT_EXPIRES_IN_SECONDS);
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: JWT_EXPIRES_IN_SECONDS });
   }
-
-  // client_credentials (no interactive user) is no longer supported as a
-  // primary path -- GitHub login requires a person in the loop by design.
-  // Legacy automation should use the static MCP_REMOTE_TOKEN directly as a
-  // Bearer header (see requireAuth below) rather than exchanging it here.
   return res.status(400).json({
     error: 'unsupported_grant_type',
     error_description: 'Only authorization_code (GitHub login) is supported. ' +
@@ -1735,36 +1652,23 @@ app.post('/token', express.urlencoded({ extended: false }), express.json(), (req
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
-// -- Bearer auth middleware (applied to all remaining routes) ----------------------------
-//
-// Accepts either a valid signed JWT (the normal path, from a completed
-// GitHub login -- see /token above) or, as a legacy fallback, an exact
-// match against the static MCP_REMOTE_TOKEN if one is configured. The JWT
-// path resolves req.actorIri to the real person who logged in; the legacy
-// path resolves it to the single shared SERVICE_ACTOR_IRI, same ambiguity
-// as every call before this version. New interactive callers should always
-// end up on the JWT path via the GitHub flow above.
-
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Unauthorized -- missing Bearer token' });
   }
   const token = auth.slice(7);
-
   const jwtPayload = verifyJwt(token, JWT_SECRET);
   if (jwtPayload) {
     req.actorIri = jwtPayload.sub;
     req.githubLogin = jwtPayload.githubLogin;
     return next();
   }
-
   if (MCP_REMOTE_TOKEN && token === MCP_REMOTE_TOKEN) {
     req.actorIri = SERVICE_ACTOR_IRI;
     req.githubLogin = null;
     return next();
   }
-
   return res.status(401).json({ error: 'Unauthorized -- invalid or expired token' });
 }
 
@@ -1775,36 +1679,24 @@ const sessions = new Map();
 app.get('/sse', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('X-Accel-Buffering', 'no');
-
   const transport = new SSEServerTransport('/message', res);
   const sessionId = transport.sessionId;
   const srv = createMcpServer(sessionId);
-
-  // actorIri is resolved once here, at connection time, from the Bearer
-  // token requireAuth already verified -- everything this session's tool
-  // calls do downstream reads it back via currentActorIri(), never from a
-  // client-supplied parameter. dataset is resolved from the persisted
-  // per-actor preference (see setActorDataset / getActorDataset above),
-  // defaulting to DEFAULT_DATASET for first-time users.
   const dataset = getActorDataset(req.actorIri);
   sessions.set(sessionId, { server: srv, transport, actorIri: req.actorIri, githubLogin: req.githubLogin, dataset });
-
   res.on('close', () => {
     sessions.delete(sessionId);
     srv.close().catch(() => {});
   });
-
   await srv.connect(transport);
 });
 
 app.post('/message', async (req, res) => {
   const sessionId = req.query.sessionId;
   const session = sessions.get(sessionId);
-
   if (!session) {
     return res.status(404).json({ error: `No active session: ${sessionId}` });
   }
-
   const reqId = randomUUID();
   await requestContext.run({ reqId, actorIri: session.actorIri, githubLogin: session.githubLogin, dataset: session.dataset }, () =>
     timedProcess(`MCP tool call (session=${sessionId}, actor=${session.githubLogin ?? 'service'}, dataset=${session.dataset}) [reqId=${reqId}]`, () =>
@@ -1818,7 +1710,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.19.0',
+    version: '1.20.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1831,7 +1723,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.19.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.20.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
