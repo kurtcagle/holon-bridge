@@ -91,6 +91,23 @@
  *
  * Changelog
  * ---------
+ *   2026-07-13 v1.19.0 Watch .env and .dataset-acl.json for changes on disk
+ *                      and exit cleanly (debounced) when either changes, so
+ *                      an external process supervisor (NSSM, pm2, systemd,
+ *                      a restart-loop wrapper) restarts this process with
+ *                      freshly loaded config. Deliberately does NOT attempt
+ *                      to hot-reload dotenv or the ACL table in place --
+ *                      .env is only ever read once at startup (via
+ *                      `import 'dotenv/config'`), and JWT_SECRET in
+ *                      particular changing under active sessions would
+ *                      invalidate already-issued tokens in a way that's
+ *                      easy to get subtly wrong if done live. A clean exit
+ *                      + supervisor restart is simpler and safer than
+ *                      partial in-process reload. If this process is ever
+ *                      run bare (`node holonbridge-mcp-remote.js`, no
+ *                      supervisor), it will now exit on config edits and
+ *                      NOT come back up on its own -- pair this with NSSM/
+ *                      pm2/a restart loop, not a bare `node` invocation.
  *   2026-07-12 v1.18.0 Add list_dataset_acls tool: the full multi-user
  *                      per-dataset ACL table (who has what access to which
  *                      dataset), merged against the live /datasets list so
@@ -330,7 +347,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { randomUUID, createHmac } from 'crypto';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, watch } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -488,6 +505,56 @@ function loadDatasetAcl() {
 
 const datasetAcl = loadDatasetAcl();
 
+// -- Auto-restart on config file changes (v1.19.0) --------------------------------
+//
+// Watches .env and .dataset-acl.json for changes and exits cleanly
+// (debounced) when either changes, so an external process supervisor
+// (NSSM, pm2, systemd, a restart-loop wrapper script) restarts this process
+// with freshly loaded config. Deliberately does NOT attempt to hot-reload
+// dotenv or the ACL table in place -- .env is only ever read once at
+// startup (via `import 'dotenv/config'` at the top of this file), and
+// JWT_SECRET in particular changing under active sessions would invalidate
+// already-issued tokens in a way that's easy to get subtly wrong if handled
+// live. A clean exit + supervisor restart is simpler and safer than a
+// partial in-process reload.
+//
+// Debounced because editors and some tools emit multiple fs events for a
+// single logical save (write-then-rename, or several writes for an atomic
+// save) -- without debouncing this could trigger more than one restart per
+// edit.
+//
+// IMPORTANT: if this process is ever run bare (`node holonbridge-mcp-remote.js`
+// with no supervisor), it will now exit on a config edit and NOT come back
+// up on its own. Pair this with NSSM/pm2/a restart-loop wrapper, not a bare
+// `node` invocation.
+
+const ENV_FILE = join(__hbDirname, '.env');
+const RESTART_DEBOUNCE_MS = 500;
+let restartTimer = null;
+
+function scheduleRestart(reason) {
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = setTimeout(() => {
+    console.log(`[restart] ${reason} -- exiting so the process supervisor can restart with fresh config.`);
+    process.exit(0);
+  }, RESTART_DEBOUNCE_MS);
+}
+
+for (const [label, watchPath] of [['.env', ENV_FILE], ['.dataset-acl.json', DATASET_ACL_FILE]]) {
+  if (existsSync(watchPath)) {
+    try {
+      watch(watchPath, { persistent: true }, (eventType) => {
+        scheduleRestart(`${label} changed (${eventType})`);
+      });
+      console.log(`[restart] Watching ${label} for changes (${watchPath})`);
+    } catch (err) {
+      console.warn(`[restart] Failed to watch ${label}:`, err.message);
+    }
+  } else {
+    console.warn(`[restart] ${label} not found at ${watchPath} -- not watching. Create it and restart this process to enable watching.`);
+  }
+}
+
 /**
  * Resolve the effective access level for a given actor on a given dataset.
  * Returns "rw", "r", or "none".
@@ -621,14 +688,10 @@ function verifyJwt(token, secret) {
 // when present, so a request's total duration as seen by this process can be
 // diffed against its duration as seen by HolonBridge REST -- a *different*
 // process, a *different* log file -- to isolate the ngrok tunnel between
-// mcp-remote and HolonBridge: grep the same reqId in both logs, subtract.
-//
-// This does NOT capture the other tunnel (Claude client <-> mcp-remote, the
-// actual SSE channel this process serves) -- there's no server-side
-// visibility into when Claude issued the request on the other end of that
-// tunnel. Isolating that leg specifically requires a manual client-side
-// wall-clock comparison against this process's own [PROCESS N] Started
-// timestamp for the same call.
+// mcp-remote and HolonBridge REST specifically, as distinct from Jena or LLM
+// processing time (both already instrumented server-side) or the separate
+// Claude-client-to-mcp-remote SSE tunnel (not measurable this way -- no
+// server-side visibility into when Claude issued the request on that leg).
 //
 // Extended 2026-07-11 (v1.15.0) to also carry actorIri/githubLogin -- the
 // identity resolved once at /sse connection time from the caller's Bearer
@@ -1042,7 +1105,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.18.0',
+    version: '1.19.0',
   });
 
   srv.tool(
@@ -1755,7 +1818,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.18.0',
+    version: '1.19.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1768,7 +1831,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.18.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.19.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
