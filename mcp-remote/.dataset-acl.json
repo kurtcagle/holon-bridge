@@ -2,7 +2,7 @@
   "defaultAccess": "none",
   "datasets": {
     "worldtest":        { "*": "rw" },
-    "ds":          { "*": "rw" },
+    "ds":          { "*": "r" },
     "chloe":       { "kurtcagle": "rw" },
     "ggsc":        { "kurtcagle": "rw", "benwortley": "rw" },
     "causalspark": { "kurtcagle": "rw" },
