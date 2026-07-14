@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HolonBridge · Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700&family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:   #EDF0F2;
+    --panel:   #F7F9FA;
+    --ink:     #22282E;
+    --muted:   #6B7681;
+    --rule:    #C6CDD3;
+    --rw:      #1F6F5B;
+    --r:       #9A6A12;
+    --none:    #8A939B;
+    --danger:  #A03A2E;
+    --focus:   #32506E;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.55 "IBM Plex Sans", system-ui, sans-serif;
+    padding: 0 20px 80px;
+  }
+  main { max-width: 980px; margin: 0 auto; }
+  a, button { font-family: inherit; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+  header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding: 26px 0 14px; border-bottom: 2px solid var(--ink); margin-bottom: 26px;
+  }
+  .wordmark { font-family: Archivo, sans-serif; font-weight: 700; font-size: 21px; letter-spacing: -0.02em; }
+  .wordmark span { color: var(--muted); font-weight: 500; }
+  .whoami { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; color: var(--muted); }
+  .whoami b { color: var(--ink); font-weight: 600; }
+
+  h2 {
+    font-family: Archivo, sans-serif; font-weight: 600; font-size: 13px;
+    letter-spacing: 0.09em; text-transform: uppercase; color: var(--muted);
+    margin: 34px 0 10px;
+  }
+
+  .card { background: var(--panel); border: 1px solid var(--rule); padding: 18px 20px; }
+
+  /* -- default access ----------------------------------------------------- */
+  .default-row { display: flex; align-items: center; gap: 14px; }
+  .default-row select {
+    font: 600 14px "IBM Plex Mono", monospace; padding: 6px 10px;
+    border: 1px solid var(--rule); background: #fff; color: var(--ink);
+  }
+  .hint { color: var(--muted); font-size: 13.5px; }
+
+  /* -- matrix -------------------------------------------------------------- */
+  .matrix-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-family: "IBM Plex Mono", monospace; font-size: 13px; }
+  th, td { border: 1px solid var(--rule); padding: 0; }
+  thead th {
+    background: var(--panel); font-weight: 600; padding: 8px 12px;
+    text-align: left; white-space: nowrap;
+  }
+  thead th.actor { text-align: center; min-width: 86px; }
+  tbody th {
+    background: var(--panel); font-weight: 400; padding: 8px 12px;
+    text-align: left; white-space: nowrap;
+  }
+  tbody th .live-tag { color: var(--muted); font-size: 11px; margin-left: 8px; }
+  td.cell { text-align: center; background: #fff; }
+  td.cell button {
+    width: 100%; height: 100%; min-height: 38px; border: 0; background: transparent;
+    cursor: pointer; font: 600 13px "IBM Plex Mono", monospace; color: var(--none);
+  }
+  td.cell button[data-level="unset"] { color: var(--rule); }
+  td.cell button[data-level="r"]     { color: var(--r); }
+  td.cell button[data-level="rw"]    { color: var(--rw); }
+  td.cell button[data-level="none"]  { color: var(--danger); }
+  td.cell button:hover { background: var(--paper); }
+
+  .adders { display: flex; gap: 24px; margin-top: 14px; flex-wrap: wrap; }
+  .adders form { display: flex; gap: 8px; }
+  .adders input {
+    font: 13px "IBM Plex Mono", monospace; padding: 7px 10px;
+    border: 1px solid var(--rule); background: #fff; min-width: 180px;
+  }
+  .adders button, .save-bar button, .signin button, .install button {
+    font: 500 14px "IBM Plex Sans", sans-serif; padding: 8px 16px;
+    border: 1px solid var(--ink); background: #fff; color: var(--ink); cursor: pointer;
+  }
+  .save-bar { display: flex; align-items: center; gap: 16px; margin-top: 26px; }
+  .save-bar button.primary { background: var(--rw); border-color: var(--rw); color: #fff; }
+  .save-bar button:disabled { opacity: 0.45; cursor: default; }
+
+  .legend { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  .legend code { font-family: "IBM Plex Mono", monospace; font-weight: 600; }
+  .legend .lr  { color: var(--r); } .legend .lrw { color: var(--rw); }
+  .legend .ln  { color: var(--danger); }
+
+  /* -- status / violations -------------------------------------------------- */
+  .banner { padding: 12px 16px; margin-top: 18px; font-size: 14px; border: 1px solid; }
+  .banner.ok     { border-color: var(--rw); color: var(--rw); background: #eef6f3; }
+  .banner.err    { border-color: var(--danger); color: var(--danger); background: #f9efed; }
+  .banner.info   { border-color: var(--rule); color: var(--muted); background: var(--panel); }
+  .violations { margin-top: 12px; }
+  .violations li {
+    font-family: "IBM Plex Mono", monospace; font-size: 12.5px;
+    color: var(--danger); margin-bottom: 6px;
+  }
+  .signin { text-align: center; padding: 70px 0; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="wordmark">holonbridge <span>/ admin</span></div>
+    <div class="whoami" id="whoami"></div>
+  </header>
+
+  <div id="signin" class="signin hidden">
+    <p class="hint">Operator sign-in goes through the same GitHub OAuth flow the MCP connector uses.</p>
+    <button id="signin-btn">Sign in with GitHub</button>
+  </div>
+
+  <div id="console" class="hidden">
+    <h2>Default access</h2>
+    <div class="card default-row">
+      <select id="default-access" aria-label="Default access">
+        <option value="none">none</option>
+        <option value="r">r</option>
+        <option value="rw">rw</option>
+      </select>
+      <span class="hint">Applied to any dataset with no explicit grant for the caller. <code>none</code> keeps unlisted datasets invisible.</span>
+    </div>
+
+    <h2>Access matrix</h2>
+    <div class="card">
+      <div class="matrix-wrap"><table id="matrix"></table></div>
+      <div class="legend">
+        Click a cell to cycle: <code>·</code> unset (falls through to <code>*</code> then default) →
+        <code class="lr">r</code> read → <code class="lrw">rw</code> read + write →
+        <code class="ln">none</code> explicit block → unset.
+      </div>
+      <div class="adders">
+        <form id="add-actor"><input placeholder="add actor (GitHub login)" aria-label="Add actor"><button>Add actor</button></form>
+        <form id="add-dataset"><input placeholder="add dataset" aria-label="Add dataset"><button>Add dataset</button></form>
+      </div>
+    </div>
+
+    <div class="save-bar">
+      <button class="primary" id="save">Save & restart bridge</button>
+      <span class="hint">Saving rewrites <code>.dataset-acl.json</code>; the config watcher restarts the process, so MCP sessions reconnect.</span>
+    </div>
+
+    <div id="status"></div>
+    <div id="install-wrap" class="install hidden" style="margin-top:12px">
+      <button id="install-shapes">Install ACL shapes into &lt;urn:admin:acl-shapes&gt;</button>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const TOKEN_KEY = 'hb_admin_jwt';
+  const $ = (s) => document.querySelector(s);
+  const LEVELS = ['unset', 'r', 'rw', 'none'];
+  const GLYPH  = { unset: '·', r: 'r', rw: 'rw', none: 'none' };
+
+  // model.grants: { dataset: { login: 'r'|'rw'|'none' } } -- unset cells absent
+  let model = { defaultAccess: 'none', grants: {}, actors: ['*'], datasets: [], liveDatasets: [] };
+
+  const token = () => sessionStorage.getItem(TOKEN_KEY);
+
+  async function api(path, init = {}) {
+    const res = await fetch(path, {
+      ...init,
+      headers: { Authorization: 'Bearer ' + token(), ...(init.headers || {}) },
+    });
+    if (res.status === 401) { sessionStorage.removeItem(TOKEN_KEY); showSignin(); throw new Error('Session expired -- sign in again.'); }
+    return res;
+  }
+
+  // -- OAuth dance against the existing /authorize + /token routes ------------
+
+  function showSignin() {
+    $('#signin').classList.remove('hidden');
+    $('#console').classList.add('hidden');
+    $('#whoami').textContent = '';
+  }
+
+  $('#signin-btn').addEventListener('click', () => {
+    const redirect = location.origin + location.pathname;
+    location.href = '/authorize?client_id=admin-console&state=admin&redirect_uri=' + encodeURIComponent(redirect);
+  });
+
+  async function exchangeCode(code) {
+    const res = await fetch('/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'authorization_code', code }),
+    });
+    if (!res.ok) throw new Error('Token exchange failed.');
+    const j = await res.json();
+    sessionStorage.setItem(TOKEN_KEY, j.access_token);
+    history.replaceState(null, '', location.pathname);
+  }
+
+  // -- load + render -----------------------------------------------------------
+
+  function banner(kind, html) { $('#status').innerHTML = '<div class="banner ' + kind + '">' + html + '</div>'; }
+
+  async function load() {
+    const who = await (await api('/admin/api/whoami')).json();
+    $('#whoami').innerHTML = 'signed in as <b>' + who.githubLogin + '</b>' + (who.operator ? '' : ' (not an operator)');
+    if (!who.operator) { banner('err', 'Your login is authenticated but not in ADMIN_OPERATORS -- read-only refusal.'); return; }
+
+    const data = await (await api('/admin/api/acl')).json();
+    model.defaultAccess = data.defaultAccess ?? 'none';
+    model.grants = structuredClone(data.datasets ?? {});
+    model.liveDatasets = data.liveDatasets ?? [];
+    model.datasets = [...new Set([...Object.keys(model.grants), ...model.liveDatasets])].sort();
+    const logins = new Set(['*']);
+    Object.values(model.grants).forEach(m => Object.keys(m).forEach(l => logins.add(l)));
+    model.actors = ['*', ...[...logins].filter(l => l !== '*').sort()];
+    if (data.note) banner('info', data.note);
+
+    $('#default-access').value = model.defaultAccess;
+    $('#console').classList.remove('hidden');
+    $('#signin').classList.add('hidden');
+    render();
+  }
+
+  function levelOf(ds, actor) { return model.grants[ds]?.[actor] ?? 'unset'; }
+
+  function setLevel(ds, actor, level) {
+    if (level === 'unset') {
+      if (model.grants[ds]) { delete model.grants[ds][actor]; if (!Object.keys(model.grants[ds]).length) delete model.grants[ds]; }
+    } else {
+      (model.grants[ds] ??= {})[actor] = level;
+    }
+  }
+
+  function render() {
+    const head = '<thead><tr><th>dataset</th>' +
+      model.actors.map(a => '<th class="actor">' + a + '</th>').join('') + '</tr></thead>';
+    const rows = model.datasets.map(ds => {
+      const inFile = !!model.grants[ds];
+      const live = model.liveDatasets.includes(ds);
+      const tag = !live ? '<span class="live-tag">not on Fuseki</span>'
+                : !inFile ? '<span class="live-tag">defaultAccess</span>' : '';
+      const cells = model.actors.map(a => {
+        const lvl = levelOf(ds, a);
+        return '<td class="cell"><button data-ds="' + ds + '" data-actor="' + a + '" data-level="' + lvl +
+               '" aria-label="' + ds + ' / ' + a + ': ' + lvl + '">' + GLYPH[lvl] + '</button></td>';
+      }).join('');
+      return '<tr><th>' + ds + tag + '</th>' + cells + '</tr>';
+    }).join('');
+    $('#matrix').innerHTML = head + '<tbody>' + rows + '</tbody>';
+
+    $('#matrix').querySelectorAll('button[data-ds]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const next = LEVELS[(LEVELS.indexOf(btn.dataset.level) + 1) % LEVELS.length];
+        setLevel(btn.dataset.ds, btn.dataset.actor, next);
+        render();
+      });
+    });
+  }
+
+  $('#add-actor').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = e.target.querySelector('input').value.trim().toLowerCase();
+    if (v && !model.actors.includes(v)) { model.actors.push(v); render(); }
+    e.target.reset();
+  });
+
+  $('#add-dataset').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = e.target.querySelector('input').value.trim();
+    if (v && !model.datasets.includes(v)) { model.datasets.push(v); model.datasets.sort(); render(); }
+    e.target.reset();
+  });
+
+  // -- save + restart handling ---------------------------------------------------
+
+  $('#save').addEventListener('click', async () => {
+    const btn = $('#save'); btn.disabled = true;
+    banner('info', 'Validating against &lt;urn:admin:acl-shapes&gt;…');
+    $('#install-wrap').classList.add('hidden');
+    try {
+      const body = { defaultAccess: $('#default-access').value, datasets: model.grants };
+      const res = await api('/admin/api/acl', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await res.json();
+      if (res.status === 422) {
+        const items = (j.violations ?? []).map(v =>
+          '<li>' + [v.focusNode && '&lt;' + v.focusNode + '&gt;', v.path, v.message].filter(Boolean).join(' — ') + '</li>').join('');
+        banner('err', 'SHACL validation failed — nothing was written.<ul class="violations">' + items + '</ul>');
+      } else if (res.status === 400) {
+        banner('err', 'Precheck failed:<ul class="violations">' + (j.problems ?? []).map(p => '<li>' + p + '</li>').join('') + '</ul>');
+      } else if (res.status === 502) {
+        banner('err', j.error + '<br>' + (j.hint ?? ''));
+        $('#install-wrap').classList.remove('hidden');
+      } else if (j.ok) {
+        banner('ok', 'Saved by ' + j.savedBy + '. Bridge is restarting — waiting for it to come back…' +
+          (j.auditWarning ? '<br>' + j.auditWarning : ''));
+        awaitRestart();
+      } else {
+        banner('err', j.error ?? 'Unexpected response.');
+      }
+    } catch (err) {
+      banner('err', err.message);
+    } finally { btn.disabled = false; }
+  });
+
+  async function awaitRestart() {
+    // v1.19.0: the watcher exits the process ~500ms after the file write;
+    // the supervisor brings it back. Poll until whoami answers again.
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        const res = await fetch('/admin/api/whoami', { headers: { Authorization: 'Bearer ' + token() } });
+        if (res.ok) { banner('ok', 'Bridge is back up with the new ACL loaded.'); load(); return; }
+      } catch { /* still restarting */ }
+    }
+    banner('err', 'Bridge did not come back within 45s — is a process supervisor (NSSM/pm2) running it? A bare `node` invocation exits on ACL changes and stays down.');
+  }
+
+  $('#install-shapes').addEventListener('click', async () => {
+    try {
+      const res = await api('/admin/api/shapes/install', { method: 'POST' });
+      const j = await res.json();
+      banner(j.ok ? 'ok' : 'err', j.ok ? 'Shapes installed into &lt;' + j.shapesGraph + '&gt;. Save again.' : j.error);
+    } catch (err) { banner('err', err.message); }
+  });
+
+  // -- boot ----------------------------------------------------------------------
+
+  (async () => {
+    const code = new URLSearchParams(location.search).get('code');
+    try {
+      if (code) await exchangeCode(code);
+      if (token()) await load(); else showSignin();
+    } catch (err) {
+      showSignin();
+      banner('err', err.message);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,171 @@
+# admin-acl-shapes.ttl
+#
+# Vocabulary + SHACL shapes for the RDF projection of mcp-remote's
+# .dataset-acl.json (v1.17.0+ format). The JSON file remains the
+# enforcement artifact read by resolveDatasetAccess(); this graph is the
+# validation and audit surface. admin.js projects JSON -> Turtle, validates
+# against these shapes via HolonBridge POST /validate (temp-graph pattern,
+# per hbValidate v1.10.2), and only writes .dataset-acl.json on
+# sh:conforms true.
+#
+# Target shapes graph: urn:admin:acl-shapes
+# Target data graph:   urn:admin:acl        (current conforming table, for audit)
+#
+# JSON <-> RDF projection (see aclToTurtle() in admin.js):
+#
+#   { "defaultAccess": "none",
+#     "datasets": { "ggsc": { "kurtcagle": "rw", "*": "r" } } }
+#
+#   <urn:admin:acl:table> a hb:DatasetAclTable ;
+#       hb:defaultAccess "none" ;
+#       hb:grant <urn:admin:acl:grant:ggsc:kurtcagle>, <urn:admin:acl:grant:ggsc:%2A> .
+#   <urn:admin:acl:grant:ggsc:kurtcagle> a hb:AccessGrant ;
+#       hb:dataset "ggsc" ; hb:actorLogin "kurtcagle" ; hb:accessLevel "rw" .
+#
+# SHACL-UI hints: the shui: annotations below are widget hints for the
+# shacl-ui-forms generator. Align the shui: prefix IRI with whatever the
+# shacl-ui-forms skill's canonical namespace is before pushing -- it is a
+# placeholder here.
+
+@prefix hb:      <https://w3id.org/holonbridge/> .
+@prefix sh:      <http://www.w3.org/ns/shacl#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix shui:    <http://www.w3.org/ns/shacl/ui#> .
+
+# ---------------------------------------------------------------------------
+# Vocabulary
+# ---------------------------------------------------------------------------
+
+hb:DatasetAclTable a rdfs:Class , owl:Class ;
+    rdfs:label   "Dataset ACL table" ;
+    rdfs:comment "The complete per-dataset access-control table for one HolonBridge mcp-remote instance. RDF projection of .dataset-acl.json." .
+
+hb:AccessGrant a rdfs:Class , owl:Class ;
+    rdfs:label   "Access grant" ;
+    rdfs:comment "One (dataset, actor) -> accessLevel cell of the ACL table." .
+
+hb:defaultAccess a owl:DatatypeProperty ;
+    rdfs:label   "default access" ;
+    rdfs:comment "Access level for datasets with no explicit grant entry. Mirrors the JSON root defaultAccess key." ;
+    rdfs:domain  hb:DatasetAclTable ;
+    rdfs:range   xsd:string .
+
+hb:grant a owl:ObjectProperty ;
+    rdfs:label   "grant" ;
+    rdfs:domain  hb:DatasetAclTable ;
+    rdfs:range   hb:AccessGrant .
+
+hb:dataset a owl:DatatypeProperty ;
+    rdfs:label   "dataset" ;
+    rdfs:comment "Fuseki dataset name (path segment, no leading slash)." ;
+    rdfs:domain  hb:AccessGrant ;
+    rdfs:range   xsd:string .
+
+hb:actorLogin a owl:DatatypeProperty ;
+    rdfs:label   "actor login" ;
+    rdfs:comment "GitHub login (matched case-insensitively by resolveDatasetAccess), or \"*\" for all authenticated users." ;
+    rdfs:domain  hb:AccessGrant ;
+    rdfs:range   xsd:string .
+
+hb:accessLevel a owl:DatatypeProperty ;
+    rdfs:label   "access level" ;
+    rdfs:comment "\"none\", \"r\", or \"rw\" -- exactly the value set resolveDatasetAccess() understands." ;
+    rdfs:domain  hb:AccessGrant ;
+    rdfs:range   xsd:string .
+
+# ---------------------------------------------------------------------------
+# Shapes
+# ---------------------------------------------------------------------------
+
+hb:DatasetAclTableShape a sh:NodeShape ;
+    sh:targetClass hb:DatasetAclTable ;
+    rdfs:label "ACL table shape" ;
+    dcterms:description "Validates the table root: exactly one defaultAccess drawn from the enforced value set, and every grant conforming to AccessGrantShape." ;
+
+    sh:property [
+        sh:path        hb:defaultAccess ;
+        sh:name        "Default access" ;
+        sh:description "Applied to any dataset with no explicit grant. \"none\" is the safe default -- \"r\" or \"rw\" here makes every unlisted dataset visible to every authenticated user." ;
+        sh:minCount    1 ;
+        sh:maxCount    1 ;
+        sh:datatype    xsd:string ;
+        sh:in          ( "none" "r" "rw" ) ;
+        shui:widget    shui:SelectWidget ;
+        sh:order       1 ;
+    ] ;
+
+    sh:property [
+        sh:path     hb:grant ;
+        sh:name     "Grants" ;
+        sh:node     hb:AccessGrantShape ;
+        sh:order    2 ;
+    ] ;
+
+    # No two grants may name the same (dataset, actorLogin) pair --
+    # resolveDatasetAccess() would silently prefer whichever JSON key
+    # survived serialisation, so a duplicate is always an authoring error.
+    sh:sparql [
+        a sh:SPARQLConstraint ;
+        sh:message "Duplicate grant: more than one access level is asserted for the same dataset + actor pair." ;
+        sh:prefixes hb: ;
+        sh:select """
+            PREFIX hb: <https://w3id.org/holonbridge/>
+            SELECT $this ?ds ?login WHERE {
+                $this hb:grant ?g1 , ?g2 .
+                FILTER(?g1 != ?g2)
+                ?g1 hb:dataset ?ds ; hb:actorLogin ?login .
+                ?g2 hb:dataset ?ds ; hb:actorLogin ?login .
+            }
+        """ ;
+    ] .
+
+hb:AccessGrantShape a sh:NodeShape ;
+    sh:targetClass hb:AccessGrant ;
+    rdfs:label "Access grant shape" ;
+    dcterms:description "One cell of the ACL matrix. dataset and actorLogin patterns match what Fuseki and GitHub respectively will actually accept, so a typo fails validation here instead of silently resolving to defaultAccess at runtime." ;
+
+    sh:property [
+        sh:path        hb:dataset ;
+        sh:name        "Dataset" ;
+        sh:description "Fuseki dataset name -- letters, digits, hyphen, underscore. No slashes." ;
+        sh:minCount    1 ;
+        sh:maxCount    1 ;
+        sh:datatype    xsd:string ;
+        sh:pattern     "^[A-Za-z0-9][A-Za-z0-9_-]*$" ;
+        shui:widget    shui:TextFieldWidget ;
+        sh:order       1 ;
+    ] ;
+
+    sh:property [
+        sh:path        hb:actorLogin ;
+        sh:name        "Actor" ;
+        sh:description "GitHub login (1-39 chars, alphanumeric with single interior hyphens -- GitHub's own username rule), or the literal \"*\" for all authenticated users. Stored lowercase; resolveDatasetAccess matches case-insensitively either way." ;
+        sh:minCount    1 ;
+        sh:maxCount    1 ;
+        sh:datatype    xsd:string ;
+        sh:pattern     "^(\\*|[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$" ;
+        shui:widget    shui:TextFieldWidget ;
+        sh:order       2 ;
+    ] ;
+
+    sh:property [
+        sh:path        hb:accessLevel ;
+        sh:name        "Access" ;
+        sh:description "none = dataset is invisible to this actor (omitted from list_datasets since v1.20.0); r = read tools only; rw = read + write tools." ;
+        sh:minCount    1 ;
+        sh:maxCount    1 ;
+        sh:datatype    xsd:string ;
+        sh:in          ( "none" "r" "rw" ) ;
+        shui:widget    shui:SelectWidget ;
+        sh:order       3 ;
+    ] .
+
+# Prefix declaration for the SPARQL constraint above (SHACL requires
+# sh:prefixes to resolve to declared sh:declare entries).
+hb: sh:declare [
+    sh:prefix    "hb" ;
+    sh:namespace "https://w3id.org/holonbridge/"^^xsd:anyURI ;
+] .

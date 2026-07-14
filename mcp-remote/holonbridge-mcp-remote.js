@@ -91,6 +91,23 @@
  *
  * Changelog
  * ---------
+ *   2026-07-13 v1.21.0 Admin console (admin.js/admin.html/admin-acl-shapes.ttl).
+ *                      GET /admin serves an HTML operator console (unauthenticated
+ *                      shell -- it runs the existing /authorize + /token GitHub
+ *                      OAuth dance itself, so it registers BEFORE app.use(requireAuth));
+ *                      /admin/api/* routes manage .dataset-acl.json gated on
+ *                      requireAuth + requireOperator (ADMIN_OPERATORS env var,
+ *                      default "kurtcagle"). A PUT projects the JSON table to
+ *                      Turtle (hb:DatasetAclTable/hb:AccessGrant), SHACL-validates
+ *                      it against <urn:admin:acl-shapes> via HolonBridge /validate
+ *                      (temp-graph pattern, per hbValidate v1.10.2), mirrors the
+ *                      conforming table to <urn:admin:acl> for audit, and only
+ *                      then writes the file atomically -- which triggers the
+ *                      v1.19.0 config watcher, so the supervisor restart IS the
+ *                      reload mechanism (the console polls until the bridge is
+ *                      back). list_dataset_acls' hardcoded "kurtcagle" check now
+ *                      delegates to isOperator() so the operator set is defined
+ *                      in exactly one place.
  *   2026-07-13 v1.20.0 list_datasets no longer shows datasets the calling actor
  *                      has no access to at all. Previously every dataset in the
  *                      live /datasets response was returned and merely annotated
@@ -369,6 +386,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import { timedProcess } from '../lib/timing.js';
+import { registerAdmin, isOperator } from './admin.js';
 
 // -- Configuration -----------------------------------------------------------------
 //
@@ -1119,7 +1137,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.20.0',
+    version: '1.21.0',
   });
 
   srv.tool(
@@ -1431,8 +1449,8 @@ function createMcpServer(sessionId) {
     {},
     async () => {
       const login = requestContext.getStore()?.githubLogin;
-      if ((login ?? '').toLowerCase() !== 'kurtcagle') {
-        throw new Error(`Access denied: the dataset ACL table is only visible to the bridge operator (actor: ${login ?? 'unknown'}).`);
+      if (!isOperator(login)) {
+        throw new Error(`Access denied: the dataset ACL table is only visible to bridge operators (ADMIN_OPERATORS -- actor: ${login ?? 'unknown'}).`);
       }
       if (!datasetAcl) {
         return {
@@ -1652,6 +1670,22 @@ app.post('/token', express.urlencoded({ extended: false }), express.json(), (req
 
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
+// -- Admin console (v1.21.0) ---------------------------------------------------
+//
+// Registered BEFORE app.use(requireAuth): GET /admin serves the HTML shell
+// unauthenticated (a browser's first hit has no Bearer header -- the page
+// performs the GitHub OAuth dance itself against /authorize + /token above),
+// while every /admin/api route applies requireAuth + requireOperator
+// explicitly inside admin.js. requireAuth and activeBaseUrl are hoisted
+// function declarations, so referencing them here is safe.
+
+registerAdmin(app, {
+  requireAuth,
+  aclFilePath: DATASET_ACL_FILE,
+  holonbridgeUrl: () => activeBaseUrl(),
+  hbBearerToken: HB_BEARER_TOKEN,
+});
+
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ')) {
@@ -1710,7 +1744,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.20.0',
+    version: '1.21.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1723,7 +1757,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.20.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.21.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
