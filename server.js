@@ -98,6 +98,7 @@ import { createRootHolon, addSchema, addEntity, promoteEntity, addProjection,
          formGroup, joinGroup, leaveGroup, navigateAgent,
          CommandRejected, UnauthorisedError }                        from './lib/lifecycle.js'
 import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
+import { Scheduler }                                                  from './lib/scheduler.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
          GRAPHS as REGISTRY_GRAPHS }                                from './registry/session-init.js'
@@ -138,6 +139,19 @@ const MAX_RETRIES = parseInt(process.env.MAX_RETRIES ?? '2', 10)
 const MODEL       = process.env.CLAUDE_MODEL          ?? 'claude-sonnet-4-6'
 const LOG_SPARQL  = process.env.LOG_SPARQL            === 'true'
 const LOG_PROMPTS = process.env.LOG_PROMPTS           === 'true'
+
+// SCHEDULER_ENABLED (added 2026-07-15, see lib/scheduler.js and
+// scheduler-personas.databook.md): off by default, deliberately. Enabling
+// this starts a tick loop and a write-event subscriber against whatever
+// tasks/personas already exist in SCHEDULER_ADMIN_DATASET the moment this
+// process boots -- opt-in via env var rather than auto-starting the first
+// time this code ships, so nothing begins firing against live data without
+// an explicit choice to turn it on. SCHEDULER_ADMIN_DATASET defaults to
+// 'admin' (the same dataset admin.js's ACL work uses) per the design
+// decision to reuse that dataset rather than mint a new one.
+const SCHEDULER_ENABLED       = process.env.SCHEDULER_ENABLED === 'true'
+const SCHEDULER_ADMIN_DATASET = process.env.SCHEDULER_ADMIN_DATASET ?? 'admin'
+let   scheduler = null // set in the startup sequence below if SCHEDULER_ENABLED
 
 // --- Mutable dataset state ----------------------------------------------------
 // module-level lets so POST /dataset can hot-swap them at runtime
@@ -1452,6 +1466,37 @@ app.get('/health', (_req, res) => {
     namedRules: namedRules.length,
     namedPipelines: namedPipelines.length,
     maxRetries: MAX_RETRIES
+  })
+})
+
+// -- GET /scheduler -------------------------------------------------------------
+//
+// Status/observability for lib/scheduler.js. Read-only -- registering tasks
+// and personas is done via SPARQL UPDATE/GSP push directly against
+// SCHEDULER_ADMIN_DATASET for now (see scheduler-personas.databook.md
+// open item: a proper /admin/api/scheduler/* surface, mirroring
+// mcp-remote/admin.js's ACL routes, is the next step, not yet wired here).
+
+app.get('/scheduler', (_req, res) => {
+  if (!SCHEDULER_ENABLED || !scheduler) {
+    return res.json({
+      enabled: false,
+      note: 'Scheduler is not running. Set SCHEDULER_ENABLED=true (and restart) to start it. ' +
+            `It will use dataset "${SCHEDULER_ADMIN_DATASET}" (override via SCHEDULER_ADMIN_DATASET).`
+    })
+  }
+  res.json({
+    enabled: true,
+    adminDataset: scheduler.adminDataset,
+    tickIntervalMs: scheduler.tickIntervalMs,
+    dryRun: scheduler.dryRun,
+    tasks: [...scheduler._tasks.values()].map(t => ({
+      iri: t.iri, actionClass: t.actionClass, triggerType: t.triggerType,
+      persona: t.personaIri, targetGraph: t.targetGraph
+    })),
+    personas: [...scheduler._personas.values()].map(p => ({
+      iri: p.iri, label: p.label, capability: [...p.capability], model: p.model
+    }))
   })
 })
 
@@ -3072,7 +3117,7 @@ app.use((_req, res) => {
       'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
       'GET  /datasets', 'GET  /graphs', 'GET  /graph',
       'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
-      'GET  /message/:id', 'GET  /description', 'GET  /health',
+      'GET  /message/:id', 'GET  /description', 'GET  /health', 'GET  /scheduler',
         'POST /validate',
         'GET  /holon', 'GET  /holon/:iri',
         'POST /holon', 'POST /holon/:iri/schema', 'POST /holon/:iri/entity',
@@ -3103,6 +3148,22 @@ loadContext()
       console.log(`[Bridge] Lifecycle anchor: ${DATASET_HOLON_IRI ?? `(unset -- urn:${DATASET}:root convention)`}`)
       console.log(`[Bridge] Model:          ${MODEL}  Max retries: ${MAX_RETRIES}`)
     })
+
+    // Scheduler bootstrap -- opt-in via SCHEDULER_ENABLED (see the constant's
+    // own comment above). Started after app.listen() so a scheduler startup
+    // problem (e.g. SCHEDULER_ADMIN_DATASET doesn't exist yet in Fuseki)
+    // logs an error rather than blocking the HTTP server from coming up at
+    // all -- the rest of the bridge should stay usable even if the
+    // scheduler can't start.
+    if (SCHEDULER_ENABLED) {
+      scheduler = new Scheduler({ jenaBase: JENA_BASE, adminDataset: SCHEDULER_ADMIN_DATASET })
+      scheduler.start().catch(err => {
+        console.error(`[Bridge] Scheduler failed to start: ${err.message}`)
+        console.error(`[Bridge] Does dataset "${SCHEDULER_ADMIN_DATASET}" exist in Fuseki? (POST /$/datasets to create it)`)
+      })
+    } else {
+      console.log('[Bridge] Scheduler disabled (SCHEDULER_ENABLED not set to "true") -- lib/scheduler.js is loaded but not running.')
+    }
 
     // Registry bootstrap — async, does not block server startup
     initSession().then(({ health }) => {
