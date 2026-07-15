@@ -1,0 +1,80 @@
+@prefix sched: <https://w3id.org/holon/sched#> .
+@prefix holon: <https://w3id.org/holon/> .
+@prefix odrl:  <http://www.w3.org/ns/odrl/2/> .
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+
+## PersonaShape -- mirrors ScheduledTaskShape's pattern from
+## scheduled-services-safety.databook.md sec.8: no capability, no policy,
+## no registration. A persona with zero capability is meaningless (it can
+## never satisfy any task's capability gate) so capability requires >=1
+## the same way it does on the original shape.
+sched:PersonaShape
+    a sh:NodeShape ;
+    sh:targetClass sched:Persona ;
+    sh:property [
+        sh:path holon:label ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:message "Every persona needs a human-readable label." ;
+    ] ;
+    sh:property [
+        sh:path sched:remit ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:message "Every persona needs a stated remit -- the thing capability and policy are supposed to encode faithfully." ;
+    ] ;
+    sh:property [
+        sh:path sched:capability ;
+        sh:minCount 1 ;
+        sh:message "A persona with no capability can never satisfy any task's capability gate -- pointless to register." ;
+    ] ;
+    sh:property [
+        sh:path sched:datasetScope ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:message "Every persona's writes must be pinned to an explicit dataset scope -- never inherited from ambient bridge state (see the 2026-07-15 admin.js incident)." ;
+    ] ;
+    sh:property [
+        sh:path odrl:hasPolicy ;
+        sh:minCount 1 ;
+        sh:message "No policy envelope, no registration -- same discipline as sched:ScheduledTaskShape." ;
+    ] ;
+    sh:property [
+        sh:path holon:createdBy ;
+        sh:minCount 1 ;
+        sh:message "Delegation requires a delegator: creator identity is mandatory." ;
+    ] .
+
+## sched:invokesPersona -- the link a task uses to optionally name a
+## persona. 0..1: a task with no persona still runs exactly as
+## scheduled-services-safety.databook.md originally described (no
+## additional gate). When present, the named IRI must resolve to a
+## sched:Persona -- sh:class enforces that structurally.
+sched:ScheduledTaskShape
+    a sh:NodeShape ;
+    sh:targetClass sched:ScheduledTask ;
+    sh:property [
+        sh:path sched:actionClass ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:class sched:ActionClass ;
+        sh:message "Every task declares exactly one action class." ;
+    ] ;
+    sh:property [
+        sh:path sched:trigger ;
+        sh:minCount 1 ;
+        sh:message "A task without a trigger cannot fire and must not register." ;
+    ] ;
+    sh:property [
+        sh:path odrl:hasPolicy ;
+        sh:minCount 1 ;
+        sh:message "No policy envelope, no registration. Authorization is not optional metadata." ;
+    ] ;
+    sh:property [
+        sh:path holon:createdBy ;
+        sh:minCount 1 ;
+        sh:message "Delegation requires a delegator: creator identity is mandatory so the rights-subset check has a subject." ;
+    ] ;
+    sh:property [
+        sh:path sched:invokesPersona ;
+        sh:maxCount 1 ;
+        sh:class sched:Persona ;
+        sh:message "sched:invokesPersona, when present, must name a registered sched:Persona. Optional -- a task naming none runs under its own ODRL envelope alone." ;
+    ] .
