@@ -761,7 +761,7 @@ async function runPipeline(nlQuery, sparqlEndpoint = JENA_SPARQL) {
       retries++
       if (attempt < MAX_RETRIES) {
         console.warn(`[Bridge] Jena error (attempt ${attempt + 1}): ${err.jenaMessage?.slice(0, 200)}`)
-        query = await retryQuery(nlQuery, query, err.jenaMessage ?? err.message,
+        query = await retryQuery(nlQuery, query, err.jenaMessage || err.message,
                                  schemaContext, namedGraphs, MODEL, LOG_PROMPTS)
       }
     }
@@ -771,8 +771,8 @@ async function runPipeline(nlQuery, sparqlEndpoint = JENA_SPARQL) {
     return {
       answer: `Query execution failed after ${retries} attempt(s). The graph may not contain matching data.`,
       sparql: query, bindings: [], vars: [],
-      formattedResults: `(query failed: ${lastError.jenaMessage ?? lastError.message})`,
-      retries, error: lastError.jenaMessage ?? lastError.message
+      formattedResults: `(query failed: ${lastError.jenaMessage || lastError.message})`,
+      retries, error: lastError.jenaMessage || lastError.message
     }
   }
 
@@ -835,7 +835,7 @@ async function runUpdate(turtle, graphIri, mode, sparqlEndpoint = JENA_SPARQL, g
     console.log(`[Update] Push succeeded -- HTTP ${result.status}, graph=${graphIri ?? 'default'}, mode=${mode}`)
     return { updated: true, conforms: true, results: [], graph: graphIri, mode, validation, jenaStatus: result.status }
   } catch (err) {
-    return { updated: false, error: `Jena GSP push failed: ${err.jenaMessage ?? err.message}`,
+    return { updated: false, error: `Jena GSP push failed: ${err.jenaMessage || err.message}`,
              conforms: true, results: [], validation, graph: graphIri, mode }
   }
 }
@@ -1380,7 +1380,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/holon/:iri/property',   description: '[LIFECYCLE] proposeAgentPropertyUpdate -- propose->validate->apply a delta to a numeric agent property (e.g. schema:healthPoints, schema:currentWealth). Validated against the property\'s governing SHACL shape (e.g. AgentHealthShape, AgentWealthShape) BEFORE any write; a rejection (409) leaves no trace. Writes a holon:ModelUpdateRequest + holon:ModelUpdateApprove pair to the events graph plus the new value on the agent. Always requires Write on the dataset anchor (see /dataset-holon-iri) -- not self-authorisable even for one\'s own agent. Body: { property, delta, rationale, actor: {iri, role?}, capProperty?, floor? }.' },
       { method: 'POST', path: '/agent',                 description: '[LIFECYCLE] createAgent -- mints an Agent holon with baseline values for its trackable properties, writing a holon:CreationEvent plus one holon:PropertyBaselineEvent per property. Each property\'s governing shape/capProperty/floor resolves from ontology metadata (holon:governedByShape/holon:capProperty/holon:floor) unless overridden. One violating baseline rejects the whole creation (409) -- no partial agent. Always requires Write on the dataset anchor (see /dataset-holon-iri). Body: { agentIri, label, agentKind, description?, extraTurtle?, trackableProperties?: [{property, value, capProperty?, capValue?, floor?}], actor: {iri, role?} }.' },
       { method: 'POST', path: '/holon/:iri/navigate',   description: '[LIFECYCLE] navigateAgent -- moves an agent (:iri) to destinationIri, writing a holon:VisitEvent chained via holon:nextVisit from the agent\'s current visit-chain tail, then updates holon:currentLocation to match. Destination must already exist as a holon -- rejects a dangling move. Self-service when actor.iri === :iri; Write on the dataset anchor required to move another agent. Body: { destinationIri, actor: {iri, role?}, note? }.' },
-      { method: 'POST', path: '/group',                 description: '[LIFECYCLE] formGroup -- creates a holon:Group, a spatial/co-location carrier (tour party, vehicle passengers) distinct from an organizational Team/Corporation (capability/authority, modeled via RoleBinding). Forms at the active member\'s current location; every initial member\'s own currentLocation is removed in favor of the group\'s. Exactly one initial member must be active. Self-service: no capability check when every member IRI is the actor themselves; Write on the dataset anchor is required when conscripting other agents. Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }.' },
+      { method: 'POST', path: '/group',                 description: '[LIFECYCLE] formGroup -- creates a holon:Group, a spatial/co-location carrier (tour party, vehicle passengers) distinct from an organizational Team/Corporation (capability/authority, modeled via RoleBinding). Forms at the active member\'s current location; every initial member\'s own currentLocation is removed in favor of the group\'s. Exactly one initial member must be active. Self-service when every member IRI is the actor themselves; Write on the dataset anchor is required when conscripting other agents. Body: { groupIri, label, memberIris: string[], activeMemberIri, actor: {iri, role?} }.' },
       { method: 'POST', path: '/group/:iri/join',        description: '[LIFECYCLE] joinGroup -- adds a member to an existing group; their own currentLocation is removed, defaulting to isActive false. Self-service when actor.iri === memberIri; Write on the dataset anchor required otherwise. Body: { memberIri, actor: {iri, role?} }.' },
       { method: 'POST', path: '/group/:iri/leave',       description: '[LIFECYCLE] leaveGroup -- removes a member, restoring their own currentLocation (copied from the group\'s). If the leaving member is active and others remain, handoffTo is required naming a successor. Auto-dissolves (tombstones) the group once membership drops to one, restoring that sole member\'s independent currentLocation. Self-service when actor.iri === memberIri; Write on the dataset anchor required otherwise. Body: { memberIri, actor: {iri, role?}, handoffTo?: string }.' },
       { method: 'GET',  path: '/description',    description: 'Capability manifest for LLM consumption (this endpoint).' },
@@ -1688,7 +1688,7 @@ app.post('/sparql-select', async (req, res) => {
     if (err instanceof SparqlError)
       return res.status(400).json({
         error:   'SPARQL execution error',
-        message: err.jenaMessage ?? err.message,
+        message: err.jenaMessage || err.message,
         sparql:  query
       })
     console.error('[Bridge] /sparql-select error:', err)
