@@ -68,6 +68,19 @@
  *                                    # hardcoded check -- which should migrate
  *                                    # to isOperator() from this module so the
  *                                    # operator set is defined once.
+ *   ADMIN_DATASET=admin              # Fuseki dataset every admin write/read
+ *                                    # (shapes install, ACL validate, ACL
+ *                                    # audit graph) targets, via
+ *                                    # X-Dataset-Override on every hbFetch
+ *                                    # call. Defaults to "admin". Must exist
+ *                                    # in Fuseki (POST /$/datasets) before
+ *                                    # admin routes will work -- an absent
+ *                                    # dataset now fails loudly rather than
+ *                                    # silently landing writes on whatever
+ *                                    # dataset HolonBridge's global DATASET
+ *                                    # happened to be pointed at (see the
+ *                                    # 2026-07-15 incident note by
+ *                                    # ADMIN_DATASET's definition below).
  */
 
 import express from 'express';
@@ -86,6 +99,24 @@ const SHAPES_GRAPH = 'urn:admin:acl-shapes';
 const ACL_GRAPH    = 'urn:admin:acl';
 const TABLE_IRI    = 'urn:admin:acl:table';
 const HB           = 'https://w3id.org/holonbridge/';
+
+// ADMIN_DATASET (added after the 2026-07-15 incident): every admin write
+// previously landed wherever HolonBridge's globally-active DATASET happened
+// to be at request time -- POST /dataset from an unrelated caller, a
+// restart with a stale session-state value, anything -- because hbFetch()
+// below sent no dataset hint at all. That produced a real outage: writes
+// silently went to a dataset named 'data' that no longer existed, surfacing
+// as a bare, body-less HTTP 405/409 with no indication anything was even
+// dataset-related. Pinning admin writes to their own dedicated Fuseki
+// dataset via X-Dataset-Override (see the per-request dataset-override
+// middleware in server.js, which /update, /validate, and /sparql-update
+// all honour) makes "which dataset does admin write to" a fixed fact of
+// the deployment rather than a function of whatever else the bridge is
+// doing -- structurally, not just for today's specific case. The dataset
+// itself must exist in Fuseki (POST /$/datasets) before this works; a
+// missing dataset now fails loudly and specifically, not silently onto
+// the wrong one.
+const ADMIN_DATASET = process.env.ADMIN_DATASET ?? 'admin';
 
 const ACCESS_LEVELS = new Set(['none', 'r', 'rw']);
 const DATASET_RE    = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -233,6 +264,7 @@ export function registerAdmin(app, { requireAuth, aclFilePath, holonbridgeUrl, h
       ...init,
       headers: {
         Authorization: `Bearer ${hbBearerToken}`,
+        'X-Dataset-Override': ADMIN_DATASET,
         ...(init.headers ?? {}),
       },
     });
@@ -401,5 +433,5 @@ export function registerAdmin(app, { requireAuth, aclFilePath, holonbridgeUrl, h
     });
   });
 
-  console.log(`[admin] Console at /admin -- operators: ${[...OPERATORS].join(', ')}`);
+  console.log(`[admin] Console at /admin -- operators: ${[...OPERATORS].join(', ')} -- dataset: ${ADMIN_DATASET} (override via ADMIN_DATASET env var)`);
 }
