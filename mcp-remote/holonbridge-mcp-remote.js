@@ -91,6 +91,20 @@
  *
  * Changelog
  * ---------
+ *   2026-07-15 v1.22.0 Add scheduler-admin.js (registerSchedulerAdmin),
+ *                      wired the same way as admin.js: routes under
+ *                      /admin/api/scheduler/* gated on requireAuth +
+ *                      requireOperator (shared operator set from admin.js,
+ *                      not redefined). GET/PUT whole-graph read-modify-
+ *                      write for the tasks and personas graphs (validate
+ *                      against PersonaShape/ScheduledTaskShape before
+ *                      writing, same discipline as the ACL table), plus
+ *                      read-only GET routes for status/provenance/
+ *                      quarantine and a shapes/install route mirroring
+ *                      admin.js's own. See lib/scheduler.js and
+ *                      scheduler-personas.databook.md for the underlying
+ *                      engine this manages. No MCP tools added -- REST-only,
+ *                      same shape as the ACL admin surface.
  *   2026-07-13 v1.21.0 Admin console (admin.js/admin.html/admin-acl-shapes.ttl).
  *                      GET /admin serves an HTML operator console (unauthenticated
  *                      shell -- it runs the existing /authorize + /token GitHub
@@ -330,8 +344,7 @@
  *                      module-level HOLONBRIDGE_URL constant directly,
  *                      ignoring activeProfile entirely -- so switching
  *                      profiles never redirected any actual query, push, or
- *                      dataset call; only get_endpoint/list_endpoints ever
- *                      read activeProfile. Introduced activeBaseUrl(), the
+ *                      dataset call. Introduced activeBaseUrl(), the
  *                      single source of truth for "which bridge do we talk
  *                      to right now," and routed every HTTP call through it.
  *                      /health now reports activeBridge alongside the
@@ -387,6 +400,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { z } from 'zod';
 import { timedProcess } from '../lib/timing.js';
 import { registerAdmin, isOperator } from './admin.js';
+import { registerSchedulerAdmin } from './scheduler-admin.js';
 
 // -- Configuration -----------------------------------------------------------------
 //
@@ -1137,7 +1151,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.21.0',
+    version: '1.22.0',
   });
 
   srv.tool(
@@ -1686,6 +1700,22 @@ registerAdmin(app, {
   hbBearerToken: HB_BEARER_TOKEN,
 });
 
+// -- Scheduler admin (v1.22.0) --------------------------------------------------
+//
+// Same placement rule as registerAdmin above: before app.use(requireAuth),
+// since every route scheduler-admin.js defines applies requireAuth +
+// requireOperator itself (requireOperator imported there from admin.js, so
+// the operator set -- ADMIN_OPERATORS -- is one fact shared by both admin
+// surfaces, not redefined). See mcp-remote/scheduler-admin.js for the full
+// route list and lib/scheduler.js / scheduler-personas.databook.md for the
+// engine these routes manage.
+
+registerSchedulerAdmin(app, {
+  requireAuth,
+  holonbridgeUrl: () => activeBaseUrl(),
+  hbBearerToken: HB_BEARER_TOKEN,
+});
+
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   if (!auth.startsWith('Bearer ')) {
@@ -1744,7 +1774,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.21.0',
+    version: '1.22.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1757,7 +1787,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.21.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.22.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
