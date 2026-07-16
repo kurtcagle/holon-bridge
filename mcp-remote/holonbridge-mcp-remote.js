@@ -50,6 +50,9 @@
  *   MCP_PUBLIC_URL=https://kurtcagle-mcp.ngrok.io  # your public ngrok/tunnel URL
  *   FUSEKI_GSP=http://localhost:3030/ds/data        # retained for health reporting
  *                                                   # no longer used by push_turtle
+ *   SCHEDULER_DATASET=admin          # optional, default 'admin' -- the dataset
+ *               scheduler state lives in; the scheduler MCP tools always target
+ *               this regardless of the caller's sticky switch_dataset selection.
  *
  * Token relationship (2026-07-11, v1.15.1):
  *   HB_BEARER_TOKEN      -- protects HolonBridge from the MCP remote. Static
@@ -78,7 +81,7 @@
  *                          SERVICE_ACTOR_IRI rather than a real identity --
  *                          same ambiguity every call had before this
  *                          version. New interactive use should always go
- *                          through GitHub login instead.
+ *                          through GitHub login.
  *
  * NOTE on registry-backed profiles (see below): querying GET /registry uses
  * this bridge's own HB_BEARER_TOKEN, which is sufficient to read federation
@@ -91,6 +94,38 @@
  *
  * Changelog
  * ---------
+ *   2026-07-16 v1.23.0 Add five scheduler MCP tools (list_scheduled_tasks,
+ *                      get_scheduler_status, create_scheduled_task,
+ *                      set_task_status, get_recent_scheduler_activity),
+ *                      the actual client-facing surface for
+ *                      lib/scheduler.js's engine and the POST
+ *                      /scheduler/reload primitive added to server.js the
+ *                      same day. These are the answer to "how does someone
+ *                      create a scheduled task from claude.ai": structured
+ *                      params only for create_scheduled_task (no raw-Turtle
+ *                      option, per design decision -- the task Turtle is
+ *                      projected server-side in this file), SHACL
+ *                      validation intentionally skipped for now (flagged
+ *                      as a known gap -- see ScheduledTaskShape's cross-
+ *                      reference limitation in scheduler-personas.databook.md),
+ *                      and sched:summary included in
+ *                      get_recent_scheduler_activity's output. Unlike every
+ *                      other tool in this file, all five always target
+ *                      SCHEDULER_DATASET_TOOLS (the scheduler admin
+ *                      dataset) via a dedicated schedHeaders() helper that
+ *                      pins X-Dataset-Override explicitly, rather than
+ *                      hbHeaders(), which would send whatever dataset the
+ *                      actor's switch_dataset preference currently is --
+ *                      scheduler state lives in one place regardless of
+ *                      what dataset a caller happens to be browsing.
+ *                      requireReadAccess/requireWriteAccess were refactored
+ *                      into parameterized requireReadAccessTo(dataset)/
+ *                      requireWriteAccessTo(dataset) so the scheduler tools
+ *                      can gate against SCHEDULER_DATASET_TOOLS explicitly
+ *                      instead of currentDataset() -- every existing call
+ *                      site is unchanged, since requireReadAccess/
+ *                      requireWriteAccess now just delegate with
+ *                      currentDataset() as before.
  *   2026-07-15 v1.22.0 Add scheduler-admin.js (registerSchedulerAdmin),
  *                      wired the same way as admin.js: routes under
  *                      /admin/api/scheduler/* gated on requireAuth +
@@ -630,13 +665,18 @@ function resolveDatasetAccess(githubLogin, dataset) {
 }
 
 /**
- * Check that the current actor has at least read access to the current dataset.
- * Throws a descriptive error if denied. Call at the top of read-path tool handlers.
+ * Parameterized core (added 2026-07-16, v1.23.0) -- the scheduler MCP tools
+ * below always operate against SCHEDULER_DATASET_TOOLS (the admin dataset
+ * scheduler state lives in), regardless of the calling actor's sticky
+ * dataset selection (currentDataset()/switch_dataset). requireReadAccess()/
+ * requireWriteAccess() below are UNCHANGED in behaviour for every existing
+ * call site -- they now just delegate to these with currentDataset(),
+ * rather than duplicating the same logic against a hardcoded currentDataset()
+ * lookup.
  */
-function requireReadAccess() {
+function requireReadAccessTo(dataset) {
   if (!datasetAcl) return;  // no ACL = no enforcement
   const login = requestContext.getStore()?.githubLogin;
-  const dataset = currentDataset();
   if (!dataset) return;  // no dataset in context = nothing to check
   const access = resolveDatasetAccess(login, dataset);
   if (access === 'none') {
@@ -645,20 +685,31 @@ function requireReadAccess() {
   // "r" and "rw" both satisfy a read check
 }
 
-/**
- * Check that the current actor has write access to the current dataset.
- * Throws a descriptive error if denied. Call at the top of write-path tool handlers.
- */
-function requireWriteAccess() {
+function requireWriteAccessTo(dataset) {
   if (!datasetAcl) return;  // no ACL = no enforcement
   const login = requestContext.getStore()?.githubLogin;
-  const dataset = currentDataset();
   if (!dataset) return;
   const access = resolveDatasetAccess(login, dataset);
   if (access !== 'rw') {
     const reason = access === 'r' ? 'you have read-only access' : 'you do not have access';
     throw new Error(`Write denied: ${reason} to dataset "${dataset}" (actor: ${login ?? 'unknown'}).`);
   }
+}
+
+/**
+ * Check that the current actor has at least read access to the current dataset.
+ * Throws a descriptive error if denied. Call at the top of read-path tool handlers.
+ */
+function requireReadAccess() {
+  requireReadAccessTo(currentDataset());
+}
+
+/**
+ * Check that the current actor has write access to the current dataset.
+ * Throws a descriptive error if denied. Call at the top of write-path tool handlers.
+ */
+function requireWriteAccess() {
+  requireWriteAccessTo(currentDataset());
 }
 
 // -- GSP dataset tracking (health reporting only) -------------------------------------------
@@ -1037,6 +1088,172 @@ async function hbListGraphs(filter) {
     .filter(g => !filter || g.iri.includes(filter));
 }
 
+// -- Scheduler MCP tool helpers (v1.23.0, 2026-07-16) -----------------------------
+//
+// Unlike every other tool in this file, the five scheduler tools registered
+// below always target SCHEDULER_DATASET_TOOLS (the admin dataset scheduler
+// state lives in -- see lib/scheduler.js's file header), regardless of the
+// calling actor's sticky dataset (currentDataset()/switch_dataset). Pinned
+// explicitly via schedHeaders() rather than hbHeaders(), which would send
+// whatever dataset the actor happens to currently be browsing -- the same
+// X-Dataset-Override discipline lib/scheduler.js itself follows against
+// Fuseki directly, and scheduler-admin.js's own hbFetch follows against
+// HolonBridge REST.
+
+const SCHEDULER_DATASET_TOOLS = process.env.SCHEDULER_DATASET ?? 'admin';
+const SCHED = 'https://w3id.org/holon/sched#';
+
+function schedHeaders(extra = {}) {
+  const reqId = currentRequestId();
+  return {
+    Authorization: `Bearer ${HB_BEARER_TOKEN}`,
+    'X-Dataset-Override': SCHEDULER_DATASET_TOOLS,
+    ...(reqId ? { 'X-Request-Id': reqId } : {}),
+    ...extra,
+  };
+}
+
+async function schedFetchJson(path, init = {}) {
+  return timedProcess(`mcp-remote -> HolonBridge ${path} [scheduler, reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const res = await fetch(`${activeBaseUrl()}${path}`, {
+      ...init,
+      headers: { 'Content-Type': 'application/json', ...schedHeaders(), ...(init.headers ?? {}) },
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HolonBridge ${path}: HTTP ${res.status} -- ${text.slice(0, 300)}`);
+    try { return JSON.parse(text); } catch { return text; }
+  });
+}
+
+async function schedReload() {
+  return schedFetchJson('/scheduler/reload', { method: 'POST' });
+}
+
+/** Push a task/policy Turtle payload into urn:scheduler:tasks (append), then reload. */
+async function schedPushTask(turtle) {
+  const res = await fetch(`${activeBaseUrl()}/update`, {
+    method: 'POST',
+    headers: schedHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ turtle, graph: 'urn:scheduler:tasks', mode: 'append' }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`HolonBridge /update [scheduler task push]: HTTP ${res.status} -- ${text.slice(0, 300)}`);
+  return schedReload();
+}
+
+async function schedListTasks() {
+  const sparql = `
+PREFIX sched: <${SCHED}>
+SELECT ?t ?actionClass ?triggerType ?intervalMs ?persona ?taskStatus ?targetGraph WHERE {
+  GRAPH <urn:scheduler:tasks> {
+    ?t a sched:ScheduledTask ; sched:actionClass ?actionClass .
+    OPTIONAL { ?t sched:trigger [ a ?triggerType ] }
+    OPTIONAL { ?t sched:trigger [ sched:intervalMs ?intervalMs ] }
+    OPTIONAL { ?t sched:invokesPersona ?persona }
+    OPTIONAL { ?t sched:taskStatus ?taskStatus }
+    OPTIONAL { ?t sched:targetGraph ?targetGraph }
+  }
+}`;
+  const result = await schedFetchJson('/sparql-select', { method: 'POST', body: JSON.stringify({ sparql }) });
+  const bindings = result.bindings ?? [];
+  return bindings.map(b => ({
+    iri: b.t?.value,
+    actionClass: (b.actionClass?.value ?? '').split(/[/#]/).pop(),
+    triggerType: (b.triggerType?.value ?? '').split(/[/#]/).pop() || null,
+    intervalMs: b.intervalMs?.value ? parseInt(b.intervalMs.value, 10) : null,
+    persona: b.persona?.value ?? null,
+    taskStatus: (b.taskStatus?.value ?? '').split(/[/#]/).pop() || 'Active',
+    targetGraph: b.targetGraph?.value ?? null,
+  }));
+}
+
+/**
+ * Project structured create_scheduled_task params into Turtle: a
+ * sched:ScheduledTask plus a companion odrl:Policy carrying the daily
+ * firing limit. Kept as a pure function (no fetch) so it can be unit
+ * tested directly -- see the execution test run before this shipped.
+ * SHACL validation against ScheduledTaskShape is deliberately NOT run here
+ * (known gap -- isolated temp-graph validation can't satisfy the shape's
+ * sh:class cross-reference checks against the live personas graph; see
+ * scheduler-personas.databook.md). Only TemporalTrigger is supported --
+ * StateTrigger tasks still need a manual push_turtle.
+ */
+function buildScheduledTaskTurtle({ taskId, actionClass, intervalMs, personaIri, sparql, targetDataset, targetGraph, dailyLimit, actorIri }) {
+  const taskIri = `sched:task-${taskId}`;
+  const policyIri = `sched:policy-${taskId}-limit`;
+  const esc = s => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const lines = [
+    '@prefix sched: <https://w3id.org/holon/sched#> .',
+    '@prefix holon: <https://w3id.org/holon/> .',
+    '@prefix odrl:  <http://www.w3.org/ns/odrl/2/> .',
+    '@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .',
+    '',
+    `${taskIri}`,
+    `    a sched:ScheduledTask ;`,
+    personaIri ? `    sched:invokesPersona <${personaIri}> ;` : null,
+    `    sched:actionClass sched:${actionClass} ;`,
+    `    sched:trigger [ a sched:TemporalTrigger ; sched:intervalMs "${intervalMs}"^^xsd:integer ] ;`,
+    `    sched:sparql """${esc(sparql)}""" ;`,
+    `    sched:targetDataset "${esc(targetDataset)}" ;`,
+    targetGraph ? `    sched:targetGraph <${targetGraph}> ;` : null,
+    `    sched:taskStatus sched:Active ;`,
+    `    odrl:hasPolicy ${policyIri} ;`,
+    `    holon:createdBy <${actorIri}> ;`,
+    `    holon:created "${new Date().toISOString().slice(0, 10)}"^^xsd:date .`,
+    '',
+    `${policyIri}`,
+    `    a odrl:Policy ;`,
+    `    odrl:permission [ odrl:action odrl:execute ; odrl:constraint [ odrl:leftOperand odrl:count ; odrl:operator odrl:lteq ; odrl:rightOperand "${dailyLimit}"^^xsd:integer ] ] ;`,
+    `    odrl:duty [ odrl:action sched:LogProvenance ] .`,
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+async function schedSetTaskStatus(taskId, status) {
+  const taskIri = `https://w3id.org/holon/sched#task-${taskId}`;
+  const update = `
+PREFIX sched: <${SCHED}>
+DELETE { GRAPH <urn:scheduler:tasks> { <${taskIri}> sched:taskStatus ?old } }
+INSERT { GRAPH <urn:scheduler:tasks> { <${taskIri}> sched:taskStatus sched:${status} } }
+WHERE  { OPTIONAL { GRAPH <urn:scheduler:tasks> { <${taskIri}> sched:taskStatus ?old } } }`;
+  const res = await fetch(`${activeBaseUrl()}/sparql-update`, {
+    method: 'POST',
+    headers: schedHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ update }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`HolonBridge /sparql-update [set_task_status]: HTTP ${res.status} -- ${text.slice(0, 300)}`);
+  return schedReload();
+}
+
+async function schedRecentActivity(sinceIso) {
+  const since = sinceIso ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const sparql = `
+PREFIX sched: <${SCHED}>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?rec ?task ?persona ?triggerType ?outcome ?reason ?summary ?firedAt WHERE {
+  GRAPH <urn:scheduler:provenance> {
+    ?rec a sched:FiringRecord ; sched:task ?task ; sched:triggerType ?triggerType ;
+         sched:outcome ?outcome ; sched:firedAt ?firedAt .
+    FILTER(?firedAt >= "${since}"^^xsd:dateTime)
+    OPTIONAL { ?rec sched:persona ?persona }
+    OPTIONAL { ?rec sched:reason ?reason }
+    OPTIONAL { ?rec sched:summary ?summary }
+  }
+} ORDER BY DESC(?firedAt)`;
+  const result = await schedFetchJson('/sparql-select', { method: 'POST', body: JSON.stringify({ sparql }) });
+  const bindings = result.bindings ?? [];
+  return bindings.map(b => ({
+    task: b.task?.value,
+    persona: b.persona?.value ?? null,
+    triggerType: b.triggerType?.value ?? null,
+    outcome: b.outcome?.value,
+    reason: b.reason?.value ?? null,
+    summary: b.summary?.value ?? null,
+    firedAt: b.firedAt?.value,
+  }));
+}
+
 // -- Static (.env) profile state -------------------------------------------------
 
 const profiles = {
@@ -1151,7 +1368,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.22.0',
+    version: '1.23.0',
   });
 
   srv.tool(
@@ -1535,6 +1752,113 @@ function createMcpServer(sessionId) {
     }
   );
 
+  srv.tool(
+    'list_scheduled_tasks',
+    'List HolonBridge scheduler tasks (lib/scheduler.js) -- always reads from the ' +
+    'scheduler admin dataset regardless of your active dataset (switch_dataset does ' +
+    'not affect this). Shows actionClass, trigger interval, invoked persona, and ' +
+    'taskStatus (Active/Suspended/Deprecated) for each task.',
+    {},
+    async () => {
+      const tasks = await schedListTasks();
+      return { content: [{ type: 'text', text: JSON.stringify(tasks, null, 2) }] };
+    }
+  );
+
+  srv.tool(
+    'get_scheduler_status',
+    "Show the scheduler's live status: whether it's running, its tick interval, " +
+    'and every currently loaded task and persona (mirrors HolonBridge GET /scheduler).',
+    {},
+    async () => {
+      const status = await schedFetchJson('/scheduler', { method: 'GET' });
+      return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
+    }
+  );
+
+  srv.tool(
+    'create_scheduled_task',
+    'Create a new time-based (TemporalTrigger) scheduled task and activate it ' +
+    'immediately -- pushes the task plus a daily-limit ODRL policy into ' +
+    'urn:scheduler:tasks, then reloads the scheduler so it takes effect without ' +
+    'restarting the bridge process. Structured parameters only (no raw Turtle) -- ' +
+    'the task Turtle is projected server-side by this tool. SHACL validation ' +
+    "against ScheduledTaskShape is intentionally SKIPPED for now (known gap: " +
+    'isolated temp-graph validation cannot satisfy the shape\'s cross-reference ' +
+    'checks against the live personas graph -- see scheduler-personas.databook.md). ' +
+    'Only TemporalTrigger tasks are supported by this tool; StateTrigger tasks ' +
+    'still require a manual push_turtle.',
+    {
+      task_id:        z.string().describe('Short slug for this task, e.g. "weekly-census" -- becomes sched:task-{task_id}'),
+      action_class:   z.enum(['ReadOnlyQuery', 'GraphWrite', 'LLMInvocation']).describe('What kind of action this task performs'),
+      interval_ms:    z.number().int().positive().describe('How often the task fires, in milliseconds'),
+      sparql:         z.string().describe('For ReadOnlyQuery/GraphWrite: the SPARQL to run. For LLMInvocation: the prompt/instruction given to the persona.'),
+      persona_iri:    z.string().optional().describe('IRI of the persona to invoke (required for LLMInvocation, optional otherwise)'),
+      target_dataset: z.string().optional().describe('Dataset the task operates against (default: the scheduler admin dataset)'),
+      target_graph:   z.string().optional().describe('Target graph IRI for GraphWrite/LLMInvocation proposals (not needed for ReadOnlyQuery)'),
+      daily_limit:    z.number().int().positive().optional().describe('Max firings per day before the policy gate rejects further runs (default 24)'),
+    },
+    async ({ task_id, action_class, interval_ms, sparql, persona_iri, target_dataset, target_graph, daily_limit }) => {
+      requireWriteAccessTo(SCHEDULER_DATASET_TOOLS);
+      const actorIri = currentActorIri();
+      if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
+      const turtle = buildScheduledTaskTurtle({
+        taskId: task_id,
+        actionClass: action_class,
+        intervalMs: interval_ms,
+        personaIri: persona_iri,
+        sparql,
+        targetDataset: target_dataset ?? SCHEDULER_DATASET_TOOLS,
+        targetGraph: target_graph,
+        dailyLimit: daily_limit ?? 24,
+        actorIri,
+      });
+      const reloadResult = await schedPushTask(turtle);
+      return {
+        content: [{
+          type: 'text',
+          text: `Created and activated sched:task-${task_id}. Reload result: ${JSON.stringify(reloadResult)}\n\n` +
+            `NOTE: SHACL validation was skipped for this task (known gap -- see tool description).\n\n` +
+            `Turtle pushed:\n${turtle}`,
+        }],
+      };
+    }
+  );
+
+  srv.tool(
+    'set_task_status',
+    'Suspend, resume, or deprecate a scheduled task by setting sched:taskStatus ' +
+    '(Active/Suspended/Deprecated), then reloads the scheduler so the change takes ' +
+    'effect immediately. Suspended tasks stay loaded (visible to list_scheduled_tasks) ' +
+    'but never fire. Deprecated is the "remove" story -- no hard-delete verb exists.',
+    {
+      task_id: z.string().describe('Task slug, e.g. "weekly-census" (without the sched:task- prefix)'),
+      status:  z.enum(['Active', 'Suspended', 'Deprecated']).describe('New status for the task'),
+    },
+    async ({ task_id, status }) => {
+      requireWriteAccessTo(SCHEDULER_DATASET_TOOLS);
+      const reloadResult = await schedSetTaskStatus(task_id, status);
+      return { content: [{ type: 'text', text: `sched:task-${task_id} -> ${status}. Reload result: ${JSON.stringify(reloadResult)}` }] };
+    }
+  );
+
+  srv.tool(
+    'get_recent_scheduler_activity',
+    'Read what the scheduler has fired recently from urn:scheduler:provenance -- ' +
+    'outcome, persona, trigger type, and (when an LLMInvocation persona supplied one) ' +
+    'a one-line human-readable summary of what it proposed and why. This is the pull ' +
+    'side of scheduler observability -- there is no push channel from the background ' +
+    'scheduler process into an open chat session, so check here for what happened ' +
+    'since you last looked.',
+    {
+      since: z.string().optional().describe('ISO 8601 datetime -- only firings at or after this time (default: last 24 hours)'),
+    },
+    async ({ since }) => {
+      const activity = await schedRecentActivity(since);
+      return { content: [{ type: 'text', text: JSON.stringify(activity, null, 2) }] };
+    }
+  );
+
   return srv;
 }
 
@@ -1774,7 +2098,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.22.0',
+    version: '1.23.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -1783,16 +2107,18 @@ app.get('/health', async (_req, res) => {
     profiles: Object.keys(merged),
     activeProfile,
     activeSessions: sessions.size,
+    schedulerDataset: SCHEDULER_DATASET_TOOLS,
   });
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.22.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.23.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
   console.log(`  Static profiles     : ${Object.keys(profiles).join(', ')}`);
   console.log(`  Registry-backed     : fetched on demand from ${HOLONBRIDGE_URL}/registry (cached ${REGISTRY_CACHE_MAX_AGE_MS / 1000}s)`);
+  console.log(`  Scheduler dataset   : ${SCHEDULER_DATASET_TOOLS}`);
   console.log(`  SSE endpoint        : http://localhost:${MCP_PORT}/sse`);
   console.log(`  Health              : http://localhost:${MCP_PORT}/health`);
 });
