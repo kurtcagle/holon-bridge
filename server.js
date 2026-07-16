@@ -1473,9 +1473,10 @@ app.get('/health', (_req, res) => {
 //
 // Status/observability for lib/scheduler.js. Read-only -- registering tasks
 // and personas is done via SPARQL UPDATE/GSP push directly against
-// SCHEDULER_ADMIN_DATASET for now (see scheduler-personas.databook.md
-// open item: a proper /admin/api/scheduler/* surface, mirroring
-// mcp-remote/admin.js's ACL routes, is the next step, not yet wired here).
+// SCHEDULER_ADMIN_DATASET, or via mcp-remote's create_scheduled_task /
+// set_task_status MCP tools (2026-07-16), which both call POST
+// /scheduler/reload below after writing so a change takes effect
+// immediately rather than waiting for the next process restart.
 
 app.get('/scheduler', (_req, res) => {
   if (!SCHEDULER_ENABLED || !scheduler) {
@@ -1492,12 +1493,45 @@ app.get('/scheduler', (_req, res) => {
     dryRun: scheduler.dryRun,
     tasks: [...scheduler._tasks.values()].map(t => ({
       iri: t.iri, actionClass: t.actionClass, triggerType: t.triggerType,
-      persona: t.personaIri, targetGraph: t.targetGraph
+      persona: t.personaIri, targetGraph: t.targetGraph, taskStatus: t.taskStatus
     })),
     personas: [...scheduler._personas.values()].map(p => ({
       iri: p.iri, label: p.label, capability: [...p.capability], model: p.model
     }))
   })
+})
+
+// -- POST /scheduler/reload ----------------------------------------------------
+//
+// Added 2026-07-16, closing the gap identified the same day: a task or
+// persona pushed via push_turtle (or the newer create_scheduled_task /
+// set_task_status MCP tools) sat inert until the whole bridge process was
+// restarted, since Scheduler.reload() -- real, working code -- was only
+// ever called once, inside start(). Thin wrapper around that existing
+// method; no new scheduling logic here, just a door into something that
+// already worked. 409 if the scheduler isn't running at all (nothing to
+// reload), matching GET /scheduler's own enabled:false shape rather than
+// inventing a different error format for the same condition.
+
+app.post('/scheduler/reload', async (_req, res) => {
+  if (!SCHEDULER_ENABLED || !scheduler) {
+    return res.status(409).json({
+      reloaded: false,
+      error: 'Scheduler is not running on this process (SCHEDULER_ENABLED is not "true"). Nothing to reload.'
+    })
+  }
+  try {
+    await scheduler.reload()
+    console.log(`[Bridge] /scheduler/reload -- ${scheduler._tasks.size} task(s), ${scheduler._personas.size} persona(s)`)
+    return res.json({
+      reloaded: true,
+      tasks: scheduler._tasks.size,
+      personas: scheduler._personas.size
+    })
+  } catch (err) {
+    console.error('[Bridge] /scheduler/reload failed:', err.message)
+    return res.status(500).json({ reloaded: false, error: err.message })
+  }
 })
 
 // -- POST /shacl-mode ---------------------------------------------------------
@@ -3117,7 +3151,7 @@ app.use((_req, res) => {
       'POST /pipeline', 'POST /ingest', 'POST /pipeline-run',
       'GET  /datasets', 'GET  /graphs', 'GET  /graph',
       'GET  /named-queries', 'GET  /named-rules', 'GET  /pipelines',
-      'GET  /message/:id', 'GET  /description', 'GET  /health', 'GET  /scheduler',
+      'GET  /message/:id', 'GET  /description', 'GET  /health', 'GET  /scheduler', 'POST /scheduler/reload',
         'POST /validate',
         'GET  /holon', 'GET  /holon/:iri',
         'POST /holon', 'POST /holon/:iri/schema', 'POST /holon/:iri/entity',
