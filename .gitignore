@@ -7,3 +7,7 @@ node_modules/
 # this is live, host-specific operational state, not configuration.
 .bridge-session-state.json
 .bridge-session-state.json.tmp
+
+*.sanitised.txt
+*.old
+.dataset-acl.json*

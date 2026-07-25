@@ -92,7 +92,9 @@ import { validateWithShacl }                                        from './lib/
 import { validateHandler }                                          from './lib/validate.js'
 import { createHolonLifecycleRouter }                              from './lib/routes/holon-lifecycle.js'
 import { loadSessionState, saveSessionState }                        from './lib/session-state.js'
-import { mintSequenceId, readSequenceValue }                          from './lib/sequence.js'
+import { mintSequenceId, readSequenceValue, classSegment }            from './lib/sequence.js'
+import { attachConn }                                                 from './lib/conn.js'
+import { substituteParams }                                           from './lib/params.js'
 import { Scheduler }                                                  from './lib/scheduler.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
@@ -212,47 +214,11 @@ let activeWatcher = null   // chokidar FSWatcher for the active context dir
 
 // --- Helpers ------------------------------------------------------------------
 
-/**
- * Substitute {{paramName}} placeholders in a SPARQL string with caller-supplied
- * values. Substitution is raw string replacement — the query author is
- * responsible for placing placeholders in the correct SPARQL syntactic context
- * (inside quotes, angle brackets, etc.).
- *
- * Example named query SPARQL:
- *   FILTER(CONTAINS(LCASE(?jobTitle), LCASE("{{role}}")))
- *
- * Called with params: { role: "ontologist" } ->
- *   FILTER(CONTAINS(LCASE(?jobTitle), LCASE("ontologist")))
- *
- * IRI example:
- *   ?person foaf:gender <{{genderIRI}}> .
- * Called with params: { genderIRI: "http://xmlns.com/foaf/0.1/Female" }
- *
- * Returns { sparql, substituted, missing } where:
- *   sparql      -- the result string (may still have unresolved placeholders)
- *   substituted -- array of param names that were replaced
- *   missing     -- array of {{placeholders}} still present after substitution
- */
-function substituteParams(sparql, params) {
-  if (!params || typeof params !== 'object' || Object.keys(params).length === 0)
-    return { sparql, substituted: [], missing: [] }
-
-  let result = sparql
-  const substituted = []
-
-  for (const [key, value] of Object.entries(params)) {
-    const placeholder = new RegExp(`\\{\\{${key}\\}\\}`, 'g')
-    if (placeholder.test(result)) {
-      result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value))
-      substituted.push(key)
-    }
-  }
-
-  // Detect any remaining unresolved placeholders
-  const remaining = [...result.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[0])
-
-  return { sparql: result, substituted, missing: remaining }
-}
+// substituteParams() lives in lib/params.js as of 2026-07-25. It was a pure
+// function with no dependency on any route handler, and it is the single place
+// the raw-substitution trust boundary is documented: {{name}} replacement is
+// textual, so a caller-supplied VALUE can terminate the SPARQL literal it lands
+// in. Read that file before widening who may call POST /query { queryId, params }.
 
 function rebuildEndpoints(dataset, base) {
   DATASET     = dataset
@@ -965,56 +931,40 @@ app.use((req, res, next) => {
 
 // ── end MCP compatibility middleware ──────────────────────────────────────────
 
-// ── Per-request dataset-override middleware ───────────────────────────────────
+// -- Per-request connection middleware ----------------------------------------
 //
-// Added 2026-07-11 (v2.10.0) to fix a real cross-user bug: every route below
-// used to read the module-level JENA_SPARQL/JENA_GSP/JENA_UPDATE/SHACL_GRAPH/
-// DATASET constants directly, meaning "which dataset am I querying" was a
-// single value shared by every concurrently connected caller. One person's
-// POST /dataset (or, worse, an MCP client's switch_dataset tool call) changed
-// it for everyone -- silently, since a dataset switch isn't an error, just
-// wrong data on someone else's next query.
+// Attaches req.conn -- the single answer to "which dataset is THIS request
+// talking to, and what are its endpoints and graph IRIs". See lib/conn.js for
+// the full reasoning; the short version is that there used to be two competing
+// answers. The module-level DATASET/JENA_* globals were one; the four req.*
+// fields the v2.10.0 X-Dataset-Override middleware computed were the other, and
+// only the routes converted to read them honoured an override at all. The rest
+// -- /describe, /named-query, /named-rule, /rule, /graph-op, /pipeline*,
+// /ingest, /registry*, /graph -- silently read the globals, so an override
+// request against any of them operated on the wrong dataset without erroring.
 //
-// This middleware reads an X-Dataset-Override header -- sent per-request by
-// holonbridge-mcp-remote (v1.16.0+), which now tracks a sticky per-actor
-// dataset preference itself rather than relying on this bridge's shared
-// global -- and computes request-scoped endpoint values on req.* for route
-// handlers to prefer over the module-level globals. Absent the header
-// (curl, older clients, the MCP_REMOTE_TOKEN service-account fallback path),
-// req.* simply falls through to whatever the current global values are, so
-// nothing that doesn't send the header changes behavior.
+// attachConn still writes the old req.sparqlEndpoint/req.gspEndpoint/
+// req.updateEndpoint/req.shaclGraph/req.datasetOverride fields with identical
+// values, so every already-converted route keeps working untouched and the
+// remaining ones can migrate to req.conn one at a time. lib/conn.js exports
+// CONN_ALIASES as the grep target for what is still on the old shape.
 //
-// Scope note: only the routes actually reachable as MCP tools through
-// holonbridge-mcp-remote were converted to read req.* here (see that file's
-// hbHeaders() for where the header comes from) -- /sparql-select,
-// /sparql-construct, /sparql-update, /update, /query, /holon[/:iri],
-// /graphs, /validate, and every lifecycle verb via getLifecycleConn(req).
-// Routes not exposed as MCP tools (/describe, /named-query, /named-rule,
-// /rule, /graph-op, /pipeline*, /ingest, /registry*, /graph) still read the
-// module-level globals unconditionally -- a known, bounded gap: calling any
-// of those directly (e.g. via curl) still operates against whichever
-// dataset POST /dataset last set globally, same as before this change.
+// The getter closure exists because this file's dataset config is reassigned at
+// runtime by POST /dataset, /fuseki-url, /shacl-mode and /dataset-holon-iri.
+// It is called per request, so a switch takes effect immediately.
+//
+// Position is unchanged from the middleware it replaces: after the MCP
+// compatibility rewrite, before every route definition.
 
-app.use((req, res, next) => {
-  const override = req.headers['x-dataset-override']
-  if (override && String(override).trim()) {
-    const ds = String(override).trim()
-    req.datasetOverride = ds
-    req.sparqlEndpoint   = `${JENA_BASE}/${ds}/sparql`
-    req.gspEndpoint      = `${JENA_BASE}/${ds}/data`
-    req.updateEndpoint   = `${JENA_BASE}/${ds}/update`
-    req.shaclGraph       = process.env.SHACL_GRAPH ?? `urn:${ds}:shacl`
-  } else {
-    req.datasetOverride = null
-    req.sparqlEndpoint   = JENA_SPARQL
-    req.gspEndpoint      = JENA_GSP
-    req.updateEndpoint   = JENA_UPDATE
-    req.shaclGraph       = SHACL_GRAPH
-  }
-  next()
-})
+app.use(attachConn(() => ({
+  dataset:         DATASET,
+  jenaBase:        JENA_BASE,
+  sparqlEndpoint:  process.env.JENA_ENDPOINT ?? null,
+  shaclGraph:      process.env.SHACL_GRAPH ?? null,
+  datasetHolonIri: DATASET_HOLON_IRI
+})))
 
-// ── end per-request dataset-override middleware ────────────────────────────────
+// -- end per-request connection middleware -------------------------------------
 
 // -- POST /query ---------------------------------------------------------------
 
@@ -1359,7 +1309,7 @@ app.get('/description', async (_req, res) => {
       { method: 'POST', path: '/fuseki-url',     description: 'Change the Fuseki base URL at runtime without restarting. Pings the new host; warns but does not roll back if unreachable. Body: { "url": "http://...", "dataset"?: "name" }.' },
       { method: 'POST', path: '/shacl-mode',     description: 'Toggle SHACL validation gate at runtime. Body: { "required": true|false }.' },
       { method: 'POST', path: '/dataset-holon-iri', description: 'Set or clear the anchor holon lib/lifecycle.js\'s flat-graph verbs (proposeAgentPropertyUpdate, createAgent, formGroup, joinGroup, leaveGroup) gate capability checks against. Body: { "iri": "<holon IRI>" | null }. null reverts to the urn:{dataset}:root convention. Persisted across restarts.' },
-      { method: 'POST', path: '/sequence/mint', description: 'Atomically mint the next hev:sequenceId for this dataset (see lib/sequence.js). Body: { graph?, counterIri? } -- both default to the urn:{dataset}:holons / urn:{dataset}:sequence-counter convention; override for a dataset using a different graph-naming scheme. Response: { dataset, value, sequenceId, graph, counterIri }. Deliberately scoped to one bridge process per dataset -- see the module docstring before relying on this across multiple concurrent bridge processes.' },
+      { method: 'POST', path: '/sequence/mint', description: 'Atomically mint the next hev:sequenceId for this dataset (see lib/sequence.js). Body: { graph?, counterIri?, entityClass? } -- graph/counterIri default to the urn:{dataset}:holons / urn:{dataset}:sequence-counter convention; override for a dataset using a different graph-naming scheme. entityClass (full IRI, CURIE, or bare local name; "class" accepted as an alias) puts the class local name into the minted IRI as {base}/counter/{dataset}/{Class}/{n}; omit it for the legacy {base}/counter/{dataset}/id-{n} form. The class labels a single dataset-wide counter rather than sharding it, so numbers stay globally monotonic across classes and hev:sequenceId keeps giving a total order over assertions. Response: { dataset, value, sequenceId, entityClass, graph, counterIri }. Deliberately scoped to one bridge process per dataset -- see the module docstring before relying on this across multiple concurrent bridge processes.' },
       { method: 'GET',  path: '/sequence',      description: 'Read a dataset\'s current sequence-counter value without minting. Query params: graph?, counterIri? -- same defaults as POST /sequence/mint.' },
       { method: 'POST', path: '/named-query',    description: 'Register, update, or delete a named query. Body: { id, label?, description?, sparql, targetGraph?, params?: [{name, description?, default?}] } or { id, delete: true }. Use {{paramName}} placeholders in sparql; callers supply values via POST /query { queryId, params }.' },
       { method: 'POST', path: '/pipeline',      description: '[NON-CANONICAL] Register, update, or delete a pipeline manifest. Body: { id, signalType, holdingGraph, promotionRule, contextGraph, ... } or { id, delete: true }.' },
@@ -1586,39 +1536,68 @@ app.post('/dataset-holon-iri', (req, res) => {
 
 // -- POST /sequence/mint -- mint the next hev:sequenceId ------------------------
 //
-// Atomically mints the next value from a dataset-scoped hev:SequenceCounter
-// and returns it both as the bare integer and as the full hev:sequenceId
-// IRI (https://.../counter/{dataset}/id-{n}). See lib/sequence.js for the
-// atomicity reasoning and the deliberate scope limit (per-dataset, single
-// bridge process -- see that file's docstring before promoting this to a
-// multi-bridge or network-wide deployment).
+// Atomically mints the next value from a dataset-scoped hev:SequenceCounter and
+// returns it both as the bare integer and as the full hev:sequenceId IRI.
+//
+// The IRI carries the class of the thing being minted when one is supplied:
+//   https://.../counter/{dataset}/{ClassLocalName}/{n}
+// and falls back to the original form when it isn't:
+//   https://.../counter/{dataset}/id-{n}
+//
+// The class is a LABEL on a single dataset-wide counter, not a shard of it --
+// numbers stay globally monotonic across classes so hev:sequenceId keeps giving
+// a total order over assertions. See lib/sequence.js for that reasoning, for the
+// atomicity argument, and for the deliberate scope limit (per-dataset, single
+// bridge process -- read that docstring before promoting this to a multi-bridge
+// or network-wide deployment).
+//
+// entityClass may be a full IRI, a CURIE, or a bare local name; "class" is
+// accepted as an alias. An unusable class is a 400, not a 500 -- it's a caller
+// error, and it must not burn a sequence number on its way to being rejected,
+// which is why it is validated before the mint rather than inside it.
 //
 // The counter's home graph and its own IRI both default to this dataset's
 // standard convention (urn:{dataset}:holons / urn:{dataset}:sequence-counter)
-// but can be overridden -- pass the actual values explicitly for any dataset
-// (e.g. Bridgerton, which uses urn:data:holons and a sportsleague:-namespaced
-// counter IRI rather than the convention default) that was set up with a
-// different graph-naming convention. The counter is created automatically,
-// seeded at 0, on first mint if it doesn't exist yet.
+// but can be overridden -- pass both explicitly for any dataset (e.g. Bridgerton,
+// which uses urn:data:holons and a sportsleague:-namespaced counter IRI) that was
+// set up with a different graph-naming convention. The counter is created
+// automatically, seeded at 0, on first mint if it doesn't exist yet.
 //
-// Request:  { graph?: string, counterIri?: string }
-// Response: { dataset, value, sequenceId, graph, counterIri }
+// Request:  { graph?, counterIri?, entityClass? | class? }
+// Response: { dataset, value, sequenceId, entityClass, graph, counterIri }
 
 app.post('/sequence/mint', async (req, res) => {
-  const dataset    = req.datasetOverride || DATASET
+  const dataset    = req.conn.dataset
   const graphIri   = (req.body?.graph && String(req.body.graph).trim())
-    ? String(req.body.graph).trim() : `urn:${dataset}:holons`
+    ? String(req.body.graph).trim() : req.conn.sequenceGraph
   const counterIri = (req.body?.counterIri && String(req.body.counterIri).trim())
-    ? String(req.body.counterIri).trim() : `urn:${dataset}:sequence-counter`
+    ? String(req.body.counterIri).trim() : req.conn.sequenceCounterIri
+
+  const rawClass    = req.body?.entityClass ?? req.body?.class ?? null
+  const entityClass = (rawClass && String(rawClass).trim()) ? String(rawClass).trim() : null
+
+  // Validate before minting so a caller typo is a 400 rather than a generic 500
+  // from inside the mint -- and, more importantly, so it doesn't consume a
+  // sequence number first. A gap left by a typo is indistinguishable after the
+  // fact from a gap left by a real concurrent mint, and the case for keeping one
+  // counter rests on gaps meaning something. classSegment() is pure and
+  // idempotent, so re-validating inside mintSequenceId() costs nothing.
+  if (entityClass !== null) {
+    try { classSegment(entityClass) }
+    catch (err) {
+      return res.status(400).json({ error: 'Invalid entityClass', message: err.message })
+    }
+  }
 
   try {
-    const { value, sequenceId } = await mintSequenceId({
-      sparqlEndpoint: req.sparqlEndpoint,
-      updateEndpoint: req.updateEndpoint,
-      dataset, graphIri, counterIri
+    const { value, sequenceId, entityClass: minted } = await mintSequenceId({
+      sparqlEndpoint: req.conn.sparqlEndpoint,
+      updateEndpoint: req.conn.updateEndpoint,
+      dataset, graphIri, counterIri,
+      ...(entityClass === null ? {} : { entityClass })
     })
-    console.log(`[Bridge] /sequence/mint dataset=${dataset} -> ${sequenceId}`)
-    return res.json({ dataset, value, sequenceId, graph: graphIri, counterIri })
+    console.log(`[Bridge] /sequence/mint dataset=${dataset} class=${minted ?? '(none)'} -> ${sequenceId}`)
+    return res.json({ dataset, value, sequenceId, entityClass: minted, graph: graphIri, counterIri })
   } catch (err) {
     console.error('[Bridge] /sequence/mint error:', err)
     return res.status(500).json({ error: 'Sequence mint failed', message: err.message })
