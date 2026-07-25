@@ -95,6 +95,7 @@ import { loadSessionState, saveSessionState }                        from './lib
 import { mintSequenceId, readSequenceValue, classSegment }            from './lib/sequence.js'
 import { attachConn }                                                 from './lib/conn.js'
 import { substituteParams }                                           from './lib/params.js'
+import { loadNamedQueries, applyQueryParams }                         from './lib/named-queries.js'
 import { Scheduler }                                                  from './lib/scheduler.js'
 import { initSession, loadRegistryCache,
          resolveEndpoints, probeReachability,
@@ -252,53 +253,30 @@ function parseNamedQueries(db) {
 
 /**
  * Load named queries from the RDF graph `urn:{DATASET}:named-queries`.
- * Each hb:NamedQuery must have dcterms:identifier and hb:sparql at minimum.
+ *
+ * Delegates to lib/named-queries.js, which reads BOTH the bridge's own hb:
+ * scheme and the HGA Named Query Specification's hquery: scheme. Before
+ * 2026-07-25 only hb: was understood, so a registry written to the HGA spec
+ * loaded as empty with no error -- the bridge simply reported zero queries for
+ * a graph that held working ones.
+ *
  * Returns [] gracefully if the graph is empty or Jena is unreachable.
  */
 async function loadNamedQueriesFromGraph() {
   const graphIri = namedQueriesGraphIri()
-  const sparql = `
-PREFIX hb:      <https://w3id.org/holonbridge/>
-PREFIX dcterms: <http://purl.org/dc/terms/>
-
-SELECT ?id ?label ?description ?sparql ?targetGraph ?parameters
-WHERE {
-  GRAPH <${graphIri}> {
-    ?query a hb:NamedQuery ;
-           dcterms:identifier ?id ;
-           hb:sparql          ?sparql .
-    OPTIONAL { ?query dcterms:title       ?label }
-    OPTIONAL { ?query dcterms:description ?description }
-    OPTIONAL { ?query hb:targetGraph      ?targetGraph }
-    OPTIONAL { ?query hb:parameters       ?parameters }
-  }
-}
-ORDER BY ?id`
-  try {
-    const { bindings } = await runQuery(JENA_SPARQL, sparql, LOG_SPARQL)
-    const queries = bindings
-      .map(r => {
-        let params = []
-        if (r.parameters?.value) {
-          try { params = JSON.parse(r.parameters.value) } catch (_) {}
-        }
-        return {
-          id:          r.id?.value          ?? '',
-          label:       r.label?.value       ?? r.id?.value ?? '',
-          description: r.description?.value ?? '',
-          sparql:      r.sparql?.value      ?? '',
-          targetGraph: r.targetGraph?.value ?? null,
-          params,
-          source:      'rdf'
-        }
-      })
-      .filter(q => q.id && q.sparql)
-    console.log(`[Bridge] Loaded ${queries.length} named quer${queries.length === 1 ? 'y' : 'ies'} from <${graphIri}>`)
-    return queries
-  } catch (err) {
-    console.warn(`[Bridge] No named queries from <${graphIri}>: ${err.message}`)
-    return []
-  }
+  const queries  = await loadNamedQueries({
+    sparqlEndpoint: JENA_SPARQL,
+    graphIri,
+    runQuery,
+    logSparql: LOG_SPARQL
+  })
+  const byVocab = queries.reduce((acc, q) => {
+    acc[q.vocabulary] = (acc[q.vocabulary] ?? 0) + 1
+    return acc
+  }, {})
+  const breakdown = Object.entries(byVocab).map(([v, n]) => `${n} ${v}:`).join(', ') || 'none'
+  console.log(`[Bridge] Loaded ${queries.length} named quer${queries.length === 1 ? 'y' : 'ies'} from <${graphIri}> (${breakdown})`)
+  return queries
 }
 
 /**
@@ -977,28 +955,41 @@ app.post('/query', async (req, res) => {
     const nq = namedQueries.find(q => q.id === queryId)
     if (!nq) return res.status(404).json({ error: `Named query '${queryId}' not found.` })
 
-    // Apply parameter substitution if params supplied
+    // Bind parameters. lib/named-queries.js dispatches on the query's vocabulary:
+    // hb: queries get {{placeholder}} substitution, hquery: queries get a VALUES
+    // clause appended. Sending hquery: parameters through substitution would
+    // match nothing and run the query unparameterised -- every row, no error --
+    // which is why this is not a single shared code path.
     let sparqlToRun = nq.sparql
-    let substitution = { substituted: [], missing: [] }
+    let binding = { bound: [], missing: [], strategy: 'none' }
     if (params && typeof params === 'object') {
-      substitution = substituteParams(nq.sparql, params)
-      sparqlToRun  = substitution.sparql
-      if (substitution.missing.length > 0) {
+      try {
+        binding     = applyQueryParams(nq, params, substituteParams)
+        sparqlToRun = binding.sparql
+      } catch (err) {
         return res.status(400).json({
-          error:   `Named query '${queryId}' has unresolved placeholders after substitution.`,
-          missing: substitution.missing,
+          error:  `Named query '${queryId}': ${err.message}`,
+          params: nq.params ?? []
+        })
+      }
+      if (binding.missing.length > 0) {
+        return res.status(400).json({
+          error:   binding.strategy === 'values'
+            ? `Named query '${queryId}' is missing required parameter(s).`
+            : `Named query '${queryId}' has unresolved placeholders after substitution.`,
+          missing: binding.missing,
           params:  nq.params ?? []
         })
       }
     }
 
-    console.log(`[Bridge] Named query '${queryId}' (source: ${nq.source ?? 'unknown'}, params: ${JSON.stringify(params ?? {})})`)
+    console.log(`[Bridge] Named query '${queryId}' (${nq.vocabulary ?? 'hb'}:, bind=${binding.strategy}, params: ${JSON.stringify(params ?? {})})`)
     try {
       const { vars, bindings }  = await runQuery(req.sparqlEndpoint, sparqlToRun, LOG_SPARQL)
       const formattedResults    = formatBindings(vars, bindings)
       const answer              = `Named query '${nq.label ?? queryId}' returned ${bindings.length} result(s).`
       const result              = { answer, sparql: sparqlToRun, bindings, vars, formattedResults, retries: 0, queryId,
-                                    substitution: substitution.substituted.length > 0 ? substitution : undefined }
+                                    binding: binding.bound.length > 0 ? binding : undefined }
       if (asDataBook) {
         const doc = buildResponseDataBook({
           nlQuery: nq.description ?? queryId, sparql: sparqlToRun, bindings, vars,
