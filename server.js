@@ -427,7 +427,7 @@ ORDER BY ?id`
  * Returns { turtle, tripleCount } on success or throws.
  * Non-canonical — shared between /rule endpoint and runPipeline().
  */
-async function executeNamedRule(rule, params = {}) {
+async function executeNamedRule(conn, rule, params = {}) {
   let sparqlToRun = rule.sparql
 
   // $this special binding
@@ -440,7 +440,7 @@ async function executeNamedRule(rule, params = {}) {
 
   // Timestamp and other auto-bindings
   const now = new Date().toISOString()
-  const autoParams = { '$timestamp': now, '$dataset': DATASET, ...params }
+  const autoParams = { '$timestamp': now, '$dataset': conn.dataset, ...params }
   const sub = substituteParams(sparqlToRun, autoParams)
   if (sub.missing.length > 0)
     throw new Error(`Unresolved placeholders in rule '${rule.id}': ${sub.missing.join(', ')}`)
@@ -454,7 +454,7 @@ async function executeNamedRule(rule, params = {}) {
   const timer      = setTimeout(() => controller.abort(), 60_000)
   let constructResp
   try {
-    constructResp = await fetch(JENA_SPARQL, {
+    constructResp = await fetch(conn.sparqlEndpoint, {
       method:  'POST',
       headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
       body:    sparqlToRun,
@@ -471,9 +471,9 @@ async function executeNamedRule(rule, params = {}) {
     : 0
 
   // Write to target graph per writeMode
-  const gspTarget = `${JENA_GSP}?graph=${encodeURIComponent(targetGraph)}`
+  const gspTarget = `${conn.gspEndpoint}?graph=${encodeURIComponent(targetGraph)}`
   if (writeMode === 'Replace' || writeMode === 'Sync') {
-    await fetch(JENA_UPDATE, {
+    await fetch(conn.updateEndpoint, {
       method:  'POST',
       headers: { 'Content-Type': 'application/sparql-update' },
       body:    `${writeMode === 'Sync' ? 'DROP SILENT' : 'CLEAR'} GRAPH <${targetGraph}>`
@@ -499,7 +499,7 @@ async function executeNamedRule(rule, params = {}) {
  * fires appropriate named rule, updates message status.
  * Non-canonical — pending WG IV alignment.
  */
-async function runIngestPipeline(messageId) {
+async function runIngestPipeline(conn, messageId) {
   const msg = messageStore.get(messageId)
   if (!msg) throw new Error(`Message '${messageId}' not found in store.`)
 
@@ -512,19 +512,19 @@ async function runIngestPipeline(messageId) {
   }
 
   const payloadGraph  = msg.payloadGraph
-  const shapesGraph   = pipeline.shapesGraph ?? SHACL_GRAPH
-  const reportGraph   = pipeline.reportGraph ?? `urn:${DATASET}:reports`
+  const shapesGraph   = pipeline.shapesGraph ?? conn.shaclGraph
+  const reportGraph   = pipeline.reportGraph ?? `urn:${conn.dataset}:reports`
   const holdingGraph  = msg.holdingGraph
 
   try {
     // 1. Fetch payload graph as Turtle for validation
-    const gspUrl = `${JENA_GSP}?graph=${encodeURIComponent(payloadGraph)}`
+    const gspUrl = `${conn.gspEndpoint}?graph=${encodeURIComponent(payloadGraph)}`
     const gspResp = await fetch(gspUrl, { headers: { 'Accept': 'text/turtle' } })
     if (!gspResp.ok) throw new Error(`Could not fetch payload graph <${payloadGraph}>`)
     const payloadTurtle = await gspResp.text()
 
     // 2. SHACL validate
-    const validation = await validateWithShacl(JENA_BASE, DATASET, shapesGraph, payloadTurtle)
+    const validation = await validateWithShacl(conn.jenaBase, conn.dataset, shapesGraph, payloadTurtle)
     const conforms    = validation?.conforms ?? true
 
     // 3. Determine max severity from report
@@ -550,7 +550,7 @@ async function runIngestPipeline(messageId) {
       msg.status = 'hb:Violated'
       const vRule = namedRules.find(r => r.id === pipeline.violationRule)
       if (vRule) {
-        await executeNamedRule(vRule, { ...ruleParams,
+        await executeNamedRule(conn, vRule, { ...ruleParams,
           '$reportGraph': reportGraph,
           '$validationNote': (validation?.results?.[0]?.message ?? 'Violation')
         })
@@ -559,18 +559,18 @@ async function runIngestPipeline(messageId) {
       const reportTurtle = `
 PREFIX hb:  <https://w3id.org/holonbridge/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-<urn:${DATASET}:report:${messageId}>
+<urn:${conn.dataset}:report:${messageId}>
   a hb:ValidationReport ;
   hb:messageId "${messageId}" ;
   hb:conforms false ;
   hb:severity hb:Violation ;
   hb:timestamp "${ruleParams['$timestamp']}"^^xsd:dateTime .`
-      await fetch(`${JENA_GSP}?graph=${encodeURIComponent(reportGraph)}`, {
+      await fetch(`${conn.gspEndpoint}?graph=${encodeURIComponent(reportGraph)}`, {
         method: 'POST', headers: { 'Content-Type': 'text/turtle' }, body: reportTurtle
       })
-      msg.reportIri = `urn:${DATASET}:report:${messageId}`
+      msg.reportIri = `urn:${conn.dataset}:report:${messageId}`
       if (!pipeline.retainOnViolation)
-        await fetch(JENA_UPDATE, { method: 'POST',
+        await fetch(conn.updateEndpoint, { method: 'POST',
           headers: { 'Content-Type': 'application/sparql-update' },
           body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
         })
@@ -582,22 +582,22 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
       if (warningPolicy === 'Block') {
         // Treat as violation
-        if (wRule) await executeNamedRule(wRule, { ...ruleParams, '$reportGraph': reportGraph })
+        if (wRule) await executeNamedRule(conn, wRule, { ...ruleParams, '$reportGraph': reportGraph })
         msg.status = 'hb:Rejected'
         msg.note   = 'Warning treated as violation per pipeline defaultWarningPolicy: Block'
         if (!pipeline.retainOnViolation)
-          await fetch(JENA_UPDATE, { method: 'POST',
+          await fetch(conn.updateEndpoint, { method: 'POST',
             headers: { 'Content-Type': 'application/sparql-update' },
             body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
           })
       } else {
         // AnnotateAndPromote — promote with warning annotation
-        if (wRule) await executeNamedRule(wRule, ruleParams)
-        const eventIri = `urn:${DATASET}:event:${ruleParams.uuid}`
+        if (wRule) await executeNamedRule(conn, wRule, ruleParams)
+        const eventIri = `urn:${conn.dataset}:event:${ruleParams.uuid}`
         msg.status  = 'hb:Promoted'
         msg.eventIri = eventIri
         msg.note    = 'Promoted with warning annotation (AnnotateAndPromote policy)'
-        await fetch(JENA_UPDATE, { method: 'POST',
+        await fetch(conn.updateEndpoint, { method: 'POST',
           headers: { 'Content-Type': 'application/sparql-update' },
           body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
         })
@@ -607,11 +607,11 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
       // Valid path — fire promotion rule
       msg.status = 'hb:Valid'
       const pRule = namedRules.find(r => r.id === pipeline.promotionRule)
-      if (pRule) await executeNamedRule(pRule, ruleParams)
-      const eventIri = `urn:${DATASET}:event:${ruleParams.uuid}`
+      if (pRule) await executeNamedRule(conn, pRule, ruleParams)
+      const eventIri = `urn:${conn.dataset}:event:${ruleParams.uuid}`
       msg.status    = 'hb:Promoted'
       msg.eventIri  = eventIri
-      await fetch(JENA_UPDATE, { method: 'POST',
+      await fetch(conn.updateEndpoint, { method: 'POST',
         headers: { 'Content-Type': 'application/sparql-update' },
         body: `DROP SILENT GRAPH <${holdingGraph}> ; DROP SILENT GRAPH <${payloadGraph}>`
       })
@@ -1639,7 +1639,7 @@ app.post('/named-query', async (req, res) => {
   if (!id || typeof id !== 'string' || !id.trim())
     return res.status(400).json({ error: '"id" is required.' })
 
-  const graphIri  = namedQueriesGraphIri()
+  const graphIri  = req.conn.namedQueriesGraph
   const queryNode = `<https://w3id.org/holonbridge/query/${encodeURIComponent(id.trim())}>`
 
   // -- Delete -------------------------------------------------------------------
@@ -1650,15 +1650,22 @@ app.post('/named-query', async (req, res) => {
       const timer = setTimeout(() => controller.abort(), 10_000)
       let response
       try {
-        response = await fetch(JENA_UPDATE, {
+        response = await fetch(req.conn.updateEndpoint, {
           method: 'POST', headers: { 'Content-Type': 'application/sparql-update' },
           body: update, signal: controller.signal
         })
       } finally { clearTimeout(timer) }
       if (!response.ok) throw new Error(`Jena UPDATE ${response.status}`)
-      await loadContext()   // refresh in-memory registry
+      // loadContext() and the loadNamed*FromGraph() loaders read the GLOBALLY
+      // active dataset, not this request's. Under an override the write above
+      // landed in another dataset, so refreshing process-global state from it
+      // would be wrong -- skip, and say so in the response rather than leaving
+      // the caller to infer it. The deeper fix is per-dataset context caching,
+      // already flagged as a KNOWN LIMITATION on runPipeline().
+      if (!req.conn.overridden) await loadContext()
       console.log(`[Bridge] Named query '${id}' deleted from <${graphIri}>`)
-      return res.json({ deleted: true, id, graph: graphIri })
+      return res.json({ deleted: true, id, graph: graphIri,
+        inMemoryRegistryReloaded: !req.conn.overridden })
     } catch (err) {
       return res.status(500).json({ deleted: false, error: err.message })
     }
@@ -1701,7 +1708,7 @@ INSERT DATA { GRAPH <${graphIri}> { ${turtleData} } }`
     const timer = setTimeout(() => controller.abort(), 10_000)
     let response
     try {
-      response = await fetch(JENA_UPDATE, {
+      response = await fetch(req.conn.updateEndpoint, {
         method: 'POST', headers: { 'Content-Type': 'application/sparql-update' },
         body: update, signal: controller.signal
       })
@@ -1710,9 +1717,16 @@ INSERT DATA { GRAPH <${graphIri}> { ${turtleData} } }`
       const body = await response.text()
       throw new Error(`Jena UPDATE ${response.status}: ${body.slice(0, 200)}`)
     }
-    await loadContext()   // refresh in-memory registry
+    // loadContext() and the loadNamed*FromGraph() loaders read the GLOBALLY
+    // active dataset, not this request's. Under an override the write above
+    // landed in another dataset, so refreshing process-global state from it
+    // would be wrong -- skip, and say so in the response rather than leaving
+    // the caller to infer it. The deeper fix is per-dataset context caching,
+    // already flagged as a KNOWN LIMITATION on runPipeline().
+    if (!req.conn.overridden) await loadContext()
     console.log(`[Bridge] Named query '${id}' registered in <${graphIri}>`)
-    return res.json({ registered: true, id, graph: graphIri, source: 'rdf' })
+    return res.json({ registered: true, id, graph: graphIri, source: 'rdf',
+      inMemoryRegistryReloaded: !req.conn.overridden })
   } catch (err) {
     console.error('[Bridge] /named-query error:', err)
     return res.status(500).json({ registered: false, error: err.message })
@@ -1945,7 +1959,7 @@ app.post('/describe', async (req, res) => {
     const timer      = setTimeout(() => controller.abort(), 30_000)
     let response
     try {
-      response = await fetch(JENA_SPARQL, {
+      response = await fetch(req.conn.sparqlEndpoint, {
         method:  'POST',
         headers: { 'Content-Type': 'application/sparql-query', 'Accept': 'text/turtle' },
         body:    sparql,
@@ -2006,7 +2020,7 @@ WHERE {
         const visitedFilter = [...visited].map(i => `<${i}>`).join(', ')
         const gc  = graphIri ? `GRAPH <${graphIri}> {` : ''
         const gcl = graphIri ? `}` : ''
-        const { bindings } = await runQuery(JENA_SPARQL, `
+        const { bindings } = await runQuery(req.conn.sparqlEndpoint, `
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT DISTINCT ?o WHERE {
   ${gc}
@@ -2108,7 +2122,7 @@ app.get('/graph', async (req, res) => {
     return res.status(400).json({ error: 'Query parameter "iri" is required.' })
 
   const acceptType = format === 'trig' ? 'application/trig' : 'text/turtle'
-  const gspUrl     = `${JENA_GSP}?graph=${encodeURIComponent(iri.trim())}`
+  const gspUrl     = `${req.conn.gspEndpoint}?graph=${encodeURIComponent(iri.trim())}`
 
   console.log(`[Bridge] GSP fetch: <${iri}>`)
   try {
@@ -2124,7 +2138,7 @@ app.get('/graph', async (req, res) => {
 
     const body = await response.text()
     if (response.status === 404)
-      return res.status(404).json({ error: `Named graph <${iri}> not found in dataset '${DATASET}'.` })
+      return res.status(404).json({ error: `Named graph <${iri}> not found in dataset '${req.conn.dataset}'.` })
     if (!response.ok)
       return res.status(502).json({ error: `Fuseki GSP returned HTTP ${response.status}: ${body.slice(0, 300)}` })
 
@@ -2156,7 +2170,7 @@ app.post('/named-rule', async (req, res) => {
   if (!id || typeof id !== 'string' || !id.trim())
     return res.status(400).json({ error: '"id" is required.' })
 
-  const graphIri  = namedRulesGraphIri()
+  const graphIri  = req.conn.namedRulesGraph
   const ruleIri   = `${graphIri}:${id.trim()}`
   const HB        = 'https://w3id.org/holonbridge/'
   const DCTERMS   = 'http://purl.org/dc/terms/'
@@ -2171,7 +2185,7 @@ WITH <${graphIri}>
 DELETE { ?rule ?p ?o }
 WHERE  { ?rule dcterms:identifier """${id}""" ; ?p ?o }`
     try {
-      await fetch(JENA_UPDATE, { method:'POST',
+      await fetch(req.conn.updateEndpoint, { method:'POST',
         headers:{'Content-Type':'application/sparql-update'}, body: deleteSparql })
       namedRules = namedRules.filter(r => r.id !== id)
       console.log(`[Bridge] Named rule '${id}' deleted`)
@@ -2194,7 +2208,7 @@ DELETE { ?rule hb:ruleStatus ?old }
 INSERT { ?rule hb:ruleStatus hb:${status} }
 WHERE  { ?rule dcterms:identifier """${id}""" . OPTIONAL { ?rule hb:ruleStatus ?old } }`
     try {
-      await fetch(JENA_UPDATE, { method:'POST',
+      await fetch(req.conn.updateEndpoint, { method:'POST',
         headers:{'Content-Type':'application/sparql-update'}, body: updateSparql })
       const r = namedRules.find(r => r.id === id)
       if (r) r.ruleStatus = status
@@ -2258,14 +2272,19 @@ ${optionals}
 }`
 
   try {
-    const resp = await fetch(JENA_UPDATE, { method:'POST',
+    const resp = await fetch(req.conn.updateEndpoint, { method:'POST',
       headers:{'Content-Type':'application/sparql-update'}, body: insertSparql })
     if (!resp.ok) {
       const txt = await resp.text()
       return res.status(502).json({ error: `Fuseki update failed: ${txt.slice(0,200)}` })
     }
-    // Reload rules into memory
-    namedRules = await loadNamedRulesFromGraph()
+    // loadContext() and the loadNamed*FromGraph() loaders read the GLOBALLY
+    // active dataset, not this request's. Under an override the write above
+    // landed in another dataset, so refreshing process-global state from it
+    // would be wrong -- skip, and say so in the response rather than leaving
+    // the caller to infer it. The deeper fix is per-dataset context caching,
+    // already flagged as a KNOWN LIMITATION on runPipeline().
+    if (!req.conn.overridden) namedRules = await loadNamedRulesFromGraph()
     console.log(`[Bridge] Named rule '${id}' registered (writeMode: ${wm}, status: ${rs})`)
     return res.json({ registered: true, id, targetGraph, writeMode: wm, ruleStatus: rs })
   } catch (err) {
@@ -2316,7 +2335,7 @@ app.post('/rule', async (req, res) => {
 
   console.log(`[Bridge] /rule '${ruleId}' writeMode=${ruleToRun.writeMode} target=<${rule.targetGraph}>`)
   try {
-    const result = await executeNamedRule(ruleToRun, params ? { ...params } : {})
+    const result = await executeNamedRule(req.conn, ruleToRun, params ? { ...params } : {})
     return res.json({
       ruleId,
       targetGraph:    rule.targetGraph,
@@ -2369,7 +2388,7 @@ app.post('/graph-op', async (req, res) => {
   console.log(`[Bridge] /graph-op: ${sparqlOp}`)
 
   try {
-    const resp = await fetch(JENA_UPDATE, {
+    const resp = await fetch(req.conn.updateEndpoint, {
       method:  'POST',
       headers: { 'Content-Type': 'application/sparql-update' },
       body:    sparqlOp
@@ -2378,8 +2397,11 @@ app.post('/graph-op', async (req, res) => {
       const txt = await resp.text()
       return res.status(502).json({ error: `Fuseki graph-op failed: ${txt.slice(0,200)}` })
     }
-    // Refresh named graphs list
-    namedGraphs = await discoverGraphs(JENA_SPARQL)
+    // Refresh the process-global named-graph list only when this request targeted
+    // the globally active dataset. Under X-Dataset-Override the operation ran
+    // against a different dataset, and repopulating the global cache from it would
+    // publish another caller's graph list as this process's own.
+    if (!req.conn.overridden) namedGraphs = await discoverGraphs(JENA_SPARQL)
     return res.json({ operation: op, source: source ?? null, target, ok: true, sparql: sparqlOp })
   } catch (err) {
     console.error('[Bridge] /graph-op error:', err)
@@ -2404,7 +2426,7 @@ app.post('/pipeline', async (req, res) => {
   if (!id || typeof id !== 'string' || !id.trim())
     return res.status(400).json({ error: '"id" is required.' })
 
-  const graphIri    = namedPipelinesGraphIri()
+  const graphIri    = req.conn.namedPipelinesGraph
   const pipelineIri = `${graphIri}:${id.trim()}`
   const HB          = 'https://w3id.org/holonbridge/'
   const DCTERMS     = 'http://purl.org/dc/terms/'
@@ -2416,7 +2438,7 @@ PREFIX dcterms: <${DCTERMS}>
 WITH <${graphIri}>
 DELETE { ?p ?pr ?o } WHERE { ?p dcterms:identifier """${id}""" ; ?pr ?o }`
     try {
-      await fetch(JENA_UPDATE, { method:'POST',
+      await fetch(req.conn.updateEndpoint, { method:'POST',
         headers:{'Content-Type':'application/sparql-update'}, body: deleteSparql })
       namedPipelines = namedPipelines.filter(p => p.id !== id)
       return res.json({ deleted: true, id })
@@ -2462,10 +2484,16 @@ ${optionals}
 }`
 
   try {
-    const resp = await fetch(JENA_UPDATE, { method:'POST',
+    const resp = await fetch(req.conn.updateEndpoint, { method:'POST',
       headers:{'Content-Type':'application/sparql-update'}, body: insertSparql })
     if (!resp.ok) return res.status(502).json({ error: `Fuseki update failed` })
-    namedPipelines = await loadNamedPipelinesFromGraph()
+    // loadContext() and the loadNamed*FromGraph() loaders read the GLOBALLY
+    // active dataset, not this request's. Under an override the write above
+    // landed in another dataset, so refreshing process-global state from it
+    // would be wrong -- skip, and say so in the response rather than leaving
+    // the caller to infer it. The deeper fix is per-dataset context caching,
+    // already flagged as a KNOWN LIMITATION on runPipeline().
+    if (!req.conn.overridden) namedPipelines = await loadNamedPipelinesFromGraph()
     console.log(`[Bridge] Pipeline '${id}' registered`)
     return res.json({ registered: true, id, signalType, contextGraph })
   } catch (err) {
@@ -2478,7 +2506,7 @@ ${optionals}
 app.get('/pipelines', (_req, res) => {
   res.json({
     total:         namedPipelines.length,
-    pipelinesGraph: namedPipelinesGraphIri(),
+    pipelinesGraph: req.conn.namedPipelinesGraph,
     pipelines:     namedPipelines.map(({ id, label, signalType, contextGraph,
                                          promotionRule, violationRule, warningRule,
                                          defaultWarningPolicy }) =>
@@ -2536,7 +2564,7 @@ app.post('/ingest', async (req, res) => {
   if (!pipeline)
     return res.status(404).json({ error: `No pipeline found for id '${pipelineId}' or signalType '${signalType}'.` })
 
-  const holdingGraph  = pipeline.holdingGraph ?? `urn:${DATASET}:holding:${messageId}`
+  const holdingGraph  = pipeline.holdingGraph ?? `urn:${req.conn.dataset}:holding:${messageId}`
   const payloadGraph  = `${holdingGraph}:payload`
   const now           = new Date().toISOString()
 
@@ -2544,7 +2572,7 @@ app.post('/ingest', async (req, res) => {
   const envelopeTurtle = `
 PREFIX hb:  <https://w3id.org/holonbridge/>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-<urn:${DATASET}:message:${messageId}>
+<urn:${req.conn.dataset}:message:${messageId}>
   a hb:Message ;
   hb:messageId     "${messageId}" ;
   hb:signalType    <${signalType || pipeline.signalType}> ;
@@ -2562,10 +2590,10 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
   // Push envelope to holding graph and payload to payload graph
   try {
-    await fetch(`${JENA_GSP}?graph=${encodeURIComponent(holdingGraph)}`, {
+    await fetch(`${req.conn.gspEndpoint}?graph=${encodeURIComponent(holdingGraph)}`, {
       method: 'POST', headers: { 'Content-Type': 'text/turtle' }, body: envelopeTurtle
     })
-    await fetch(`${JENA_GSP}?graph=${encodeURIComponent(payloadGraph)}`, {
+    await fetch(`${req.conn.gspEndpoint}?graph=${encodeURIComponent(payloadGraph)}`, {
       method: 'POST', headers: { 'Content-Type': 'text/turtle' }, body: payloadTurtle
     })
   } catch (err) {
@@ -2576,13 +2604,14 @@ PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
   console.log(`[Bridge] /ingest accepted messageId='${messageId}' pipeline='${pipeline.id}'`)
 
   if (sync) {
-    await runIngestPipeline(messageId)
+    await runIngestPipeline(req.conn, messageId)
     const msg = messageStore.get(messageId)
     return res.json({ messageId, pipelineId: pipeline.id, ...msg })
   }
 
   // Async — fire and forget
-  setImmediate(() => runIngestPipeline(messageId))
+  const conn = req.conn   // captured: the closure outlives the response
+  setImmediate(() => runIngestPipeline(conn, messageId))
 
   return res.status(202).json({
     accepted:   true,
@@ -2611,7 +2640,8 @@ app.post('/pipeline-run', async (req, res) => {
     return res.status(409).json({ error: `Message '${messageId}' is not Pending (status: ${msg.status}).` })
 
   console.log(`[Bridge] /pipeline-run triggered for '${messageId}'`)
-  setImmediate(() => runIngestPipeline(messageId))
+  const conn = req.conn   // captured: the closure outlives the response
+  setImmediate(() => runIngestPipeline(conn, messageId))
 
   return res.status(202).json({
     triggered:  true,
@@ -2692,7 +2722,11 @@ app.post('/registry/refresh', async (_req, res) => {
 // Body: { dataGraph: "<IRI>", shapesGraph?: "<IRI>" }
 
 app.post('/validate', async (req, res) => {
-  await validateHandler(req, res, { JENA_BASE, DATASET: req.datasetOverride || DATASET, SHACL_GRAPH: req.shaclGraph })
+  await validateHandler(req, res, {
+    JENA_BASE:   req.conn.jenaBase,
+    DATASET:     req.conn.dataset,
+    SHACL_GRAPH: req.conn.shaclGraph
+  })
 })
 
 // -- GET /holon[/:iri] + eighteen lifecycle verbs --------------------------------
