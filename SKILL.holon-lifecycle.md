@@ -165,6 +165,19 @@ crossed" property of portal potential would be undercut by an ACL write on
 every promotion. Explicit re-assignment is still possible via
 `designateAgent` afterward if a different owner is wanted for the subtree.
 
+**`createRootHolon` seeds an initial binding (fix for issue #8).** A fresh
+root, unlike a promoted child, has no ancestor to inherit a binding from --
+so without an explicit binding at creation time, nobody, including the
+actor who just created it, would ever hold any capability on it, and
+`designateAgent`'s own `Grant` check could never succeed to establish one
+after the fact (total bootstrap deadlock, reported and reproduced end-to-end
+in issue #8). `createRootHolon()` closes this by self-granting `actor` an
+`Owner` binding on the new root, written in the same request as the root
+registration triple via the same `holon:RoleBinding` shape `designateAgent`
+produces (both now share a `roleBindingTurtle()` helper). `grantedBy` is
+`actor` themselves -- there is no other grantor at the moment a root is
+first created.
+
 This is deliberately coarse -- Read/Write/Promote/Grant/Owner, no
 delegation chains, no time-bound grants, no cryptographic proof of Role.
 Fine-grained VC/profile work belongs to the W3C HCG Identity WG
