@@ -23,6 +23,11 @@
  *   # Test-only, double-gated (see test-utils/clear-holarchy.js):
  *   holon test:clear-holarchy --root <iri> --confirm [--dry-run]
  *
+ *   # Test-only, live verification of the issue #8 fix (see
+ *   # test-utils/verify-root-bootstrap.js) -- runs createRootHolon then
+ *   # addSchema with NO designate-agent call in between:
+ *   holon test:verify-root-bootstrap [--base <iri>] [--actor <iri>]
+ *
  * Connection is read from environment (same convention as holonbridge-mcp):
  *   HOLONBRIDGE_SPARQL_ENDPOINT, HOLONBRIDGE_GSP_ENDPOINT, JENA_BASE, JENA_DATASET
  */
@@ -119,6 +124,11 @@ async function main() {
     case 'test:clear-holarchy': {
       const { clearHolarchy } = await import('../test-utils/clear-holarchy.js')
       result = await clearHolarchy(conn(), args.root, { confirm: args.confirm === true, dryRun: args['dry-run'] === true })
+      break
+    }
+    case 'test:verify-root-bootstrap': {
+      const { verifyRootBootstrap } = await import('../test-utils/verify-root-bootstrap.js')
+      result = await verifyRootBootstrap(conn(), { baseIri: args.base, actorIri: args.actor })
       break
     }
     default:
