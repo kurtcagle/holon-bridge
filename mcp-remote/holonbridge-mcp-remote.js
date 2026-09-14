@@ -94,6 +94,36 @@
  *
  * Changelog
  * ---------
+ *   2026-09-14 v1.24.0 Add three more lifecycle-verb MCP tools:
+ *                      create_root_holon, add_schema, designate_agent --
+ *                      wrapping HolonBridge's createRootHolon (POST /holon),
+ *                      addSchema (POST /holon/:iri/schema), and
+ *                      designateAgent (POST /holon/:iri/agent) verbs
+ *                      (lib/lifecycle.js). Fourth through sixth lifecycle
+ *                      verbs exposed through this MCP remote, after
+ *                      propose_property_update (v1.11.0), create_agent
+ *                      (v1.12.0), and navigate_agent (v1.14.0) -- the
+ *                      remaining twelve verbs (addEntity, promoteEntity,
+ *                      addProjection, modifyEntity, annotateProperty,
+ *                      listHolonContents, editMetadata, deleteHolon,
+ *                      purgeHolon, moveHolon, formGroup, joinGroup,
+ *                      leaveGroup) stay unexposed here pending the same
+ *                      treatment. actorIri for create_root_holon/add_schema
+ *                      and grantedBy for designate_agent both come from
+ *                      currentActorIri() -- never a caller-supplied
+ *                      parameter -- matching the identity model every
+ *                      other lifecycle-verb tool in this file already
+ *                      follows (v1.15.0). designate_agent's own escalation
+ *                      guard (server-side, lib/lifecycle.js) is the
+ *                      holon-level gate on what a grantor can issue;
+ *                      requireWriteAccess() here is only the separate
+ *                      mcp-remote-level per-dataset ACL check every other
+ *                      write-path tool already calls. Prompted by wanting
+ *                      to exercise issue #8's fix (commit befe6748) --
+ *                      createRootHolon -> addSchema, no designateAgent
+ *                      call in between -- through an MCP client rather
+ *                      than only the bin/holon.js CLI or
+ *                      test-utils/verify-root-bootstrap.js run locally.
  *   2026-07-16 v1.23.0 Add five scheduler MCP tools (list_scheduled_tasks,
  *                      get_scheduler_status, create_scheduled_task,
  *                      set_task_status, get_recent_scheduler_activity),
@@ -1017,6 +1047,106 @@ async function hbNavigateAgent(agentIri, destinationIri, note) {
 }
 
 /**
+ * Establish a new root holon and its schema/scene/events graph triad via
+ * HolonBridge's createRootHolon lifecycle verb (POST /holon,
+ * lib/lifecycle.js). Since commit befe6748 (fix for issue #8), this also
+ * self-grants the acting actor an Owner RoleBinding on the new holon as
+ * part of the same write -- previously a fresh root had zero bindings, and
+ * designateAgent (the only verb that could write one) itself required
+ * Grant capability, a permanent deadlock. The returned DataBook carries
+ * that binding as its own block (id: owner-binding) alongside the root
+ * registration block.
+ *
+ * actorIri comes from currentActorIri() (see hbProposePropertyUpdate above
+ * for why), not a caller-supplied argument.
+ */
+async function hbCreateRootHolon(baseIri, label, rootLocked) {
+  const actorIri = currentActorIri();
+  if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
+  return timedProcess(`mcp-remote -> HolonBridge /holon [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const body = { baseIri, label, actor: { iri: actorIri } };
+    if (rootLocked !== undefined) body.rootLocked = rootLocked;
+    const res = await fetch(`${activeBaseUrl()}/holon`, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HolonBridge /holon: HTTP ${res.status} -- ${text.slice(0, 400)}`);
+    }
+    return text;
+  });
+}
+
+/**
+ * Push a schema DataBook into a holon's schema graph via HolonBridge's
+ * addSchema lifecycle verb (POST /holon/:iri/schema, lib/lifecycle.js).
+ * Requires Write on holonIri -- since the issue #8 fix, an actor who just
+ * created holonIri via create_root_holon already holds Owner there (which
+ * implies Write) with no separate designate_agent call needed first; on
+ * any other holon, Write must already have been granted some other way.
+ * schemaMarkdown is a full DataBook document (frontmatter plus one or more
+ * fenced ```turtle/```shacl blocks) -- addSchema concatenates every fenced
+ * block it contains into the schema graph, not just a single raw Turtle
+ * payload.
+ *
+ * actorIri comes from currentActorIri() (see hbProposePropertyUpdate above
+ * for why), not a caller-supplied argument.
+ */
+async function hbAddSchema(holonIri, schemaMarkdown) {
+  const actorIri = currentActorIri();
+  if (!actorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
+  return timedProcess(`mcp-remote -> HolonBridge /holon/.../schema [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const url = `${activeBaseUrl()}/holon/${encodeURIComponent(holonIri)}/schema`;
+    const body = { schemaDataBook: { markdown: schemaMarkdown }, actor: { iri: actorIri } };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HolonBridge /holon/.../schema: HTTP ${res.status} -- ${text.slice(0, 400)}`);
+    }
+    return text;
+  });
+}
+
+/**
+ * Grant a RoleBinding on a holon via HolonBridge's designateAgent
+ * lifecycle verb (POST /holon/:iri/agent, lib/lifecycle.js) -- the only
+ * verb that can create a RoleBinding for someone else. The grantor
+ * (grantedBy) is always the caller's own logged-in identity, resolved from
+ * currentActorIri() -- never a caller-supplied argument -- so a tool
+ * caller can only issue capabilities they themselves actually hold on
+ * holonIri. designateAgent's own escalation guard rejects issuing a
+ * capability the grantor lacks; a rejection comes back as a non-2xx
+ * response, surfaced here as a thrown Error carrying the response body.
+ */
+async function hbDesignateAgent(holonIri, agentIri, agentName, agentKind, capability) {
+  const grantorIri = currentActorIri();
+  if (!grantorIri) throw new Error('No authenticated actor identity on this session -- log in again.');
+  return timedProcess(`mcp-remote -> HolonBridge /holon/.../agent [reqId=${currentRequestId() ?? 'none'}]`, async () => {
+    const url = `${activeBaseUrl()}/holon/${encodeURIComponent(holonIri)}/agent`;
+    const body = {
+      agent: { iri: agentIri, name: agentName, kind: agentKind, capability },
+      grantedBy: { iri: grantorIri },
+    };
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: hbHeaders({ 'Content-Type': 'application/json', Accept: 'text/markdown' }),
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`HolonBridge /holon/.../agent: HTTP ${res.status} -- ${text.slice(0, 400)}`);
+    }
+    return text;
+  });
+}
+
+/**
  * Validate a Turtle payload against a SHACL shapes graph.
  *
  * The current /validate route (lib/validate.js, v2.9.1+) only validates a
@@ -1368,7 +1498,7 @@ function activeBaseUrl() {
 function createMcpServer(sessionId) {
   const srv = new McpServer({
     name: 'holonbridge-mcp-remote',
-    version: '1.23.0',
+    version: '1.24.0',
   });
 
   srv.tool(
@@ -1586,6 +1716,76 @@ function createMcpServer(sessionId) {
     async ({ agent_iri, destination_iri, note }) => {
       requireWriteAccess();
       const result = await hbNavigateAgent(agent_iri, destination_iri, note);
+      return { content: [{ type: 'text', text: result }] };
+    }
+  );
+
+  srv.tool(
+    'create_root_holon',
+    "Establish a new root holon via HolonBridge's createRootHolon lifecycle verb " +
+    '(POST /holon) -- mints its schema/scene/events graph triad and registers it. ' +
+    'Since the issue #8 fix (commit befe6748), this also self-grants YOUR logged-in ' +
+    'identity an Owner RoleBinding on the new holon as part of the same write -- no ' +
+    'separate designate_agent call is needed before you can call add_schema or any ' +
+    'other Write-gated verb on it. Pass root_locked: true to mark this as an ' +
+    'intentional root structure (a registry, a corridor spine, a journeys index) that ' +
+    'moveHolon refuses to silently reparent later. The acting actor is your own ' +
+    'logged-in identity -- not a parameter you supply.',
+    {
+      base_iri:    z.string().describe('IRI for the new root holon, e.g. urn:holon:my-project:root'),
+      label:       z.string().describe('rdfs:label for the holon'),
+      root_locked: z.boolean().optional().describe('Mark as an intentional root structure moveHolon should refuse to silently reparent'),
+    },
+    async ({ base_iri, label, root_locked }) => {
+      requireWriteAccess();
+      const result = await hbCreateRootHolon(base_iri, label, root_locked);
+      return { content: [{ type: 'text', text: result }] };
+    }
+  );
+
+  srv.tool(
+    'add_schema',
+    "Push a schema DataBook into a holon's schema graph via HolonBridge's addSchema " +
+    'lifecycle verb (POST /holon/:iri/schema). schema_markdown is a full DataBook ' +
+    'document (YAML frontmatter, then one or more fenced ```turtle or ```shacl blocks) ' +
+    '-- every fenced block it contains is concatenated into the schema graph, not just ' +
+    'a single raw Turtle payload. Requires Write on holon_iri: if you created it ' +
+    'yourself via create_root_holon you already hold Owner there (which implies ' +
+    'Write) with nothing further to do; on a holon someone else created, Write must ' +
+    'already have been granted to you via designate_agent. The acting actor is your ' +
+    'own logged-in identity -- not a parameter you supply.',
+    {
+      holon_iri:       z.string().describe('IRI of the holon to add schema to'),
+      schema_markdown: z.string().describe('DataBook markdown -- frontmatter plus one or more fenced turtle/shacl blocks'),
+    },
+    async ({ holon_iri, schema_markdown }) => {
+      requireWriteAccess();
+      const result = await hbAddSchema(holon_iri, schema_markdown);
+      return { content: [{ type: 'text', text: result }] };
+    }
+  );
+
+  srv.tool(
+    'designate_agent',
+    "Grant a RoleBinding on a holon via HolonBridge's designateAgent lifecycle verb " +
+    "(POST /holon/:iri/agent) -- the only verb that can create a RoleBinding for " +
+    "someone else. The grantor is always YOUR own logged-in identity: designateAgent's " +
+    'escalation guard rejects issuing any capability you do not yourself hold on ' +
+    'holon_iri (a Write-only grantor cannot delegate at all, since Grant itself is ' +
+    'required to call this verb, and Write does not imply Grant). Capability values: ' +
+    'Read, Write, Promote, Grant, Owner (Owner implies the rest). The acting grantor ' +
+    'is your own logged-in identity -- not a parameter you supply.',
+    {
+      holon_iri:  z.string().describe('IRI of the holon the capability is granted on'),
+      agent_iri:  z.string().describe('IRI of the agent/actor/persona receiving the grant'),
+      name:       z.string().describe('rdfs:label for the receiving agent, e.g. "Ben Wortley"'),
+      kind:       z.enum(['Agent', 'Persona', 'Actor']).describe('prov: kind of the receiving agent'),
+      capability: z.array(z.enum(['Read', 'Write', 'Promote', 'Grant', 'Owner']))
+                   .describe('Capabilities to grant -- you must already hold every one of these yourself on holon_iri'),
+    },
+    async ({ holon_iri, agent_iri, name, kind, capability }) => {
+      requireWriteAccess(); // dataset-level ACL gate; designateAgent's own escalation guard is the holon-level one
+      const result = await hbDesignateAgent(holon_iri, agent_iri, name, kind, capability);
       return { content: [{ type: 'text', text: result }] };
     }
   );
@@ -2098,7 +2298,7 @@ app.get('/health', async (_req, res) => {
   res.json({
     status: 'ok',
     server: 'holonbridge-mcp-remote',
-    version: '1.23.0',
+    version: '1.24.0',
     holonbridge: HOLONBRIDGE_URL,
     activeBridge: activeBaseUrl(),
     jenaBase,
@@ -2112,7 +2312,7 @@ app.get('/health', async (_req, res) => {
 });
 
 app.listen(parseInt(MCP_PORT), () => {
-  console.log(`holonbridge-mcp-remote v1.23.0 listening on :${MCP_PORT}`);
+  console.log(`holonbridge-mcp-remote v1.24.0 listening on :${MCP_PORT}`);
   console.log(`  HolonBridge target  : ${HOLONBRIDGE_URL}`);
   console.log(`  Jena base           : ${jenaBase}`);
   console.log(`  Active GSP dataset  : ${activeFusekiDataset}`);
