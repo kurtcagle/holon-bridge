@@ -300,7 +300,7 @@ Fuseki dataset. The MCP remote does not persist dataset state across
 HolonBridge restarts.
 
 ```
-switch_dataset("chloe")    # or "storme", "ggsc", "causalspark", etc.
+switch_dataset("chloe")    # or "storme", "ggsc", "example", etc.
 ```
 
 ---
