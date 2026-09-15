@@ -1933,7 +1933,7 @@ app.post('/describe', async (req, res) => {
   if (!iri || typeof iri !== 'string' || !iri.trim())
     return res.status(400).json({
       error: '"iri" is required — provide the seed IRI to describe.',
-      example: { iri: 'urn:chloe:meeting:2026-06-26-causalspark-marion', depth: 3, graph: null }
+      example: { iri: 'urn:example:meeting:2026-01-01-project-kickoff', depth: 3, graph: null }
     })
 
   const seedIri      = iri.trim()
